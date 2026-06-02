@@ -1,4 +1,4 @@
- # pages/child_attendance.py — Child Attendance / Room Occupancy
+# pages/child_attendance.py — Child Attendance / Room Occupancy
 #
 # Two data entry paths:
 #   1. Bulk CSV upload  → all rooms, all dates in one file → summary table
