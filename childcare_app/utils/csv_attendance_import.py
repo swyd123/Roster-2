@@ -380,3 +380,9 @@ def _bulk_fail(errors: list[str], warnings: list[str] | None = None) -> dict:
         "n_children":       0,
         "n_skipped":        0,
     }
+def parse_csv_bulk(file_bytes, rooms, intervals):
+    """
+    Backwards-compatible wrapper used by child_attendance.py.
+    Calls the existing CSV parser.
+    """
+    return parse_csv(file_bytes, rooms, intervals)
