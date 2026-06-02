@@ -7,6 +7,17 @@ from datetime import date, datetime, timedelta, timezone
 from utils.supabase_client import get_supabase_client, get_organisation_id
 
 
+def _one(resp) -> Optional[dict]:
+    """
+    Return the first row from a query response, or None.
+    Replaces .single() which is not available on SyncQueryRequestBuilder.
+    """
+    data = resp.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
 # ── ROSTER PERIODS ────────────────────────────────────────────────────────────
 
 def fetch_roster_periods(centre_id: str, limit: int = 20) -> list[dict]:
@@ -27,20 +38,20 @@ def fetch_roster_periods(centre_id: str, limit: int = 20) -> list[dict]:
 
 def fetch_roster_period_by_id(period_id: str) -> Optional[dict]:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("roster_periods")
         .select("*")
         .eq("id", period_id)
-        .single()
+        .limit(1)
         .execute()
-    ).data
+    )
 
 
 def create_roster_period(
     centre_id: str, start_date: str, end_date: str, notes: str = ""
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("roster_periods")
         .insert({
             "centre_id":  centre_id,
@@ -49,14 +60,18 @@ def create_roster_period(
             "status":     "draft",
             "notes":      notes.strip() or None,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Roster period could not be created — no row returned from database.")
+    return result
 
 
 def publish_roster_period(period_id: str, publisher_user_id: str) -> dict:
     sb  = get_supabase_client()
     now = datetime.now(timezone.utc).isoformat()
-    return (
+    result = _one(
         sb.from_("roster_periods")
         .update({
             "status":               "published",
@@ -64,8 +79,12 @@ def publish_roster_period(period_id: str, publisher_user_id: str) -> dict:
             "published_by_user_id": publisher_user_id,
         })
         .eq("id", period_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Roster period could not be published — no row returned from database.")
+    return result
 
 
 def archive_roster_period(period_id: str) -> None:
@@ -131,26 +150,30 @@ def create_shift(
     template_id: str | None = None,
     created_by: str | None = None,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("roster_shifts")
         .insert({
-            "roster_period_id":      period_id,
-            "centre_id":             centre_id,
-            "user_id":               user_id,
-            "room_id":               room_id or None,
-            "shift_date":            shift_date,
-            "start_time":            start_time,
-            "end_time":              end_time,
+            "roster_period_id":       period_id,
+            "centre_id":              centre_id,
+            "user_id":                user_id,
+            "room_id":                room_id or None,
+            "shift_date":             shift_date,
+            "start_time":             start_time,
+            "end_time":               end_time,
             "break_duration_minutes": break_duration_minutes,
-            "shift_type":            shift_type,
-            "status":                "scheduled",
-            "notes":                 notes.strip() or None,
-            "shift_template_id":     template_id,
-            "created_by_user_id":    created_by,
+            "shift_type":             shift_type,
+            "status":                 "scheduled",
+            "notes":                  notes.strip() or None,
+            "shift_template_id":      template_id,
+            "created_by_user_id":     created_by,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Shift could not be created — no row returned from database.")
+    return result
 
 
 def update_shift(
@@ -158,20 +181,24 @@ def update_shift(
     room_id: str, start_time: str, end_time: str,
     break_duration_minutes: int, shift_type: str, notes: str,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("roster_shifts")
         .update({
-            "room_id":               room_id or None,
-            "start_time":            start_time,
-            "end_time":              end_time,
+            "room_id":                room_id or None,
+            "start_time":             start_time,
+            "end_time":               end_time,
             "break_duration_minutes": break_duration_minutes,
-            "shift_type":            shift_type,
-            "notes":                 notes.strip() or None,
+            "shift_type":             shift_type,
+            "notes":                  notes.strip() or None,
         })
         .eq("id", shift_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Shift could not be updated — no row returned from database.")
+    return result
 
 
 def delete_shift(shift_id: str) -> None:
@@ -196,16 +223,16 @@ def copy_shifts_to_period(source_period_id: str, dest_period_id: str,
         except Exception:
             continue
         inserts.append({
-            "roster_period_id":      dest_period_id,
-            "centre_id":             centre_id,
-            "user_id":               s["user_id"],
-            "room_id":               s.get("room_id"),
-            "shift_date":            new_date.isoformat(),
-            "start_time":            s["start_time"],
-            "end_time":              s["end_time"],
+            "roster_period_id":       dest_period_id,
+            "centre_id":              centre_id,
+            "user_id":                s["user_id"],
+            "room_id":                s.get("room_id"),
+            "shift_date":             new_date.isoformat(),
+            "start_time":             s["start_time"],
+            "end_time":               s["end_time"],
             "break_duration_minutes": s.get("break_duration_minutes", 0),
-            "shift_type":            s.get("shift_type", "standard"),
-            "status":                "scheduled",
+            "shift_type":             s.get("shift_type", "standard"),
+            "status":                 "scheduled",
         })
 
     if inserts:
@@ -231,39 +258,47 @@ def create_shift_template(
     centre_id: str, name: str, start_time: str, end_time: str,
     break_duration_minutes: int, colour: str,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("shift_templates")
         .insert({
-            "centre_id":             centre_id,
-            "name":                  name.strip(),
-            "start_time":            start_time,
-            "end_time":              end_time,
+            "centre_id":              centre_id,
+            "name":                   name.strip(),
+            "start_time":             start_time,
+            "end_time":               end_time,
             "break_duration_minutes": break_duration_minutes,
-            "colour":                colour,
-            "is_active":             True,
+            "colour":                 colour,
+            "is_active":              True,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Shift template could not be created — no row returned from database.")
+    return result
 
 
 def update_shift_template(
     template_id: str, name: str, start_time: str, end_time: str,
     break_duration_minutes: int, colour: str,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("shift_templates")
         .update({
-            "name":                  name.strip(),
-            "start_time":            start_time,
-            "end_time":              end_time,
+            "name":                   name.strip(),
+            "start_time":             start_time,
+            "end_time":               end_time,
             "break_duration_minutes": break_duration_minutes,
-            "colour":                colour,
+            "colour":                 colour,
         })
         .eq("id", template_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Shift template could not be updated — no row returned from database.")
+    return result
 
 
 def delete_shift_template(template_id: str) -> None:
@@ -280,7 +315,7 @@ def fetch_approved_leave_for_period(
     Returns {user_id: [list of date strings with approved leave]}
     for the given period.
     """
-    sb = get_supabase_client()
+    sb      = get_supabase_client()
     records = (
         sb.from_("leave_requests")
         .select("user_id, start_date, end_date")
@@ -306,13 +341,11 @@ def fetch_approved_leave_for_period(
     return leave_map
 
 
-def fetch_availability_map(
-    centre_id: str
-) -> dict[str, dict]:
+def fetch_availability_map(centre_id: str) -> dict[str, dict]:
     """
     Returns {user_id: {day_of_week: {is_available, available_from, available_until}}}
     """
-    sb = get_supabase_client()
+    sb      = get_supabase_client()
     records = (
         sb.from_("staff_availability")
         .select("user_id, day_of_week, is_available, available_from, available_until")
@@ -325,8 +358,8 @@ def fetch_availability_map(
         uid = r["user_id"]
         dow = r["day_of_week"]
         av_map.setdefault(uid, {})[dow] = {
-            "is_available":   r.get("is_available", True),
-            "available_from": r.get("available_from"),
+            "is_available":    r.get("is_available", True),
+            "available_from":  r.get("available_from"),
             "available_until": r.get("available_until"),
         }
     return av_map
@@ -340,21 +373,22 @@ def enrich_shifts_with_qual_flags(shifts: list[dict]) -> list[dict]:
     based on nested qualification data.
     """
     for s in shifts:
-        u = s.get("users") or {}
-        profiles = u.get("staff_profiles") or []
+        u           = s.get("users") or {}
+        profiles    = u.get("staff_profiles") or []
         has_diploma = False
         for profile in profiles:
             for sq in (profile.get("staff_qualifications") or []):
-                qt = sq.get("qualification_types") or {}
+                qt    = sq.get("qualification_types") or {}
+                short = (qt.get("short_name") or "").lower()
                 if (qt.get("category") == "formal_qualification"
-                        and sq.get("status") == "active"):
-                    short = (qt.get("short_name") or "").lower()
-                    if short in ("diploma", "adv diploma", "b.ed (ec)"):
-                        has_diploma = True
-                        break
+                        and sq.get("status") == "active"
+                        and short in ("diploma", "adv diploma", "b.ed (ec)")):
+                    has_diploma = True
+                    break
 
-        s["has_diploma"]   = has_diploma
-        s["counts_ratio"]  = s.get("shift_type", "standard") in ("standard", "opening",
-                                                                    "closing", "split", "overtime")
-        s["display_name"]  = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+        s["has_diploma"]  = has_diploma
+        s["counts_ratio"] = s.get("shift_type", "standard") in (
+            "standard", "opening", "closing", "split", "overtime"
+        )
+        s["display_name"] = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
     return shifts
