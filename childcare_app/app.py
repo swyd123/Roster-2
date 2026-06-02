@@ -37,6 +37,7 @@ NAV = [
     ("───", None),
     ("SETTINGS",          None),
     ("🏫  Centres",             "centres"),
+    ("👶  Child Attendance",   "child_attendance"),
 ]
 
 CONTEXT_KEYS = [
@@ -110,5 +111,6 @@ elif page == "ratio_report":     from pages.ratio_report     import render; rend
 elif page == "break_schedule": from pages.break_schedule import render; render()
 elif page == "break_history":  from pages.break_history  import render; render()
 elif page == "centres":        from pages.centres        import render; render()
+elif page == "child_attendance": from pages.child_attendance import render; render()
 else:
     st.info("Select an item from the sidebar to get started.")
