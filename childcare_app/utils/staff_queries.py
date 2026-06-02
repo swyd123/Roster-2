@@ -41,7 +41,7 @@ def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
     rows = (
         sb.from_("user_centre_roles")
         .select(
-            "user_id, role, primary_room_id, centre_id, is_active,"
+            "id, user_id, role, primary_room_id, centre_id, is_active,"
             "centres!user_centre_roles_centre_id_fkey(id, name),"
             "rooms!user_centre_roles_primary_room_id_fkey(id, name)"
         )
@@ -154,10 +154,25 @@ def create_staff_member(
     emergency_contact_name: str, emergency_contact_phone: str,
     emergency_contact_relationship: str, notes: str,
 ) -> dict:
+    """
+    Create a staff member in three steps:
+      1. Insert a row into users
+      2. Insert a row into staff_profiles
+      3. Insert a row into user_centre_roles (required — centre_id must be provided)
+
+    Raises ValueError if any step fails, with a message describing which step.
+    """
+    if not centre_id:
+        raise ValueError(
+            "Centre assignment is required. Please select a centre before saving."
+        )
+    if not role:
+        raise ValueError("Role is required. Please select a role for this staff member.")
+
     sb     = get_supabase_client()
     org_id = get_organisation_id()
 
-    # 1 — create user account
+    # Step 1 — create user account
     u = _one(
         sb.from_("users")
         .insert({
@@ -171,9 +186,12 @@ def create_staff_member(
         .execute()
     )
     if not u:
-        raise ValueError("User account could not be created.")
+        raise ValueError(
+            "Could not create the user account. "
+            "Check that the email address is not already in use."
+        )
 
-    # 2 — create staff profile
+    # Step 2 — create staff profile
     profile = _one(
         sb.from_("staff_profiles")
         .insert({
@@ -191,18 +209,102 @@ def create_staff_member(
         .select()
         .execute()
     )
+    if not profile:
+        raise ValueError(
+            "User account was created but the staff profile could not be saved. "
+            "Please contact support."
+        )
 
-    # 3 — assign centre role
-    if centre_id:
-        sb.from_("user_centre_roles").insert({
+    # Step 3 — assign centre role (required)
+    role_row = _one(
+        sb.from_("user_centre_roles")
+        .insert({
             "user_id":         u["id"],
             "centre_id":       centre_id,
             "role":            role,
             "primary_room_id": primary_room_id or None,
             "is_active":       True,
-        }).execute()
+        })
+        .select()
+        .execute()
+    )
+    if not role_row:
+        raise ValueError(
+            f"Staff profile was created but the centre role could not be assigned. "
+            f"Please open the staff member's profile and use the Edit tab to add their centre assignment."
+        )
 
     return profile
+
+
+def upsert_centre_role(
+    user_id: str,
+    centre_id: str,
+    role: str,
+    primary_room_id: str | None,
+) -> dict:
+    """
+    Insert or update the user_centre_roles row for a staff member at a centre.
+
+    If a row already exists for this user+centre, update it.
+    If no row exists, insert one.
+
+    Used by the Edit tab on the staff profile to add or change
+    a centre assignment after the staff member has been created.
+    """
+    if not centre_id:
+        raise ValueError("Centre is required.")
+    if not role:
+        raise ValueError("Role is required.")
+
+    sb = get_supabase_client()
+
+    # Check for an existing row (active or inactive) for this user+centre
+    existing = (
+        sb.from_("user_centre_roles")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("centre_id", centre_id)
+        .is_("deleted_at", "null")
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if existing:
+        # Update the existing role row
+        row_id = existing[0]["id"]
+        result = _one(
+            sb.from_("user_centre_roles")
+            .update({
+                "role":            role,
+                "primary_room_id": primary_room_id or None,
+                "is_active":       True,
+            })
+            .eq("id", row_id)
+            .select()
+            .execute()
+        )
+    else:
+        # Insert a new row
+        result = _one(
+            sb.from_("user_centre_roles")
+            .insert({
+                "user_id":         user_id,
+                "centre_id":       centre_id,
+                "role":            role,
+                "primary_room_id": primary_room_id or None,
+                "is_active":       True,
+            })
+            .select()
+            .execute()
+        )
+
+    if not result:
+        raise ValueError(
+            "Centre role could not be saved. "
+            "Check that the centre ID and role are valid."
+        )
+    return result
 
 
 def update_staff_member(
