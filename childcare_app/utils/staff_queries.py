@@ -8,41 +8,101 @@ from utils.supabase_client import get_supabase_client, get_organisation_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
+    """
+    Fetch user_centre_roles rows for a list of user_ids, joined to centres
+    and rooms. Returns a dict keyed by user_id.
+
+    WHY A SEPARATE QUERY?
+    PostgREST can only traverse real foreign-key relationships in a single
+    select. There is no direct FK between staff_profiles and user_centre_roles
+    — they are both children of users. Querying
+        staff_profiles → user_centre_roles
+    fails with PGRST200. The solution is to query user_centre_roles directly,
+    filtering by the set of user_ids we already have from staff_profiles.
+    """
+    if not user_ids:
+        return {}
+
+    rows = (
+        sb.from_("user_centre_roles")
+        .select(
+            "user_id, role, primary_room_id, centre_id, is_active,"
+            "centres!user_centre_roles_centre_id_fkey(id, name),"
+            "rooms!user_centre_roles_primary_room_id_fkey(id, name)"
+        )
+        .in_("user_id", user_ids)
+        .is_("deleted_at", "null")
+        .execute()
+    ).data or []
+
+    result: dict[str, list[dict]] = {}
+    for row in rows:
+        uid = row["user_id"]
+        result.setdefault(uid, []).append(row)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STAFF — core list & profile
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_all_staff() -> list[dict]:
-    """All active staff for this organisation with user + role data."""
+    """
+    All active staff for this organisation with user + role data.
+
+    Uses two queries and merges in Python to avoid the invalid
+    staff_profiles → user_centre_roles join (no direct FK exists;
+    both tables hang off users).
+    """
     sb     = get_supabase_client()
     org_id = get_organisation_id()
 
-    resp = (
+    # Query 1 — staff profiles + user accounts (valid FK: staff_profiles.user_id → users.id)
+    profiles = (
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, notes, organisation_id,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active, created_at"
-            "),"
-            "user_centre_roles!user_centre_roles_user_id_fkey("
-            "  role, primary_room_id, centre_id, is_active,"
-            "  centres!user_centre_roles_centre_id_fkey(id, name),"
-            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("organisation_id", org_id)
         .is_("deleted_at", "null")
         .order("id")
         .execute()
-    )
-    return resp.data or []
+    ).data or []
+
+    if not profiles:
+        return []
+
+    # Query 2 — roles for those users (valid FK: user_centre_roles.user_id → users.id)
+    user_ids  = [p["users"]["id"] for p in profiles if p.get("users")]
+    roles_map = _fetch_roles_for_users(sb, user_ids)
+
+    # Merge: attach user_centre_roles list onto each profile using the shared user_id
+    for profile in profiles:
+        uid = (profile.get("users") or {}).get("id")
+        profile["user_centre_roles"] = roles_map.get(uid, [])
+
+    return profiles
 
 
 def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
-    """Full record for one staff member including qualifications summary."""
+    """
+    Full record for one staff member.
+
+    Same two-query pattern as fetch_all_staff to avoid the invalid
+    staff_profiles → user_centre_roles join.
+    """
     sb = get_supabase_client()
 
-    resp = (
+    # Query 1 — profile + user
+    profile = (
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
@@ -51,19 +111,23 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
             "emergency_contact_relationship, notes, organisation_id,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active"
-            "),"
-            "user_centre_roles!user_centre_roles_user_id_fkey("
-            "  role, primary_room_id, centre_id, is_active,"
-            "  centres!user_centre_roles_centre_id_fkey(id, name),"
-            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("id", profile_id)
         .is_("deleted_at", "null")
         .single()
         .execute()
-    )
-    return resp.data
+    ).data
+
+    if not profile:
+        return None
+
+    # Query 2 — roles
+    uid = (profile.get("users") or {}).get("id")
+    roles_map = _fetch_roles_for_users(sb, [uid]) if uid else {}
+    profile["user_centre_roles"] = roles_map.get(uid, [])
+
+    return profile
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +387,6 @@ def upsert_availability(rows: list[dict]) -> None:
     sb = get_supabase_client()
     if not rows:
         return
-    # Delete existing records for this user+centre combination, then re-insert
     user_id   = rows[0]["user_id"]
     centre_id = rows[0]["centre_id"]
     sb.from_("staff_availability").delete().eq("user_id", user_id).eq("centre_id", centre_id).execute()
@@ -336,10 +399,8 @@ def upsert_availability(rows: list[dict]) -> None:
 
 def fetch_leave_requests(centre_id: str | None = None, user_id: str | None = None,
                           status_filter: str | None = None) -> list[dict]:
-    sb     = get_supabase_client()
-    org_id = get_organisation_id()
+    sb = get_supabase_client()
 
-    # Start from leave_requests, join to users for staff name
     q = (
         sb.from_("leave_requests")
         .select(
@@ -351,7 +412,6 @@ def fetch_leave_requests(centre_id: str | None = None, user_id: str | None = Non
         )
     )
 
-    # Filter by centre or user
     if centre_id:
         q = q.eq("centre_id", centre_id)
     if user_id:
