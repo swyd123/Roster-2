@@ -36,6 +36,7 @@ NAV = [
     ("📜  Break History",       "break_history"),
     ("───", None),
     ("SETTINGS",          None),
+    ("🏫  Centres",             "centres"),
 ]
 
 CONTEXT_KEYS = [
@@ -50,6 +51,7 @@ CONTEXT_KEYS = [
     "show_log_break", "prefill_shift_id", "prefill_user_id",
     "roster_period_id", "show_create_roster",
     "show_publish_panel",
+    "show_add_centre",
 ]
 
 with st.sidebar:
@@ -87,25 +89,26 @@ if "page" not in st.session_state:
 
 page = st.session_state.get("page", "staff_list")
 
-if   page == "staff_list":    from pages.staff_list    import render; render()
-elif page == "staff_add":     from pages.staff_add     import render; render()
-elif page == "staff_profile": from pages.staff_profile import render; render()
-elif page == "leave_list":    from pages.leave_list    import render; render()
-elif page == "leave_review":  from pages.leave_review  import render; render()
-elif page == "leave_add":     from pages.leave_add     import render; render()
-elif page == "roster_list":   from pages.roster_list   import render; render()
-elif page == "roster_builder":from pages.roster_builder import render; render()
+if   page == "staff_list":     from pages.staff_list     import render; render()
+elif page == "staff_add":      from pages.staff_add      import render; render()
+elif page == "staff_profile":  from pages.staff_profile  import render; render()
+elif page == "leave_list":     from pages.leave_list     import render; render()
+elif page == "leave_review":   from pages.leave_review   import render; render()
+elif page == "leave_add":      from pages.leave_add      import render; render()
+elif page == "roster_list":    from pages.roster_list    import render; render()
+elif page == "roster_builder": from pages.roster_builder import render; render()
 elif page == "shift_templates":from pages.shift_templates import render; render()
-elif page == "roster_report": from pages.roster_report  import render; render()
-elif page == "rooms_list":    from pages.rooms_list    import render; render()
-elif page == "room_form":     from pages.room_form     import render; render()
-elif page == "room_detail":   from pages.room_detail   import render; render()
-elif page == "room_allocation": from pages.room_allocation import render; render()
+elif page == "roster_report":  from pages.roster_report  import render; render()
+elif page == "rooms_list":     from pages.rooms_list     import render; render()
+elif page == "room_form":      from pages.room_form      import render; render()
+elif page == "room_detail":    from pages.room_detail    import render; render()
+elif page == "room_allocation":from pages.room_allocation import render; render()
 elif page == "ratio_dashboard":  from pages.ratio_dashboard  import render; render()
 elif page == "ratio_detail":     from pages.ratio_detail     import render; render()
 elif page == "ratio_breach_log": from pages.ratio_breach_log import render; render()
 elif page == "ratio_report":     from pages.ratio_report     import render; render()
 elif page == "break_schedule": from pages.break_schedule import render; render()
 elif page == "break_history":  from pages.break_history  import render; render()
+elif page == "centres":        from pages.centres        import render; render()
 else:
     st.info("Select an item from the sidebar to get started.")
