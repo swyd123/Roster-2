@@ -1,26 +1,30 @@
 # pages/child_attendance.py — Child Attendance / Room Occupancy
 #
-# MVP: enter expected and actual child counts per room per 15-minute interval.
-# No individual child profiles required.
-# Data feeds ratio dashboard and roster validation automatically.
+# Two ways to enter data:
+#   1. CSV upload  — upload a per-child file → auto-fills interval counts
+#   2. Manual form — edit counts directly per 15-min interval
+#
+# Both paths write to room_attendance_intervals via upsert_all_intervals.
 
 import io
 import streamlit as st
-from datetime import date, datetime, time as _time
+from datetime import date, datetime
+
 import pandas as pd
 
 from utils.attendance_queries import (
-    generate_intervals, fetch_intervals_for_room,
-    upsert_all_intervals, summarise_day,
+    generate_intervals,
+    fetch_intervals_for_room,
     fetch_intervals_for_centre,
-    get_children_count_for_room_at_time,
+    upsert_all_intervals,
+)
+from utils.csv_attendance_import import (
+    parse_csv,
+    room_counts_to_upsert_rows,
 )
 from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_centres
 from utils.centre_queries import fetch_centre_by_id
-# compute_ratio and now_time_str removed from this import.
-# now_time_str does not exist in older deployments of ratio_engine.py,
-# which caused the ImportError on startup. datetime is already imported above.
 from utils.helpers import toast_success, toast_error
 
 
@@ -29,7 +33,7 @@ def render():
     h1, h2 = st.columns([4, 1])
     h1.title("Child Attendance")
     h1.markdown(
-        '<p class="page-sub">Enter expected and actual child counts per room '
+        '<p class="page-sub">Upload a CSV or enter counts manually '
         "· 15-minute intervals · feeds ratio monitor automatically</p>",
         unsafe_allow_html=True,
     )
@@ -63,7 +67,6 @@ def render():
     )
     st.session_state.attendance_centre_id = centre_id
 
-    # Date picker
     attendance_date = cc2.date_input(
         "Date",
         value=date.today(),
@@ -71,20 +74,17 @@ def render():
         format="DD/MM/YYYY",
     )
 
-    # ── Load centre for operating hours ──────────────────────────────
+    # ── Load centre + rooms ───────────────────────────────────────────
     with st.spinner("Loading…"):
         try:
-            centre  = fetch_centre_by_id(centre_id)
-            rooms   = fetch_rooms(centre_id)
+            centre = fetch_centre_by_id(centre_id)
+            rooms  = fetch_rooms(centre_id)
         except Exception as e:
             toast_error(f"Could not load data: {e}")
             return
 
     if not rooms:
-        st.info(
-            "No rooms configured for this centre. "
-            "Go to **🚪 Rooms** to add rooms first."
-        )
+        st.info("No rooms configured. Go to **🚪 Rooms** to add rooms first.")
         return
 
     opens_at  = centre.get("opens_at")  if centre else None
@@ -93,28 +93,27 @@ def render():
 
     if not intervals:
         st.error(
-            "Could not generate intervals — centre opening/closing times are not set. "
+            "Centre opening/closing times are not set. "
             "Go to **🏫 Centres → Edit** to set them."
         )
         return
 
-    # ── Room selector ─────────────────────────────────────────────────
+    # ── Room selector (for manual form) ──────────────────────────────
     room_opts = {r["id"]: r["name"] for r in rooms}
     room_id   = cc3.selectbox(
-        "Room",
+        "Room (manual entry)",
         options=list(room_opts.keys()),
         format_func=lambda x: room_opts[x],
         key="att_room_sel",
     )
     selected_room = next((r for r in rooms if r["id"] == room_id), {})
 
-    date_str  = attendance_date.isoformat()
-    colour    = selected_room.get("colour", "#3498DB")
-    capacity  = selected_room.get("licensed_capacity", 0)
-    r_staff   = selected_room.get("required_ratio_staff", 1)
-    r_children= selected_room.get("required_ratio_children", 4)
+    date_str = attendance_date.isoformat()
+    colour   = selected_room.get("colour", "#3498DB")
+    capacity = selected_room.get("licensed_capacity", 0)
+    r_children = selected_room.get("required_ratio_children", 4)
 
-    # ── Load existing data for this room / date ───────────────────────
+    # ── Load existing data for the selected room ──────────────────────
     with st.spinner("Loading intervals…"):
         try:
             saved = fetch_intervals_for_room(room_id, date_str)
@@ -122,21 +121,31 @@ def render():
             toast_error(f"Could not load attendance data: {e}")
             saved = []
 
-    # Build lookup: interval_start → saved row
     saved_map = {s["interval_start"]: s for s in saved}
     n_saved   = sum(1 for s in saved if s.get("expected_children", 0) > 0)
 
     st.markdown("---")
 
-    # ── Day summary strip ─────────────────────────────────────────────
-    _render_day_summary(saved, rooms, room_id, centre_id, date_str)
+    # ── Day summary ───────────────────────────────────────────────────
+    _render_day_summary(rooms, room_id, centre_id, date_str)
 
     st.markdown("---")
 
-    # ── CSV upload (optional, does not affect interval form) ─
-    _render_csv_upload(now)
+    # ── CSV upload section ────────────────────────────────────────────
+    _render_csv_upload(
+        centre_id=centre_id,
+        rooms=rooms,
+        intervals=intervals,
+        date_str=date_str,
+    )
 
-    # ── Room header ───────────────────────────────────────────────────
+    st.markdown("---")
+
+    # ── Manual interval entry form ────────────────────────────────────
+    now      = datetime.now().strftime("%H:%M:%S")
+    is_today = attendance_date == date.today()
+
+    # Room header
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;">'
         f'<div style="width:14px;height:14px;border-radius:50%;background:{colour};'
@@ -154,92 +163,70 @@ def render():
         st.caption(f"✅ {n_saved} of {len(intervals)} intervals have data saved.")
     else:
         st.info(
-            "No attendance data entered yet for this room and date. "
-            "Fill in the expected children column below and click **Save**."
+            "No attendance data saved yet for this room and date. "
+            "Upload a CSV above, or fill in the counts below and click **Save**."
         )
 
-    # ── Helper: show whether we're in a shift right now ──────────────
-    now = datetime.now().strftime("%H:%M:%S")
-    is_today = attendance_date == date.today()
-
-    # ── Interval entry form ───────────────────────────────────────────
     st.markdown(
-        "**Enter expected and actual child counts for each 15-minute interval.**  \n"
-        "Expected = planned headcount. Actual = observed (leave blank if not yet known)."
+        "**Manual entry** — expected and actual child counts per 15-minute interval."
     )
 
-    # Column headers
     hc0, hc1, hc2, hc3, hc4 = st.columns([1.8, 1.4, 1.4, 1.4, 2.0])
     hc0.markdown("**Time**")
     hc1.markdown("**Expected**")
     hc2.markdown("**Actual**")
-    hc3.markdown("**Ratio status**")
+    hc3.markdown("**Capacity %**")
     hc4.markdown("**Notes**")
 
     form_rows = []
     with st.form(key=f"attendance_form_{room_id}_{date_str}"):
-
         for iv in intervals:
-            istart  = iv["interval_start"]
-            iend    = iv["interval_end"]
-            label   = iv["label"]
+            istart   = iv["interval_start"]
+            iend     = iv["interval_end"]
+            label    = iv["label"]
             existing = saved_map.get(istart, {})
-
-            # Is this the current 15-min window?
-            is_now  = is_today and istart <= now < iend
+            is_now   = is_today and istart <= now < iend
 
             label_html = (
-                f'<span style="font-size:0.82rem;font-weight:{"700" if is_now else "400"};'
+                f'<span style="font-size:0.82rem;'
+                f'font-weight:{"700" if is_now else "400"};'
                 f'color:{"#0d1f35" if is_now else "#475569"};">'
                 f'{"▶ " if is_now else ""}{label}</span>'
             )
 
             c0, c1, c2, c3, c4 = st.columns([1.8, 1.4, 1.4, 1.4, 2.0])
-
             c0.markdown(label_html, unsafe_allow_html=True)
 
             exp = c1.number_input(
-                "exp",
-                min_value=0, max_value=capacity or 100,
+                "exp", min_value=0, max_value=capacity or 100,
                 value=int(existing.get("expected_children") or 0),
-                key=f"exp_{istart}",
-                label_visibility="collapsed",
-                step=1,
+                key=f"exp_{istart}", label_visibility="collapsed", step=1,
             )
 
             act_val = existing.get("actual_children")
             act = c2.number_input(
-                "act",
-                min_value=0, max_value=capacity or 100,
+                "act", min_value=0, max_value=capacity or 100,
                 value=int(act_val) if act_val is not None else 0,
-                key=f"act_{istart}",
-                label_visibility="collapsed",
-                step=1,
+                key=f"act_{istart}", label_visibility="collapsed", step=1,
             )
-            # Treat 0 as "not recorded" only if there is also no expected count
             actual_to_save = act if (act > 0 or act_val is not None) else None
 
-            # Inline ratio preview for this slot
-            # Use actual if set, else expected
-            n_children_for_ratio = act if (act_val is not None or act > 0) else exp
-            if n_children_for_ratio > 0:
-                # We don't know staff at this slot here — show capacity indicator only
-                pct = round((n_children_for_ratio / capacity) * 100) if capacity else 0
+            n_for_pct = act if (act_val is not None or act > 0) else exp
+            if n_for_pct > 0 and capacity:
+                pct = round((n_for_pct / capacity) * 100)
                 if pct >= 100:
-                    ratio_html = '<span style="color:#991b1b;font-size:0.75rem;">⚠ Over cap</span>'
+                    pct_html = f'<span style="color:#991b1b;font-size:0.75rem;">⚠ {pct}%</span>'
                 elif pct >= 80:
-                    ratio_html = f'<span style="color:#92400e;font-size:0.75rem;">{pct}% cap</span>'
+                    pct_html = f'<span style="color:#92400e;font-size:0.75rem;">{pct}%</span>'
                 else:
-                    ratio_html = f'<span style="color:#14532d;font-size:0.75rem;">{pct}% cap</span>'
+                    pct_html = f'<span style="color:#14532d;font-size:0.75rem;">{pct}%</span>'
             else:
-                ratio_html = '<span style="color:#94a3b8;font-size:0.75rem;">—</span>'
-            c3.markdown(ratio_html, unsafe_allow_html=True)
+                pct_html = '<span style="color:#94a3b8;font-size:0.75rem;">—</span>'
+            c3.markdown(pct_html, unsafe_allow_html=True)
 
             notes_val = c4.text_input(
-                "notes",
-                value=existing.get("notes", "") or "",
-                key=f"notes_{istart}",
-                label_visibility="collapsed",
+                "notes", value=existing.get("notes", "") or "",
+                key=f"notes_{istart}", label_visibility="collapsed",
                 placeholder="optional",
             )
 
@@ -253,26 +240,21 @@ def render():
 
         st.markdown("")
         sc1, sc2 = st.columns([1, 4])
-        submitted = sc1.form_submit_button(
-            "💾  Save All Intervals",
-            type="primary",
-            use_container_width=True,
+        submitted  = sc1.form_submit_button(
+            "💾  Save", type="primary", use_container_width=True,
         )
-        clear_btn = sc2.form_submit_button(
-            "🔄  Reset to Saved",
-            use_container_width=False,
-        )
+        clear_btn  = sc2.form_submit_button("🔄  Reset to Saved")
 
     if clear_btn:
         st.rerun()
 
     if submitted:
-        # Only save rows that have at least an expected count
-        rows_to_save = [r for r in form_rows if r["expected_children"] > 0
-                        or r["actual_children"] is not None]
-
+        rows_to_save = [
+            r for r in form_rows
+            if r["expected_children"] > 0 or r["actual_children"] is not None
+        ]
         if not rows_to_save:
-            toast_error("Enter at least one expected or actual count before saving.")
+            toast_error("Enter at least one count before saving.")
         else:
             with st.spinner("Saving…"):
                 try:
@@ -291,156 +273,201 @@ def render():
                 except Exception as e:
                     toast_error(f"Could not save: {e}")
 
-    # ── Tip ───────────────────────────────────────────────────────────
     st.markdown("")
     st.caption(
-        "💡 **Tip:** These counts feed directly into the Ratio Monitor. "
-        "Fill in 'Expected' the evening before to help with roster planning. "
-        "Update 'Actual' during the day for live compliance tracking."
+        "💡 Counts feed the Ratio Monitor. "
+        "Use 'Expected' for planning, 'Actual' for live tracking."
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV UPLOAD SECTION
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── CSV attendance upload ──────────────────────────────────────────────────────
-
-def _render_csv_upload(now_str: str):
+def _render_csv_upload(
+    centre_id: str,
+    rooms: list[dict],
+    intervals: list[dict],
+    date_str: str,
+):
     """
-    Optional CSV upload section.  Completely self-contained — no writes to the
-    database, no effect on the interval entry form below.
+    CSV upload → interval count preview → Save to Supabase.
 
-    Expected CSV columns (case-insensitive, extra columns ignored):
-        child_name   — any text identifier
-        start_time   — HH:MM or HH:MM:SS  (required)
-        finish_time  — HH:MM or HH:MM:SS  (blank = child still present)
+    Expected CSV columns:
+        child_name, room_name, start_time, end_time
 
-    Calculated and displayed:
-        • Total children in the file
-        • Currently present  (finish_time blank OR finish_time > now)
-        • Earliest start time
-        • Latest finish time (among those who have left)
+    All parsing and interval calculation is handled by csv_attendance_import.py.
+    This function handles only display and the save action.
     """
-    with st.expander("📂  Upload CSV attendance file (optional)", expanded=False):
+    st.markdown("### 📂 Import from CSV")
+    st.caption(
+        "Upload a CSV with one row per child. "
+        "The app calculates how many children are in each room for every 15-minute interval."
+    )
+
+    # Template download
+    sample = (
+        "child_name,room_name,start_time,end_time\n"
+        "Mia,Babies,08:00,16:30\n"
+        "Leo,Babies,09:15,15:45\n"
+        "Ava,Toddlers,07:30,17:00\n"
+        "Noah,Preschool,09:00,15:00\n"
+    )
+    st.download_button(
+        "⬇️  Download sample CSV",
+        data=sample,
+        file_name="attendance_template.csv",
+        mime="text/csv",
+        key="dl_sample_csv",
+    )
+
+    uploaded = st.file_uploader(
+        "Choose CSV file",
+        type=["csv"],
+        key="csv_upload_widget",
+        label_visibility="collapsed",
+    )
+
+    if uploaded is None:
+        st.caption("No file selected.")
+        return
+
+    # ── Parse ─────────────────────────────────────────────────────────
+    result = parse_csv(
+        file_bytes=uploaded.read(),
+        rooms=rooms,
+        intervals=intervals,
+    )
+
+    # ── Errors (blocking) ─────────────────────────────────────────────
+    if result["errors"]:
+        for err in result["errors"]:
+            st.error(f"❌ {err}")
+        # Still show warnings even when blocked
+        for warn in result["warnings"]:
+            st.warning(f"⚠️ {warn}")
+        return
+
+    # ── Warnings (non-blocking) ───────────────────────────────────────
+    for warn in result["warnings"]:
+        st.warning(f"⚠️ {warn}")
+
+    preview_df  = result["preview_df"]
+    room_counts = result["room_counts"]
+    n_children  = result["n_children"]
+    n_skipped   = result["n_skipped"]
+
+    # ── Summary metrics ───────────────────────────────────────────────
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Children loaded",  n_children)
+    m2.metric("Rows skipped",     n_skipped,
+              delta="see warnings" if n_skipped else None,
+              delta_color="inverse" if n_skipped else "off")
+    m3.metric("Rooms with data",  len(room_counts))
+
+    # ── Per-child preview table ───────────────────────────────────────
+    st.markdown("**Per-child preview**")
+    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    # ── Per-room interval count preview ──────────────────────────────
+    if room_counts:
+        st.markdown("**Calculated interval counts by room**")
         st.caption(
-            "Upload a CSV with columns: **child_name**, **start_time**, **finish_time**. "
-            "Blank finish_time = child still present. No data is saved to the database."
+            "These counts will be saved as **Expected children** for each interval. "
+            "You can edit them in the manual form below after saving."
         )
 
-        uploaded = st.file_uploader(
-            "Choose CSV file",
-            type=["csv"],
-            key="csv_upload_widget",
-            label_visibility="collapsed",
-        )
+        room_name_map = {r["id"]: r["name"] for r in rooms}
 
-        if uploaded is None:
+        for rid, counts in room_counts.items():
+            rname  = room_name_map.get(rid, rid)
+            colour = next(
+                (r.get("colour", "#3498DB") for r in rooms if r["id"] == rid),
+                "#3498DB",
+            )
+
+            # Build display table: only non-zero intervals
+            nonzero = [
+                {"Time": iv[:5], "Expected children": cnt}
+                for iv, cnt in sorted(counts.items())
+                if cnt > 0
+            ]
+
+            if not nonzero:
+                continue
+
+            peak = max(v["Expected children"] for v in nonzero)
+
             st.markdown(
-                '<p style="font-size:0.82rem;color:#94a3b8;">No file selected.</p>',
+                f'<div style="display:flex;align-items:center;gap:0.5rem;'
+                f'margin-bottom:0.3rem;">'
+                f'<div style="width:10px;height:10px;border-radius:50%;'
+                f'background:{colour};"></div>'
+                f'<strong style="font-size:0.9rem;">{rname}</strong>'
+                f'<span style="font-size:0.8rem;color:#7a90a8;margin-left:0.4rem;">'
+                f'Peak {peak} · {len(nonzero)} interval(s)</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
-            return
-
-        # ── Parse ─────────────────────────────────────────────────────
-        try:
-            df = pd.read_csv(io.StringIO(uploaded.read().decode("utf-8", errors="replace")))
-        except Exception as e:
-            st.error(f"❌ Could not read CSV: {e}")
-            return
-
-        # Normalise column names: strip whitespace, lowercase
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-        required = {"start_time"}
-        missing  = required - set(df.columns)
-        if missing:
-            st.error(
-                f"❌ CSV is missing required column(s): **{', '.join(sorted(missing))}**. "
-                f"Found columns: {list(df.columns)}"
+            st.dataframe(
+                pd.DataFrame(nonzero),
+                use_container_width=True,
+                hide_index=True,
             )
-            return
 
-        # Add child_name column if absent (not required — just display)
-        if "child_name" not in df.columns:
-            df["child_name"] = [f"Child {i+1}" for i in range(len(df))]
+    # ── Save button ───────────────────────────────────────────────────
+    st.markdown("")
+    if not room_counts:
+        st.info("No interval data to save — all rooms were skipped or had no children.")
+        return
 
-        if "finish_time" not in df.columns:
-            df["finish_time"] = None
+    if st.button(
+        f"💾  Save to Supabase — {date_str}",
+        type="primary",
+        key="csv_save_btn",
+    ):
+        rows_by_room = room_counts_to_upsert_rows(room_counts, intervals)
+        saved_rooms  = 0
+        saved_ivs    = 0
+        errors_saving = []
 
-        # Keep only the three canonical columns; drop extras for display
-        display_df = df[["child_name", "start_time", "finish_time"]].copy()
-
-        def _parse_time(val) -> str | None:
-            """Parse a time cell into HH:MM:SS string, or None if blank/invalid."""
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                return None
-            s = str(val).strip()
-            if not s:
-                return None
-            for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p"):
+        with st.spinner("Saving interval counts…"):
+            for rid, rows in rows_by_room.items():
                 try:
-                    return datetime.strptime(s, fmt).strftime("%H:%M:%S")
-                except ValueError:
-                    continue
-            return None  # unparseable — treat as blank
+                    n = upsert_all_intervals(
+                        centre_id=centre_id,
+                        room_id=rid,
+                        attendance_date=date_str,
+                        rows=rows,
+                    )
+                    saved_rooms += 1
+                    saved_ivs   += n
+                except Exception as exc:
+                    rname = room_name_map.get(rid, rid)   # type: ignore[name-defined]
+                    errors_saving.append(f"{rname}: {exc}")
 
-        start_times  = [_parse_time(v) for v in display_df["start_time"]]
-        finish_times = [_parse_time(v) for v in display_df["finish_time"]]
+        if errors_saving:
+            for e in errors_saving:
+                toast_error(f"Could not save {e}")
+        if saved_rooms > 0:
+            toast_success(
+                f"Saved {saved_ivs} interval(s) across "
+                f"{saved_rooms} room(s) for {date_str}."
+            )
+            st.rerun()
 
-        # ── Calculations ──────────────────────────────────────────────
-        total_children = len(display_df)
 
-        # Present = finish_time is None/blank OR finish_time > now_str
-        currently_present = sum(
-            1 for ft in finish_times
-            if ft is None or ft > now_str
-        )
-
-        valid_starts  = [t for t in start_times  if t is not None]
-        valid_finishes= [t for t in finish_times if t is not None]
-
-        earliest_start  = min(valid_starts)[:5]   if valid_starts   else "—"
-        latest_finish   = max(valid_finishes)[:5]  if valid_finishes else "—"
-
-        # ── Summary metrics ───────────────────────────────────────────
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total children",     total_children)
-        m2.metric("Currently present",  currently_present)
-        m3.metric("Earliest start",     earliest_start)
-        m4.metric("Latest finish",      latest_finish)
-
-        # ── Table ─────────────────────────────────────────────────────
-        # Add a "Present now?" column for clarity
-        display_df = display_df.copy()
-        display_df["present_now"] = [
-            "✅ Yes" if ft is None or ft > now_str else "🔴 No"
-            for ft in finish_times
-        ]
-        # Rename columns for display
-        display_df.columns = ["Child", "Start", "Finish", "Present now?"]
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.caption(
-            f"ℹ️ {total_children} row(s) loaded from **{uploaded.name}**. "
-            "This data is not saved — use the interval form below to persist counts."
-        )
-
-# ── Day summary strip across all rooms ────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DAY SUMMARY STRIP
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _render_day_summary(
-    saved: list[dict],      # intervals for currently selected room
     rooms: list[dict],
     selected_room_id: str,
     centre_id: str,
     date_str: str,
 ):
-    """
-    Show a compact summary row per room for the selected day,
-    so the user can see at a glance which rooms have data.
-    """
+    """Compact per-room summary for the selected date."""
     with st.spinner("Loading centre summary…"):
         try:
             all_intervals = fetch_intervals_for_centre(centre_id, date_str)
@@ -448,43 +475,40 @@ def _render_day_summary(
             all_intervals = []
 
     st.markdown(f"### 📅 {date_str} — All Rooms")
-    cols = st.columns(len(rooms)) if rooms else []
+    if not rooms:
+        return
 
+    cols = st.columns(len(rooms))
     for i, room in enumerate(rooms):
         rid    = room["id"]
         colour = room.get("colour", "#3498DB")
         rname  = room.get("name", "")
         cap    = room.get("licensed_capacity", 0)
+
         room_ivs = [r for r in all_intervals if r.get("room_id") == rid]
 
         if not room_ivs:
-            n_exp  = 0
-            n_act  = None
-            status = "no_data"
+            content = '<span style="font-size:0.75rem;color:#94a3b8;">No data</span>'
         else:
             peak_exp = max(int(r.get("expected_children") or 0) for r in room_ivs)
             act_rows = [r for r in room_ivs if r.get("actual_children") is not None]
-            peak_act = max(int(r.get("actual_children") or 0) for r in act_rows) if act_rows else None
-            n_exp    = peak_exp
-            n_act    = peak_act
-            status   = "has_data"
-
-        is_selected = rid == selected_room_id
-        border = f"2px solid {colour}" if is_selected else "1px solid #e4edf5"
-        bg     = f"{colour}12" if is_selected else "#fafcfe"
-
-        if status == "no_data":
-            content = '<span style="font-size:0.75rem;color:#94a3b8;">No data</span>'
-        else:
-            pct = round((n_exp / cap) * 100) if cap else 0
-            act_str = f" / {n_act} actual" if n_act is not None else ""
+            peak_act = (
+                max(int(r.get("actual_children") or 0) for r in act_rows)
+                if act_rows else None
+            )
+            pct     = round((peak_exp / cap) * 100) if cap else 0
+            act_str = f" / {peak_act} actual" if peak_act is not None else ""
             content = (
                 f'<span style="font-size:0.78rem;color:#0d1f35;">'
-                f'Peak {n_exp}{act_str}</span><br>'
+                f'Peak {peak_exp}{act_str}</span><br>'
                 f'<span style="font-size:0.7rem;color:#7a90a8;">{pct}% of {cap}</span>'
             )
 
-        cols[i % len(cols)].markdown(
+        is_sel = rid == selected_room_id
+        border = f"2px solid {colour}" if is_sel else "1px solid #e4edf5"
+        bg     = f"{colour}12"         if is_sel else "#fafcfe"
+
+        cols[i].markdown(
             f'<div style="border:{border};background:{bg};border-radius:8px;'
             f'padding:0.5rem 0.6rem;text-align:center;margin-bottom:0.3rem;">'
             f'<div style="display:flex;align-items:center;justify-content:center;'
