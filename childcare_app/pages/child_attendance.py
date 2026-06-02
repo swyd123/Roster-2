@@ -1,10 +1,15 @@
 # pages/child_attendance.py — Child Attendance / Room Occupancy
 #
 # Two ways to enter data:
-#   1. CSV upload  — upload a per-child file → auto-fills interval counts
-#   2. Manual form — edit counts directly per 15-min interval
+#   1. CSV upload  → calculates interval counts → pre-fills editable grid
+#   2. Manual entry → edit counts directly in the grid
 #
-# Both paths write to room_attendance_intervals via upsert_all_intervals.
+# Session state key "csv_prefill_{room_id}_{date_str}" bridges the CSV
+# parser and the grid: parse_csv writes counts there; the grid reads them
+# as default values for number_input widgets; the Save button captures
+# whatever the user typed (not the raw CSV values), so manual edits stick.
+#
+# No .single() anywhere.
 
 import io
 import streamlit as st
@@ -26,6 +31,18 @@ from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_centres
 from utils.centre_queries import fetch_centre_by_id
 from utils.helpers import toast_success, toast_error
+
+
+# ── Session state key helpers ─────────────────────────────────────────────────
+
+def _prefill_key(room_id: str, date_str: str) -> str:
+    """Key for CSV-derived prefill counts: {interval_start → count}."""
+    return f"csv_prefill_{room_id}_{date_str}"
+
+
+def _csv_result_key(date_str: str) -> str:
+    """Key for the full parse_csv result (preview, warnings, room_counts)."""
+    return f"csv_result_{date_str}"
 
 
 def render():
@@ -73,6 +90,7 @@ def render():
         key="att_date",
         format="DD/MM/YYYY",
     )
+    date_str = attendance_date.isoformat()
 
     # ── Load centre + rooms ───────────────────────────────────────────
     with st.spinner("Loading…"):
@@ -98,22 +116,21 @@ def render():
         )
         return
 
-    # ── Room selector (for manual form) ──────────────────────────────
+    # ── Room selector ─────────────────────────────────────────────────
     room_opts = {r["id"]: r["name"] for r in rooms}
     room_id   = cc3.selectbox(
-        "Room (manual entry)",
+        "Room",
         options=list(room_opts.keys()),
         format_func=lambda x: room_opts[x],
         key="att_room_sel",
     )
     selected_room = next((r for r in rooms if r["id"] == room_id), {})
 
-    date_str = attendance_date.isoformat()
-    colour   = selected_room.get("colour", "#3498DB")
-    capacity = selected_room.get("licensed_capacity", 0)
+    colour     = selected_room.get("colour", "#3498DB")
+    capacity   = selected_room.get("licensed_capacity", 0)
     r_children = selected_room.get("required_ratio_children", 4)
 
-    # ── Load existing data for the selected room ──────────────────────
+    # ── Load saved data from Supabase ─────────────────────────────────
     with st.spinner("Loading intervals…"):
         try:
             saved = fetch_intervals_for_room(room_id, date_str)
@@ -132,16 +149,33 @@ def render():
     st.markdown("---")
 
     # ── CSV upload section ────────────────────────────────────────────
+    # This section parses the CSV and stores room_counts in session state.
+    # It does NOT rerun — the grid below reads from session state immediately
+    # on the same render pass so pre-fill values appear without a second click.
     _render_csv_upload(
         centre_id=centre_id,
         rooms=rooms,
         intervals=intervals,
         date_str=date_str,
+        room_id=room_id,
     )
 
     st.markdown("---")
 
-    # ── Manual interval entry form ────────────────────────────────────
+    # ── Interval grid ─────────────────────────────────────────────────
+    # Value priority for each interval's expected count:
+    #   1. CSV prefill (written by _render_csv_upload into session state)
+    #   2. Supabase saved value (saved_map)
+    #   3. Zero
+    #
+    # The number_input widget captures whatever the user types.
+    # Saving uses the widget values, not the prefill — so manual edits are
+    # always honoured.
+
+    prefill_key    = _prefill_key(room_id, date_str)
+    csv_prefill    = st.session_state.get(prefill_key, {})
+    prefill_active = bool(csv_prefill)
+
     now      = datetime.now().strftime("%H:%M:%S")
     is_today = attendance_date == date.today()
 
@@ -159,23 +193,29 @@ def render():
         unsafe_allow_html=True,
     )
 
-    if n_saved:
-        st.caption(f"✅ {n_saved} of {len(intervals)} intervals have data saved.")
+    if prefill_active:
+        n_prefilled = sum(1 for v in csv_prefill.values() if v > 0)
+        st.info(
+            f"📋 **{n_prefilled} interval(s) pre-filled from CSV.** "
+            "Edit any values below, then click **Save** to persist."
+        )
+    elif n_saved:
+        st.caption(f"✅ {n_saved} of {len(intervals)} intervals have saved data.")
     else:
         st.info(
-            "No attendance data saved yet for this room and date. "
-            "Upload a CSV above, or fill in the counts below and click **Save**."
+            "No data yet. Upload a CSV above, or fill in the counts below and click **Save**."
         )
 
     st.markdown(
-        "**Manual entry** — expected and actual child counts per 15-minute interval."
+        "**Expected and actual child counts per 15-minute interval.**"
     )
 
+    # Column headers
     hc0, hc1, hc2, hc3, hc4 = st.columns([1.8, 1.4, 1.4, 1.4, 2.0])
     hc0.markdown("**Time**")
     hc1.markdown("**Expected**")
     hc2.markdown("**Actual**")
-    hc3.markdown("**Capacity %**")
+    hc3.markdown("**Cap %**")
     hc4.markdown("**Notes**")
 
     form_rows = []
@@ -186,6 +226,12 @@ def render():
             label    = iv["label"]
             existing = saved_map.get(istart, {})
             is_now   = is_today and istart <= now < iend
+
+            # Value priority: CSV prefill → Supabase saved → 0
+            if istart in csv_prefill:
+                exp_default = int(csv_prefill[istart])
+            else:
+                exp_default = int(existing.get("expected_children") or 0)
 
             label_html = (
                 f'<span style="font-size:0.82rem;'
@@ -198,35 +244,53 @@ def render():
             c0.markdown(label_html, unsafe_allow_html=True)
 
             exp = c1.number_input(
-                "exp", min_value=0, max_value=capacity or 100,
-                value=int(existing.get("expected_children") or 0),
-                key=f"exp_{istart}", label_visibility="collapsed", step=1,
+                "exp",
+                min_value=0,
+                max_value=capacity or 100,
+                value=exp_default,
+                key=f"exp_{istart}",
+                label_visibility="collapsed",
+                step=1,
             )
 
             act_val = existing.get("actual_children")
             act = c2.number_input(
-                "act", min_value=0, max_value=capacity or 100,
+                "act",
+                min_value=0,
+                max_value=capacity or 100,
                 value=int(act_val) if act_val is not None else 0,
-                key=f"act_{istart}", label_visibility="collapsed", step=1,
+                key=f"act_{istart}",
+                label_visibility="collapsed",
+                step=1,
             )
             actual_to_save = act if (act > 0 or act_val is not None) else None
 
+            # Capacity % indicator
             n_for_pct = act if (act_val is not None or act > 0) else exp
             if n_for_pct > 0 and capacity:
                 pct = round((n_for_pct / capacity) * 100)
                 if pct >= 100:
-                    pct_html = f'<span style="color:#991b1b;font-size:0.75rem;">⚠ {pct}%</span>'
+                    pct_html = (
+                        f'<span style="color:#991b1b;font-size:0.75rem;">⚠ {pct}%</span>'
+                    )
                 elif pct >= 80:
-                    pct_html = f'<span style="color:#92400e;font-size:0.75rem;">{pct}%</span>'
+                    pct_html = (
+                        f'<span style="color:#92400e;font-size:0.75rem;">{pct}%</span>'
+                    )
                 else:
-                    pct_html = f'<span style="color:#14532d;font-size:0.75rem;">{pct}%</span>'
+                    pct_html = (
+                        f'<span style="color:#14532d;font-size:0.75rem;">{pct}%</span>'
+                    )
             else:
                 pct_html = '<span style="color:#94a3b8;font-size:0.75rem;">—</span>'
             c3.markdown(pct_html, unsafe_allow_html=True)
 
+            notes_default = existing.get("notes", "") or ""
             notes_val = c4.text_input(
-                "notes", value=existing.get("notes", "") or "",
-                key=f"notes_{istart}", label_visibility="collapsed",
+                "notes",
+                value=notes_default,
+                key=f"notes_{istart}",
+                label_visibility="collapsed",
                 placeholder="optional",
             )
 
@@ -239,13 +303,18 @@ def render():
             })
 
         st.markdown("")
-        sc1, sc2 = st.columns([1, 4])
-        submitted  = sc1.form_submit_button(
+        sc1, sc2, sc3 = st.columns([1.2, 1.2, 4])
+        submitted = sc1.form_submit_button(
             "💾  Save", type="primary", use_container_width=True,
         )
-        clear_btn  = sc2.form_submit_button("🔄  Reset to Saved")
+        clear_btn = sc2.form_submit_button(
+            "🔄  Reset", use_container_width=True,
+        )
 
     if clear_btn:
+        # Clear CSV prefill so the grid reloads from Supabase
+        st.session_state.pop(prefill_key, None)
+        st.session_state.pop(_csv_result_key(date_str), None)
         st.rerun()
 
     if submitted:
@@ -269,6 +338,9 @@ def render():
                         f"{selected_room.get('name','')} — "
                         f"{attendance_date.strftime('%-d %b %Y')}."
                     )
+                    # Clear the CSV prefill now that data is saved to Supabase
+                    st.session_state.pop(prefill_key, None)
+                    st.session_state.pop(_csv_result_key(date_str), None)
                     st.rerun()
                 except Exception as e:
                     toast_error(f"Could not save: {e}")
@@ -276,7 +348,7 @@ def render():
     st.markdown("")
     st.caption(
         "💡 Counts feed the Ratio Monitor. "
-        "Use 'Expected' for planning, 'Actual' for live tracking."
+        "Use 'Expected' for planning the day, 'Actual' for live tracking."
     )
 
 
@@ -289,23 +361,27 @@ def _render_csv_upload(
     rooms: list[dict],
     intervals: list[dict],
     date_str: str,
+    room_id: str,
 ):
     """
-    CSV upload → interval count preview → Save to Supabase.
+    CSV upload → parse → store counts in session state → pre-fill grid.
 
-    Expected CSV columns:
-        child_name, room_name, start_time, end_time
-
-    All parsing and interval calculation is handled by csv_attendance_import.py.
-    This function handles only display and the save action.
+    Key design decisions:
+    - Does NOT call st.rerun() after parsing. The grid on the same page
+      reads from session state immediately in the same render pass.
+    - Stores parse_csv result under _csv_result_key so warnings/preview
+      survive reruns (e.g. after the user edits a number_input).
+    - Stores per-room prefill counts under _prefill_key(room_id, date_str).
+    - The Save button in the main grid (not here) persists to Supabase.
     """
     st.markdown("### 📂 Import from CSV")
     st.caption(
         "Upload a CSV with one row per child. "
-        "The app calculates how many children are in each room for every 15-minute interval."
+        "The app counts how many children are in each room at every 15-minute interval "
+        "and pre-fills the editable grid below."
     )
 
-    # Template download
+    # ── Sample download ───────────────────────────────────────────────
     sample = (
         "child_name,room_name,start_time,end_time\n"
         "Mia,Babies,08:00,16:30\n"
@@ -321,6 +397,7 @@ def _render_csv_upload(
         key="dl_sample_csv",
     )
 
+    # ── File uploader ─────────────────────────────────────────────────
     uploaded = st.file_uploader(
         "Choose CSV file",
         type=["csv"],
@@ -328,22 +405,53 @@ def _render_csv_upload(
         label_visibility="collapsed",
     )
 
+    result_key  = _csv_result_key(date_str)
+    prefill_key = _prefill_key(room_id, date_str)
+
     if uploaded is None:
+        # No file in uploader.  If we have a cached result from a previous
+        # upload in this session, clear it so the grid reverts to saved data.
+        if result_key in st.session_state:
+            st.session_state.pop(result_key, None)
+            # Do NOT pop prefill_key here — user may have already edited the
+            # grid and not yet saved. Clearing prefill would wipe their edits.
         st.caption("No file selected.")
         return
 
-    # ── Parse ─────────────────────────────────────────────────────────
-    result = parse_csv(
-        file_bytes=uploaded.read(),
-        rooms=rooms,
-        intervals=intervals,
-    )
+    # ── Parse (or use cached result for this date) ────────────────────
+    # Re-parse every time a new file is uploaded.  Streamlit gives uploaded
+    # a new object on every render when a file is present, but the file
+    # bytes are the same if the user hasn't changed the file.  Using a
+    # cache keyed on (filename, size) avoids re-parsing on every re-render
+    # caused by number_input interactions.
+    cache_sig = f"{uploaded.name}_{uploaded.size}"
+    cached    = st.session_state.get(result_key)
+
+    if cached is None or cached.get("_sig") != cache_sig:
+        # Fresh parse
+        raw_bytes = uploaded.read()
+        result    = parse_csv(
+            file_bytes=raw_bytes,
+            rooms=rooms,
+            intervals=intervals,
+        )
+        result["_sig"] = cache_sig
+        st.session_state[result_key] = result
+
+        # Write prefill counts for every room into session state.
+        # The grid for the currently selected room reads from prefill_key.
+        # If the CSV covers other rooms too, their prefill keys are also set
+        # so switching rooms immediately shows the right counts.
+        if result["room_counts"]:
+            for rid, counts in result["room_counts"].items():
+                st.session_state[_prefill_key(rid, date_str)] = counts
+    else:
+        result = cached
 
     # ── Errors (blocking) ─────────────────────────────────────────────
     if result["errors"]:
         for err in result["errors"]:
             st.error(f"❌ {err}")
-        # Still show warnings even when blocked
         for warn in result["warnings"]:
             st.warning(f"⚠️ {warn}")
         return
@@ -359,13 +467,13 @@ def _render_csv_upload(
 
     # ── Summary metrics ───────────────────────────────────────────────
     m1, m2, m3 = st.columns(3)
-    m1.metric("Children loaded",  n_children)
-    m2.metric("Rows skipped",     n_skipped,
+    m1.metric("Children loaded", n_children)
+    m2.metric("Rows skipped",    n_skipped,
               delta="see warnings" if n_skipped else None,
               delta_color="inverse" if n_skipped else "off")
-    m3.metric("Rooms with data",  len(room_counts))
+    m3.metric("Rooms with data", len(room_counts))
 
-    # ── Per-child preview table ───────────────────────────────────────
+    # ── Per-child preview ─────────────────────────────────────────────
     st.markdown("**Per-child preview**")
     st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
@@ -373,8 +481,8 @@ def _render_csv_upload(
     if room_counts:
         st.markdown("**Calculated interval counts by room**")
         st.caption(
-            "These counts will be saved as **Expected children** for each interval. "
-            "You can edit them in the manual form below after saving."
+            "These counts have been loaded into the editable grid below. "
+            "Edit any value before saving."
         )
 
         room_name_map = {r["id"]: r["name"] for r in rooms}
@@ -385,19 +493,15 @@ def _render_csv_upload(
                 (r.get("colour", "#3498DB") for r in rooms if r["id"] == rid),
                 "#3498DB",
             )
-
-            # Build display table: only non-zero intervals
             nonzero = [
-                {"Time": iv[:5], "Expected children": cnt}
-                for iv, cnt in sorted(counts.items())
+                {"Time": iv_start[:5], "Expected children": cnt}
+                for iv_start, cnt in sorted(counts.items())
                 if cnt > 0
             ]
-
             if not nonzero:
                 continue
 
             peak = max(v["Expected children"] for v in nonzero)
-
             st.markdown(
                 f'<div style="display:flex;align-items:center;gap:0.5rem;'
                 f'margin-bottom:0.3rem;">'
@@ -405,7 +509,7 @@ def _render_csv_upload(
                 f'background:{colour};"></div>'
                 f'<strong style="font-size:0.9rem;">{rname}</strong>'
                 f'<span style="font-size:0.8rem;color:#7a90a8;margin-left:0.4rem;">'
-                f'Peak {peak} · {len(nonzero)} interval(s)</span>'
+                f'Peak {peak} · {len(nonzero)} interval(s) with children</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -415,46 +519,14 @@ def _render_csv_upload(
                 hide_index=True,
             )
 
-    # ── Save button ───────────────────────────────────────────────────
-    st.markdown("")
-    if not room_counts:
-        st.info("No interval data to save — all rooms were skipped or had no children.")
-        return
-
-    if st.button(
-        f"💾  Save to Supabase — {date_str}",
-        type="primary",
-        key="csv_save_btn",
-    ):
-        rows_by_room = room_counts_to_upsert_rows(room_counts, intervals)
-        saved_rooms  = 0
-        saved_ivs    = 0
-        errors_saving = []
-
-        with st.spinner("Saving interval counts…"):
-            for rid, rows in rows_by_room.items():
-                try:
-                    n = upsert_all_intervals(
-                        centre_id=centre_id,
-                        room_id=rid,
-                        attendance_date=date_str,
-                        rows=rows,
-                    )
-                    saved_rooms += 1
-                    saved_ivs   += n
-                except Exception as exc:
-                    rname = room_name_map.get(rid, rid)   # type: ignore[name-defined]
-                    errors_saving.append(f"{rname}: {exc}")
-
-        if errors_saving:
-            for e in errors_saving:
-                toast_error(f"Could not save {e}")
-        if saved_rooms > 0:
-            toast_success(
-                f"Saved {saved_ivs} interval(s) across "
-                f"{saved_rooms} room(s) for {date_str}."
-            )
-            st.rerun()
+    if room_counts:
+        selected_room_name = room_name_map.get(room_id, "the selected room")  # type: ignore[name-defined]
+        st.success(
+            f"✅ Grid pre-filled for **{selected_room_name}**. "
+            "Scroll down to review and edit, then click **Save**."
+        )
+    else:
+        st.info("No interval data could be calculated — all rows were skipped.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
