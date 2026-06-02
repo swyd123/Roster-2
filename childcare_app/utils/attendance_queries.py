@@ -144,19 +144,27 @@ def upsert_interval(
     expected_children: int,
     actual_children: int | None,
     notes: str = "",
+    preserve_expected: bool = False,
 ) -> dict:
     """
     Insert or update a single 15-minute interval row.
 
-    Uses a check-then-insert/update pattern (no .single()) that is safe
-    against the UNIQUE constraint on (room_id, attendance_date, interval_start).
-    If a row already exists it is updated in-place; no duplicates are created.
+    preserve_expected=True (used by CSV import):
+        When updating an existing row, leave expected_children unchanged.
+        Only actual_children and notes are updated.
+        When inserting a new row, expected_children defaults to 0.
+
+    preserve_expected=False (default, used by the manual grid):
+        Both expected_children and actual_children are written as supplied.
+
+    No .single() — uses check-then-insert/update pattern.
+    Safe against the UNIQUE constraint on (room_id, attendance_date, interval_start).
     """
     sb = get_supabase_client()
 
     existing = (
         sb.from_("room_attendance_intervals")
-        .select("id")
+        .select("id, expected_children")
         .eq("room_id", room_id)
         .eq("attendance_date", attendance_date)
         .eq("interval_start", interval_start)
@@ -166,18 +174,30 @@ def upsert_interval(
 
     if existing:
         row_id = existing[0]["id"]
-        result = _one(
-            sb.from_("room_attendance_intervals")
-            .update({
+
+        if preserve_expected:
+            # CSV import path: keep the previously planned expected count
+            update_payload = {
+                "actual_children": actual_children,
+                "notes":           notes.strip() or None,
+            }
+        else:
+            # Manual grid path: overwrite both columns as supplied
+            update_payload = {
                 "expected_children": expected_children,
                 "actual_children":   actual_children,
                 "notes":             notes.strip() or None,
-            })
+            }
+
+        result = _one(
+            sb.from_("room_attendance_intervals")
+            .update(update_payload)
             .eq("id", row_id)
             .select()
             .execute()
         )
     else:
+        # New row — expected_children is 0 when coming from CSV import
         result = _one(
             sb.from_("room_attendance_intervals")
             .insert({
@@ -211,6 +231,7 @@ def upsert_all_intervals(
     room_id: str,
     attendance_date: str,
     rows: list[dict],
+    preserve_expected: bool = False,
 ) -> int:
     """
     Upsert a list of intervals for one room on one date.
@@ -218,13 +239,14 @@ def upsert_all_intervals(
     Each row dict must contain:
         interval_start    — "HH:MM:SS"
         interval_end      — "HH:MM:SS"
-        expected_children — int
+        expected_children — int  (ignored when preserve_expected=True on update)
         actual_children   — int or None
         notes             — str (optional)
 
+    preserve_expected=True  → CSV import: don't overwrite planned headcounts.
+    preserve_expected=False → Manual grid: write both columns as given.
+
     Returns count of rows saved.
-    Existing rows are updated; missing rows are inserted.
-    No duplicates are ever created.
     """
     saved = 0
     for row in rows:
@@ -237,6 +259,7 @@ def upsert_all_intervals(
             expected_children=int(row.get("expected_children") or 0),
             actual_children=row.get("actual_children"),
             notes=row.get("notes", "") or "",
+            preserve_expected=preserve_expected,
         )
         saved += 1
     return saved
@@ -251,20 +274,14 @@ def upsert_bulk_import(
     tasks: list[dict],
 ) -> tuple[int, int, list[str]]:
     """
-    Save all tasks produced by csv_attendance_import.build_bulk_upsert_plan()
-    to Supabase.
+    Save all tasks from build_bulk_upsert_plan() to Supabase.
 
-    Each task is a dict:
-        date_str — "YYYY-MM-DD"
-        room_id  — UUID string
-        rows     — list of row dicts (same format as upsert_all_intervals)
+    Each task: {date_str, room_id, rows: [row_dict, ...]}
 
-    Returns:
-        (total_intervals_saved, total_room_dates_saved, error_messages)
+    Uses preserve_expected=True so that CSV imports update actual_children
+    without overwriting any existing planned expected_children counts.
 
-    Errors per task are collected and returned rather than raising, so a
-    failure on one room/date does not prevent the remaining tasks from saving.
-    Existing rows are updated; no duplicates are created.
+    Returns (total_intervals_saved, total_room_dates_saved, error_messages).
     """
     total_ivs   = 0
     total_rooms = 0
@@ -277,6 +294,7 @@ def upsert_bulk_import(
                 room_id=task["room_id"],
                 attendance_date=task["date_str"],
                 rows=task["rows"],
+                preserve_expected=True,   # CSV import — preserve planned counts
             )
             total_ivs   += n
             total_rooms += 1
@@ -295,22 +313,11 @@ def upsert_single_date_from_bulk(
     intervals: list[dict],
 ) -> tuple[int, int, list[str]]:
     """
-    Save one date's worth of data from a bulk import result without requiring
-    the caller to run build_bulk_upsert_plan() themselves.
+    Save one date's CSV data as actual_children without touching
+    existing expected_children values.
 
-    Parameters
-    ----------
-    centre_id    UUID of the centre.
-    date_str     "YYYY-MM-DD" — the single date to save.
-    room_counts  {room_id: {interval_start: count}} for that date.
-                 Comes directly from date_room_counts[date_str] in the
-                 parse_csv_bulk() result.
-    intervals    The centre's interval list from generate_intervals().
-                 Used to look up interval_end for each interval_start.
-
-    Returns
-    -------
-    (total_intervals_saved, total_room_dates_saved, error_messages)
+    room_counts comes directly from date_room_counts[date_str] in the
+    parse_csv_bulk() result.
     """
     from utils.csv_attendance_import import room_counts_to_upsert_rows
 
@@ -328,23 +335,10 @@ def upsert_all_dates_from_bulk(
     intervals: list[dict],
 ) -> tuple[int, int, list[str]]:
     """
-    Save every date in a bulk import result to Supabase in one call.
+    Save every date in a bulk import result as actual_children without
+    touching existing expected_children values.
 
-    Parameters
-    ----------
-    centre_id         UUID of the centre.
-    date_room_counts  {date_str: {room_id: {interval_start: count}}}.
-                      This is the date_room_counts value returned directly
-                      from parse_csv_bulk().
-    intervals         The centre's interval list from generate_intervals().
-
-    Returns
-    -------
-    (total_intervals_saved, total_room_dates_saved, error_messages)
-
-    Each room×date combination is saved independently.  A failure on one
-    does not stop the others from saving.  Existing rows are updated in-place;
-    no duplicates are ever created.
+    date_room_counts comes directly from parse_csv_bulk().
     """
     from utils.csv_attendance_import import build_bulk_upsert_plan
 
@@ -358,13 +352,15 @@ def upsert_all_dates_from_bulk(
 
 def intervals_to_slot_counts(
     intervals: list[dict],
-    use_actual: bool = False,
+    use_actual: bool = True,
 ) -> dict[str, list[int]]:
     """
     Convert interval rows into a slot-indexed count dict keyed by room_id.
     Slot 0 = 06:00, each slot = 15 min.
 
-    use_actual=True → prefer actual_children when set, fall back to expected.
+    use_actual=True  → prefer actual_children when set, fall back to expected.
+                       This is the default: actual attendance data takes
+                       priority over planned headcounts.
     use_actual=False → always use expected_children.
     """
     from utils.roster_engine import TOTAL_SLOTS, time_to_slot
@@ -399,6 +395,9 @@ def get_children_count_for_room_at_time(
 ) -> int:
     """
     Return the child count for a room at a specific time (HH:MM:SS).
+
+    use_actual=True → prefer actual_children when recorded (CSV import),
+                      fall back to expected_children (manual planning entry).
     Returns 0 if no matching interval found.
     """
     for row in intervals:
