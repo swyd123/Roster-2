@@ -1,13 +1,16 @@
 # pages/child_attendance.py — Child Attendance / Room Occupancy
 #
 # Two data entry paths:
-#   1. Bulk CSV upload  → all rooms, all dates in one file → summary table
-#                      → select date+room to review → pre-fills editable grid
-#   2. Manual entry     → pick date and room → edit grid directly
+#   1. Bulk CSV upload  → all rooms, all dates → pre-fills Actual column in grid
+#   2. Manual entry     → pick date and room → edit Expected + Actual directly
 #
-# Session state bridges CSV → grid without a rerun:
+# CSV counts are stored in actual_children (real attendance).
+# expected_children is left unchanged on existing rows (planned headcounts).
+#
+# Session state:
 #   "bulk_import_result"           full parse_csv_bulk() result, cached by file sig
 #   _prefill_key(room_id, date)    {interval_start → count} for one room on one date
+#                                  these counts pre-fill the ACTUAL column
 #   "bulk_review_date"             date currently selected in the review picker
 #   "bulk_review_room"             room currently selected in the review picker
 #
@@ -38,6 +41,7 @@ from utils.helpers import toast_success, toast_error
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _prefill_key(room_id: str, date_str: str) -> str:
+    """Key for CSV-derived actual counts: {interval_start → count}."""
     return f"csv_prefill_{room_id}_{date_str}"
 
 def _bulk_result_key() -> str:
@@ -146,10 +150,11 @@ def _render_bulk_csv_section(
     st.markdown("### 📂 Bulk CSV Import")
     st.caption(
         "Upload one CSV file covering any number of rooms and dates. "
-        "Existing records are updated — no duplicates created."
+        "CSV counts populate **Actual attendance**. "
+        "Existing planned (Expected) counts are not overwritten."
     )
 
-    # ── Sample template download ──────────────────────────────────────
+    # ── Sample template ───────────────────────────────────────────────
     sample = (
         "attendance_date,child_name,room_name,start_time,end_time\n"
         "2026-06-01,Mia,Babies,08:00,16:30\n"
@@ -197,9 +202,8 @@ def _render_bulk_csv_section(
         result["_sig"] = sig
         st.session_state[bkey] = result
 
-        # Write prefill counts into session state for every room × date
-        # so the manual grid below immediately shows the right values
-        # when the user selects any combination.
+        # Write prefill counts into session state for every room × date.
+        # These counts will populate the ACTUAL column in the grid below.
         if result.get("date_room_counts"):
             for d_str, room_counts in result["date_room_counts"].items():
                 for rid, counts in room_counts.items():
@@ -238,8 +242,8 @@ def _render_bulk_csv_section(
               delta="see warnings" if n_skipped else None,
               delta_color="inverse" if n_skipped else "off")
 
-    # ── Summary table: one row per date × room ────────────────────────
-    st.markdown("**Import summary — by date and room**")
+    # ── Summary table ─────────────────────────────────────────────────
+    st.markdown("**Import summary — Actual attendance by date and room**")
     summary_rows = _build_summary_table(date_room_counts, room_map, intervals)
     st.dataframe(
         pd.DataFrame(summary_rows),
@@ -247,7 +251,7 @@ def _render_bulk_csv_section(
         hide_index=True,
     )
 
-    # ── Per-child preview (collapsed to save space) ───────────────────
+    # ── Per-child preview ─────────────────────────────────────────────
     with st.expander("📋  Per-child row preview", expanded=False):
         st.dataframe(
             result.get("preview_df", pd.DataFrame()),
@@ -260,14 +264,13 @@ def _render_bulk_csv_section(
     # ── Action buttons ────────────────────────────────────────────────
     ba1, ba2, _ = st.columns([1.8, 2.2, 3])
 
-    # Save all dates and rooms
     if ba1.button(
         f"💾  Save all — {len(dates)} date(s), {total_room_dates} room×date(s)",
         type="primary",
         key="bulk_save_all_btn",
         use_container_width=True,
     ):
-        with st.spinner("Saving all intervals to Supabase…"):
+        with st.spinner("Saving actual attendance to Supabase…"):
             total_ivs, total_rooms, errors = upsert_all_dates_from_bulk(
                 centre_id=centre_id,
                 date_room_counts=date_room_counts,
@@ -278,15 +281,13 @@ def _render_bulk_csv_section(
                 toast_error(f"Error: {e}")
         if total_ivs > 0:
             toast_success(
-                f"✅ Saved {total_ivs} interval(s) across "
+                f"✅ Saved {total_ivs} actual interval(s) across "
                 f"{total_rooms} room×date combination(s)."
             )
-            # Clear prefill cache — data now lives in Supabase
             _clear_all_prefills(date_room_counts)
             st.session_state.pop(bkey, None)
             st.rerun()
 
-    # Save selected date only (helper for reviewing one date at a time)
     selected_review_date = st.session_state.get("bulk_review_date")
     if selected_review_date and selected_review_date in date_room_counts:
         if ba2.button(
@@ -307,9 +308,8 @@ def _render_bulk_csv_section(
                     toast_error(f"Error: {e}")
             if total_ivs > 0:
                 toast_success(
-                    f"✅ Saved {total_ivs} interval(s) for {selected_review_date}."
+                    f"✅ Saved {total_ivs} actual interval(s) for {selected_review_date}."
                 )
-                # Clear prefill for this date's rooms
                 for rid in room_counts_for_date:
                     st.session_state.pop(_prefill_key(rid, selected_review_date), None)
                 st.rerun()
@@ -327,22 +327,19 @@ def _render_manual_grid(
 ):
     st.markdown("### ✏️ Review and Edit Intervals")
     st.caption(
-        "Select a date and room to review CSV-imported counts or enter data manually. "
+        "Select a date and room to review CSV-imported actual counts or enter data manually. "
         "Edit any value, then click **Save**."
     )
 
     # ── Date + room selectors ─────────────────────────────────────────
-    # Pre-fill selectors from bulk review state if set
     cached_result  = st.session_state.get(_bulk_result_key(), {})
     imported_dates = (cached_result.get("dates") or []) if cached_result else []
 
     gc1, gc2 = st.columns(2)
 
-    # Date: offer imported dates prominently if available, else free-pick
     if imported_dates:
-        # Default to first imported date, or whatever was last reviewed
-        default_review = st.session_state.get("bulk_review_date") or imported_dates[0]
-        idx = imported_dates.index(default_review) if default_review in imported_dates else 0
+        default_review    = st.session_state.get("bulk_review_date") or imported_dates[0]
+        idx               = imported_dates.index(default_review) if default_review in imported_dates else 0
         selected_date_str = gc1.selectbox(
             "Date to review",
             options=imported_dates,
@@ -366,9 +363,9 @@ def _render_manual_grid(
         selected_date_str = attendance_date.isoformat()
         st.session_state["bulk_review_date"] = selected_date_str
 
-    room_opts = {r["id"]: r["name"] for r in rooms}
+    room_opts    = {r["id"]: r["name"] for r in rooms}
     default_room = st.session_state.get("bulk_review_room") or list(room_opts.keys())[0]
-    room_id = gc2.selectbox(
+    room_id      = gc2.selectbox(
         "Room",
         options=list(room_opts.keys()),
         format_func=lambda x: room_opts[x],
@@ -393,17 +390,22 @@ def _render_manual_grid(
             saved = []
 
     saved_map = {s["interval_start"]: s for s in saved}
-    n_saved   = sum(1 for s in saved if s.get("expected_children", 0) > 0)
+    # Count intervals that have actual_children recorded (CSV path)
+    # or expected_children recorded (manual planning path)
+    n_saved_actual   = sum(1 for s in saved if s.get("actual_children") is not None)
+    n_saved_expected = sum(1 for s in saved if (s.get("expected_children") or 0) > 0)
+    n_saved          = n_saved_actual or n_saved_expected
 
     # ── Day summary strip ─────────────────────────────────────────────
     _render_day_summary(rooms, room_id, centre_id, date_str)
     st.markdown("")
 
-    # ── Room header ───────────────────────────────────────────────────
+    # ── Prefill from CSV (populates ACTUAL column) ────────────────────
     prefill_key    = _prefill_key(room_id, date_str)
     csv_prefill    = st.session_state.get(prefill_key, {})
     prefill_active = bool(csv_prefill)
 
+    # ── Room header ───────────────────────────────────────────────────
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;">'
         f'<div style="width:14px;height:14px;border-radius:50%;background:{colour};'
@@ -419,18 +421,22 @@ def _render_manual_grid(
     if prefill_active:
         n_prefilled = sum(1 for v in csv_prefill.values() if v > 0)
         st.info(
-            f"📋 **{n_prefilled} interval(s) pre-filled from CSV upload.** "
+            f"📋 **{n_prefilled} interval(s) pre-filled from CSV — shown in Actual column.** "
             "Edit any values below, then click **Save**."
         )
     elif n_saved:
-        st.caption(f"✅ {n_saved} of {len(intervals)} intervals have saved data.")
+        act_note = f" ({n_saved_actual} with actual data)" if n_saved_actual else ""
+        st.caption(f"✅ {n_saved} of {len(intervals)} intervals have saved data{act_note}.")
     else:
         st.info(
             "No data for this room and date yet. "
             "Upload a CSV above, or fill in the counts below and click **Save**."
         )
 
-    st.markdown("**Expected and actual child counts per 15-minute interval.**")
+    st.markdown(
+        "**Expected** = planned headcount (roster planning).  "
+        "**Actual** = real attendance (CSV import or live count)."
+    )
 
     # ── Column headers ────────────────────────────────────────────────
     now      = datetime.now().strftime("%H:%M:%S")
@@ -439,7 +445,7 @@ def _render_manual_grid(
     hc0, hc1, hc2, hc3, hc4 = st.columns([1.8, 1.4, 1.4, 1.4, 2.0])
     hc0.markdown("**Time**")
     hc1.markdown("**Expected**")
-    hc2.markdown("**Actual**")
+    hc2.markdown("**Actual** ← CSV")
     hc3.markdown("**Cap %**")
     hc4.markdown("**Notes**")
 
@@ -453,11 +459,21 @@ def _render_manual_grid(
             existing = saved_map.get(istart, {})
             is_now   = is_today and istart <= now < iend
 
-            # Value priority: CSV prefill → Supabase saved → 0
+            # Expected column: always from Supabase saved value (manual plan)
+            # CSV import never touches expected_children on existing rows
+            exp_default = int(existing.get("expected_children") or 0)
+
+            # Actual column priority:
+            #   1. CSV prefill (from this session's upload)
+            #   2. Supabase saved actual_children
+            #   3. Zero
+            saved_act = existing.get("actual_children")
             if istart in csv_prefill:
-                exp_default = int(csv_prefill[istart])
+                act_default = int(csv_prefill[istart])
+            elif saved_act is not None:
+                act_default = int(saved_act)
             else:
-                exp_default = int(existing.get("expected_children") or 0)
+                act_default = 0
 
             label_html = (
                 f'<span style="font-size:0.82rem;'
@@ -476,16 +492,17 @@ def _render_manual_grid(
                 label_visibility="collapsed", step=1,
             )
 
-            act_val = existing.get("actual_children")
             act = c2.number_input(
                 "act", min_value=0, max_value=capacity or 100,
-                value=int(act_val) if act_val is not None else 0,
+                value=act_default,
                 key=f"act_{room_id}_{date_str}_{istart}",
                 label_visibility="collapsed", step=1,
             )
-            actual_to_save = act if (act > 0 or act_val is not None) else None
+            # Treat 0 as "not recorded" only if neither CSV nor DB had a value
+            actual_to_save = act if (act > 0 or saved_act is not None or istart in csv_prefill) else None
 
-            n_for_pct = act if (act_val is not None or act > 0) else exp
+            # Capacity % — prefer actual when available
+            n_for_pct = act if actual_to_save is not None else exp
             if n_for_pct > 0 and capacity:
                 pct = round((n_for_pct / capacity) * 100)
                 if pct >= 100:
@@ -536,11 +553,14 @@ def _render_manual_grid(
         else:
             with st.spinner("Saving…"):
                 try:
+                    # Manual save: preserve_expected=False so user edits
+                    # to the Expected column are honoured
                     n = upsert_all_intervals(
                         centre_id=centre_id,
                         room_id=room_id,
                         attendance_date=date_str,
                         rows=rows_to_save,
+                        preserve_expected=False,
                     )
                     toast_success(
                         f"Saved {n} interval(s) for "
@@ -553,8 +573,8 @@ def _render_manual_grid(
 
     st.markdown("")
     st.caption(
-        "💡 Counts feed the Ratio Monitor. "
-        "Use 'Expected' for planning, 'Actual' for live tracking."
+        "💡 The Ratio Monitor uses Actual when available, Expected otherwise. "
+        "Upload a CSV to populate Actual; edit Expected for roster planning."
     )
 
 
@@ -589,14 +609,17 @@ def _render_day_summary(
         if not room_ivs:
             content = '<span style="font-size:0.75rem;color:#94a3b8;">No data</span>'
         else:
-            peak_exp = max(int(r.get("expected_children") or 0) for r in room_ivs)
+            # Prefer actual_children for the summary display
             act_rows = [r for r in room_ivs if r.get("actual_children") is not None]
             peak_act = max(int(r.get("actual_children") or 0) for r in act_rows) if act_rows else None
-            pct      = round((peak_exp / cap) * 100) if cap else 0
-            act_str  = f" / {peak_act} act" if peak_act is not None else ""
-            content  = (
+            peak_exp = max(int(r.get("expected_children") or 0) for r in room_ivs)
+            # Use actual if available, else expected for capacity %
+            peak_display = peak_act if peak_act is not None else peak_exp
+            pct          = round((peak_display / cap) * 100) if cap else 0
+            act_str      = f"{peak_act} actual" if peak_act is not None else f"{peak_exp} expected"
+            content      = (
                 f'<span style="font-size:0.78rem;color:#0d1f35;">'
-                f'Peak {peak_exp}{act_str}</span><br>'
+                f'Peak {act_str}</span><br>'
                 f'<span style="font-size:0.7rem;color:#7a90a8;">{pct}% of {cap}</span>'
             )
 
@@ -617,7 +640,7 @@ def _render_day_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build the summary table shown after CSV parse
+# Build summary table shown after CSV parse
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_summary_table(
@@ -625,11 +648,7 @@ def _build_summary_table(
     room_map: dict[str, dict],
     intervals: list[dict],
 ) -> list[dict]:
-    """
-    Build a list of row dicts for the summary table:
-    Date | Room | Children | Peak attendance | First arrival | Last departure
-    """
-    rows = []
+    rows      = []
     iv_lookup = {iv["interval_start"]: iv["interval_end"] for iv in intervals}
 
     for date_str in sorted(date_room_counts.keys()):
@@ -638,34 +657,21 @@ def _build_summary_table(
             room_counts.items(),
             key=lambda kv: (room_map.get(kv[0], {}).get("name", "")),
         ):
-            rname = room_map.get(room_id, {}).get("name", room_id)
-
-            # Intervals that have children
+            rname  = room_map.get(room_id, {}).get("name", room_id)
             active = {iv: cnt for iv, cnt in counts.items() if cnt > 0}
             if not active:
                 continue
-
-            peak        = max(active.values())
-            first_iv    = min(active.keys())
-            last_iv     = max(active.keys())
-
-            # "Last departure" = end of the last occupied interval
+            first_iv    = min(active)
+            last_iv     = max(active)
             last_iv_end = iv_lookup.get(last_iv, last_iv)
-
-            # Unique-child approximation: not possible from counts alone,
-            # so report the sum of peak headcounts as a proxy.
-            # The CSV preview shows actual children; this is the interval view.
-            total_child_intervals = sum(active.values())
-
             rows.append({
                 "Date":            date_str,
                 "Room":            rname,
-                "Children (sum)":  total_child_intervals,
-                "Peak":            peak,
+                "Actual (sum)":    sum(active.values()),
+                "Peak actual":     max(active.values()),
                 "First arrival":   first_iv[:5],
                 "Last departure":  last_iv_end[:5],
             })
-
     return rows
 
 
@@ -674,7 +680,6 @@ def _build_summary_table(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clear_all_prefills(date_room_counts: dict):
-    """Remove all CSV prefill keys for every room×date in the import."""
     for date_str, room_counts in date_room_counts.items():
         for rid in room_counts:
             st.session_state.pop(_prefill_key(rid, date_str), None)
