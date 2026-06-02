@@ -7,10 +7,12 @@
 #   parse_csv_bulk(file_bytes, rooms, intervals, fallback_date=None)
 #       Multi-date parser. Accepts attendance_date column.
 #       Groups by date + room. Returns bulk_room_counts / date_room_counts.
+#       CSV counts → actual_children (not expected_children).
 #
 #   parse_csv(file_bytes, rooms, intervals, fallback_date=None)
 #       Single-date parser. Does not accept attendance_date column.
 #       Returns room_counts (flat, one date only).
+#       CSV counts → actual_children (not expected_children).
 #
 # Both share private _parse_date / _parse_time / _duration_str helpers only.
 
@@ -43,14 +45,8 @@ def parse_csv_bulk(
         start_time        HH:MM or HH:MM:SS
         end_time          HH:MM or HH:MM:SS
 
-    Parameters
-    ----------
-    file_bytes      Raw bytes from st.file_uploader.
-    rooms           List of room dicts — needs 'id' and 'name'.
-    intervals       List of interval dicts from generate_intervals() —
-                    needs 'interval_start' ("HH:MM:SS").
-    fallback_date   ISO date string used when attendance_date column is absent.
-                    If absent and None, returns a blocking error.
+    CSV counts are placed into actual_children, not expected_children,
+    because the CSV represents real attendance records.
 
     Returns
     -------
@@ -113,7 +109,7 @@ def parse_csv_bulk(
     n_total = len(df)
 
     for idx, row in df.iterrows():
-        rownum     = int(idx) + 2           # 1-based, +1 for header
+        rownum     = int(idx) + 2
         child_name = str(row.get("child_name", f"Child {rownum}")).strip()
         csv_room   = str(row.get("room_name", "")).strip()
         start_raw  = row.get("start_time", "")
@@ -130,7 +126,7 @@ def parse_csv_bulk(
                 )
                 continue
         else:
-            date_str = fallback_date        # already validated above
+            date_str = fallback_date
 
         # Room
         matched_room = room_by_name.get(_norm(csv_room))
@@ -167,7 +163,6 @@ def parse_csv_bulk(
             "end":        end_str,
         })
 
-    # Report unknown rooms as a single warning each
     for ur in sorted(unknown_rooms):
         known = ", ".join(f"'{r['name']}'" for r in rooms)
         warnings.append(
@@ -183,7 +178,7 @@ def parse_csv_bulk(
         )
         return _bulk_fail(errors, warnings)
 
-    # ── 5. Build preview DataFrame ────────────────────────────────────
+    # ── 5. Preview DataFrame ──────────────────────────────────────────
     preview_df = pd.DataFrame([
         {
             "Date":  r["date_str"],
@@ -198,8 +193,8 @@ def parse_csv_bulk(
 
     # ── 6. Count children per date × room × 15-min interval ──────────
     # Presence rule: child counted at interval_start if
-    #     child_start <= interval_start < child_end
-    iv_starts = [iv["interval_start"] for iv in intervals]
+    #   child_start <= interval_start < child_end
+    iv_starts     = [iv["interval_start"] for iv in intervals]
     iv_end_lookup = {iv["interval_start"]: iv["interval_end"] for iv in intervals}
 
     # {date_str: {room_id: {interval_start: count}}}
@@ -220,7 +215,7 @@ def parse_csv_bulk(
             if s <= iv_start < e:
                 bulk_room_counts[d][rid][iv_start] += 1
 
-    # Drop rooms where every interval is zero (child outside operating hours)
+    # Drop rooms where every interval is zero
     for d in list(bulk_room_counts):
         bulk_room_counts[d] = {
             rid: counts
@@ -232,7 +227,7 @@ def parse_csv_bulk(
 
     dates = sorted(bulk_room_counts.keys())
 
-    # ── 7. Build summary DataFrame ────────────────────────────────────
+    # ── 7. Summary DataFrame ──────────────────────────────────────────
     room_name_by_id = {r["id"]: r["name"] for r in rooms}
     summary_rows = []
     for d in dates:
@@ -243,11 +238,11 @@ def parse_csv_bulk(
             first_iv = min(active)
             last_iv  = max(active)
             summary_rows.append({
-                "Date":          d,
-                "Room":          room_name_by_id.get(rid, rid),
-                "Children":      sum(active.values()),
-                "Peak":          max(active.values()),
-                "First arrival": first_iv[:5],
+                "Date":           d,
+                "Room":           room_name_by_id.get(rid, rid),
+                "Children":       sum(active.values()),
+                "Peak":           max(active.values()),
+                "First arrival":  first_iv[:5],
                 "Last departure": iv_end_lookup.get(last_iv, last_iv)[:5],
             })
 
@@ -288,6 +283,8 @@ def parse_csv(
     Required CSV columns: child_name, room_name, start_time, end_time
     attendance_date column is ignored if present.
 
+    CSV counts → actual_children (not expected_children).
+
     Returns
     -------
     dict with keys:
@@ -301,7 +298,6 @@ def parse_csv(
     errors:   list[str] = []
     warnings: list[str] = []
 
-    # ── Read & normalise ──────────────────────────────────────────────
     try:
         text = file_bytes.decode("utf-8", errors="replace")
         df   = pd.read_csv(io.StringIO(text))
@@ -316,7 +312,6 @@ def parse_csv(
         for c in df.columns
     ]
 
-    # ── Column validation ─────────────────────────────────────────────
     required = {"child_name", "room_name", "start_time", "end_time"}
     missing  = required - set(df.columns)
     if missing:
@@ -325,13 +320,11 @@ def parse_csv(
             f"Found: {', '.join(df.columns.tolist())}."
         ])
 
-    # ── Room lookup ───────────────────────────────────────────────────
     def _norm(s: str) -> str:
         return " ".join(str(s).strip().lower().split())
 
     room_by_name: dict[str, dict] = {_norm(r["name"]): r for r in rooms}
 
-    # ── Parse rows ────────────────────────────────────────────────────
     parsed_rows:  list[dict] = []
     unknown_rooms: set[str]  = set()
     n_total = len(df)
@@ -389,7 +382,6 @@ def parse_csv(
         )
         return _single_fail(errors, warnings)
 
-    # ── Preview DataFrame ─────────────────────────────────────────────
     preview_df = pd.DataFrame([
         {
             "Child": r["child_name"],
@@ -401,7 +393,6 @@ def parse_csv(
         for r in parsed_rows
     ]).sort_values(["Room", "Start"]).reset_index(drop=True)
 
-    # ── Count per room × interval ─────────────────────────────────────
     iv_starts = [iv["interval_start"] for iv in intervals]
 
     room_counts: dict[str, dict[str, int]] = {}
@@ -418,7 +409,6 @@ def parse_csv(
             if s <= iv_start < e:
                 room_counts[rid][iv_start] += 1
 
-    # Drop all-zero rooms
     room_counts = {
         rid: counts
         for rid, counts in room_counts.items()
@@ -447,6 +437,10 @@ def room_counts_to_upsert_rows(
     """
     Convert {room_id → {interval_start → count}} to
     {room_id → [row_dict, ...]} ready for upsert_all_intervals.
+
+    The CSV count goes into actual_children.
+    expected_children is set to 0 so that existing planned headcounts
+    are preserved by the preserve_expected flag in upsert_interval.
     Only intervals within the centre's operating hours are included.
     """
     iv_lookup = {iv["interval_start"]: iv for iv in intervals}
@@ -461,8 +455,8 @@ def room_counts_to_upsert_rows(
             rows.append({
                 "interval_start":    iv_start,
                 "interval_end":      iv["interval_end"],
-                "expected_children": count,
-                "actual_children":   None,
+                "expected_children": 0,       # leave existing planned count intact
+                "actual_children":   count,   # CSV count → actual attendance
                 "notes":             notes,
             })
         if rows:
