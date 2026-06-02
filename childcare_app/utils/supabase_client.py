@@ -5,17 +5,27 @@
 #
 # CREDENTIAL RESOLUTION ORDER
 # ------------------------------------------------------------------
-# 1. st.secrets  — used automatically on Streamlit Cloud.
-#                  Add secrets in the Streamlit Cloud dashboard under
-#                  App Settings → Secrets, in TOML format:
+# Key used:  SUPABASE_SERVICE_ROLE_KEY  (preferred — bypasses RLS)
+#            SUPABASE_ANON_KEY          (fallback — subject to RLS)
 #
-#                      SUPABASE_URL      = "https://xxx.supabase.co"
-#                      SUPABASE_ANON_KEY = "eyJ..."
-#                      ORGANISATION_ID   = "your-uuid"
+# The service role key is required for write operations (creating
+# staff, inserting records) because RLS policies on the anon role
+# block those inserts with error 42501. The service role key bypasses
+# RLS entirely, so always prefer it when available.
 #
-# 2. Environment variables / .env file — used for local development.
-#                  Copy .env.example to .env and fill in your values.
-#                  python-dotenv loads the file automatically.
+# Both keys are found in:
+#   Supabase Dashboard → Project Settings → API
+#
+# Secrets are resolved in this order:
+#   1. st.secrets  — Streamlit Cloud App Settings → Secrets (TOML):
+#
+#        SUPABASE_URL              = "https://xxx.supabase.co"
+#        SUPABASE_SERVICE_ROLE_KEY = "eyJ..."   ← add this
+#        SUPABASE_ANON_KEY         = "eyJ..."   ← keep as fallback
+#        ORGANISATION_ID           = "your-uuid"
+#
+#   2. Environment variables / .env file — local development.
+#      Add SUPABASE_SERVICE_ROLE_KEY to your .env file.
 #
 # The app works in both environments with no code changes required.
 # ------------------------------------------------------------------
@@ -25,8 +35,7 @@ import streamlit as st
 from supabase import create_client, Client
 
 # Load .env for local development.
-# This is a no-op on Streamlit Cloud (no .env file present there),
-# so it is always safe to call.
+# Safe no-op on Streamlit Cloud where no .env file exists.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -38,23 +47,14 @@ def _get_secret(key: str) -> str | None:
     """
     Resolve a configuration value from st.secrets first,
     then fall back to environment variables.
-
-    st.secrets is populated from:
-      - Streamlit Cloud App Settings → Secrets (production)
-      - .streamlit/secrets.toml        (local alternative to .env)
-
-    Environment variables are populated from:
-      - The .env file (via python-dotenv, local development)
-      - The shell environment (CI, Docker, etc.)
     """
-    # 1. Try st.secrets (Streamlit Cloud or local secrets.toml)
+    # 1. Try st.secrets (Streamlit Cloud or local .streamlit/secrets.toml)
     try:
         value = st.secrets.get(key)
         if value:
             return str(value)
     except Exception:
-        # st.secrets is not available in all execution contexts
-        # (e.g. when running plain Python tests). Silently continue.
+        # st.secrets unavailable outside Streamlit execution context
         pass
 
     # 2. Fall back to environment variables / .env
@@ -66,23 +66,29 @@ def get_supabase_client() -> Client:
     """
     Returns a connected Supabase client, cached for the session.
 
-    Credentials are read from st.secrets (Streamlit Cloud) or
-    environment variables / .env (local development).
+    Uses SUPABASE_SERVICE_ROLE_KEY when available so that write
+    operations (INSERT, UPDATE, DELETE) are not blocked by RLS
+    policies (error 42501). Falls back to SUPABASE_ANON_KEY only
+    when the service role key is not configured.
     """
     url = _get_secret("SUPABASE_URL")
-    key = _get_secret("SUPABASE_ANON_KEY")
+
+    # Prefer service role key — it bypasses RLS and allows all writes.
+    # Fall back to anon key for read-only or public deployments.
+    key = _get_secret("SUPABASE_SERVICE_ROLE_KEY") or _get_secret("SUPABASE_ANON_KEY")
 
     if not url or not key:
         st.error(
             "⚠️ **Supabase credentials are missing.**\n\n"
             "**On Streamlit Cloud:** add them in App Settings → Secrets:\n"
             "```toml\n"
-            "SUPABASE_URL      = \"https://your-project.supabase.co\"\n"
-            "SUPABASE_ANON_KEY = \"eyJ...\"\n"
-            "ORGANISATION_ID   = \"your-org-uuid\"\n"
+            "SUPABASE_URL              = \"https://your-project.supabase.co\"\n"
+            "SUPABASE_SERVICE_ROLE_KEY = \"eyJ...\"   # recommended — bypasses RLS\n"
+            "SUPABASE_ANON_KEY         = \"eyJ...\"   # fallback\n"
+            "ORGANISATION_ID           = \"your-org-uuid\"\n"
             "```\n"
-            "**Locally:** copy `.env.example` to `.env` and fill in your values.\n\n"
-            "Both values are in: Supabase Dashboard → Project Settings → API"
+            "**Locally:** add the same keys to your `.env` file.\n\n"
+            "Both keys are in: Supabase Dashboard → Project Settings → API"
         )
         st.stop()   # Nothing in the app works without a DB connection
 
