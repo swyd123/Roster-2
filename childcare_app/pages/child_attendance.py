@@ -16,7 +16,9 @@ from utils.attendance_queries import (
 from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_centres
 from utils.centre_queries import fetch_centre_by_id
-from utils.ratio_engine import compute_ratio, now_time_str
+# compute_ratio and now_time_str removed from this import.
+# now_time_str does not exist in older deployments of ratio_engine.py,
+# which caused the ImportError on startup. datetime is already imported above.
 from utils.helpers import toast_success, toast_error
 
 
@@ -152,7 +154,7 @@ def render():
         )
 
     # ── Helper: show whether we're in a shift right now ──────────────
-    now = now_time_str()
+    now = datetime.now().strftime("%H:%M:%S")
     is_today = attendance_date == date.today()
 
     # ── Interval entry form ───────────────────────────────────────────
