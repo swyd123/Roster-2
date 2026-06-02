@@ -4,8 +4,10 @@
 # No individual child profiles required.
 # Data feeds ratio dashboard and roster validation automatically.
 
+import io
 import streamlit as st
-from datetime import date, datetime
+from datetime import date, datetime, time as _time
+import pandas as pd
 
 from utils.attendance_queries import (
     generate_intervals, fetch_intervals_for_room,
@@ -130,6 +132,9 @@ def render():
     _render_day_summary(saved, rooms, room_id, centre_id, date_str)
 
     st.markdown("---")
+
+    # ── CSV upload (optional, does not affect interval form) ─
+    _render_csv_upload(now)
 
     # ── Room header ───────────────────────────────────────────────────
     st.markdown(
@@ -294,6 +299,134 @@ def render():
         "Update 'Actual' during the day for live compliance tracking."
     )
 
+
+
+# ── CSV attendance upload ──────────────────────────────────────────────────────
+
+def _render_csv_upload(now_str: str):
+    """
+    Optional CSV upload section.  Completely self-contained — no writes to the
+    database, no effect on the interval entry form below.
+
+    Expected CSV columns (case-insensitive, extra columns ignored):
+        child_name   — any text identifier
+        start_time   — HH:MM or HH:MM:SS  (required)
+        finish_time  — HH:MM or HH:MM:SS  (blank = child still present)
+
+    Calculated and displayed:
+        • Total children in the file
+        • Currently present  (finish_time blank OR finish_time > now)
+        • Earliest start time
+        • Latest finish time (among those who have left)
+    """
+    with st.expander("📂  Upload CSV attendance file (optional)", expanded=False):
+        st.caption(
+            "Upload a CSV with columns: **child_name**, **start_time**, **finish_time**. "
+            "Blank finish_time = child still present. No data is saved to the database."
+        )
+
+        uploaded = st.file_uploader(
+            "Choose CSV file",
+            type=["csv"],
+            key="csv_upload_widget",
+            label_visibility="collapsed",
+        )
+
+        if uploaded is None:
+            st.markdown(
+                '<p style="font-size:0.82rem;color:#94a3b8;">No file selected.</p>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        # ── Parse ─────────────────────────────────────────────────────
+        try:
+            df = pd.read_csv(io.StringIO(uploaded.read().decode("utf-8", errors="replace")))
+        except Exception as e:
+            st.error(f"❌ Could not read CSV: {e}")
+            return
+
+        # Normalise column names: strip whitespace, lowercase
+        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+        required = {"start_time"}
+        missing  = required - set(df.columns)
+        if missing:
+            st.error(
+                f"❌ CSV is missing required column(s): **{', '.join(sorted(missing))}**. "
+                f"Found columns: {list(df.columns)}"
+            )
+            return
+
+        # Add child_name column if absent (not required — just display)
+        if "child_name" not in df.columns:
+            df["child_name"] = [f"Child {i+1}" for i in range(len(df))]
+
+        if "finish_time" not in df.columns:
+            df["finish_time"] = None
+
+        # Keep only the three canonical columns; drop extras for display
+        display_df = df[["child_name", "start_time", "finish_time"]].copy()
+
+        def _parse_time(val) -> str | None:
+            """Parse a time cell into HH:MM:SS string, or None if blank/invalid."""
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return None
+            s = str(val).strip()
+            if not s:
+                return None
+            for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p"):
+                try:
+                    return datetime.strptime(s, fmt).strftime("%H:%M:%S")
+                except ValueError:
+                    continue
+            return None  # unparseable — treat as blank
+
+        start_times  = [_parse_time(v) for v in display_df["start_time"]]
+        finish_times = [_parse_time(v) for v in display_df["finish_time"]]
+
+        # ── Calculations ──────────────────────────────────────────────
+        total_children = len(display_df)
+
+        # Present = finish_time is None/blank OR finish_time > now_str
+        currently_present = sum(
+            1 for ft in finish_times
+            if ft is None or ft > now_str
+        )
+
+        valid_starts  = [t for t in start_times  if t is not None]
+        valid_finishes= [t for t in finish_times if t is not None]
+
+        earliest_start  = min(valid_starts)[:5]   if valid_starts   else "—"
+        latest_finish   = max(valid_finishes)[:5]  if valid_finishes else "—"
+
+        # ── Summary metrics ───────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total children",     total_children)
+        m2.metric("Currently present",  currently_present)
+        m3.metric("Earliest start",     earliest_start)
+        m4.metric("Latest finish",      latest_finish)
+
+        # ── Table ─────────────────────────────────────────────────────
+        # Add a "Present now?" column for clarity
+        display_df = display_df.copy()
+        display_df["present_now"] = [
+            "✅ Yes" if ft is None or ft > now_str else "🔴 No"
+            for ft in finish_times
+        ]
+        # Rename columns for display
+        display_df.columns = ["Child", "Start", "Finish", "Present now?"]
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            f"ℹ️ {total_children} row(s) loaded from **{uploaded.name}**. "
+            "This data is not saved — use the interval form below to persist counts."
+        )
 
 # ── Day summary strip across all rooms ────────────────────────────────────────
 
