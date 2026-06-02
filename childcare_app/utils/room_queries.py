@@ -7,6 +7,19 @@ from datetime import datetime, date, timezone
 from utils.supabase_client import get_supabase_client, get_organisation_id
 
 
+def _one(resp) -> Optional[dict]:
+    """
+    Return the first row from a query response, or None.
+    Replaces .single() which is not available on SyncQueryRequestBuilder.
+    Used for SELECT … LIMIT 1, INSERT … SELECT, and UPDATE … SELECT
+    where exactly one row is expected.
+    """
+    data = resp.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROOMS — CRUD
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,14 +45,14 @@ def fetch_rooms(centre_id: str, include_inactive: bool = False) -> list[dict]:
 
 def fetch_room_by_id(room_id: str) -> Optional[dict]:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("rooms")
         .select("*")
         .eq("id", room_id)
         .is_("deleted_at", "null")
-        .single()
+        .limit(1)
         .execute()
-    ).data
+    )
 
 
 def create_room(
@@ -55,8 +68,8 @@ def create_room(
     sort_order: int,
     notes: str,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("rooms")
         .insert({
             "centre_id":               centre_id,
@@ -72,8 +85,12 @@ def create_room(
             "is_active":               True,
             "notes":                   notes.strip() or None,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Room could not be created — no row returned from database.")
+    return result
 
 
 def update_room(
@@ -90,8 +107,8 @@ def update_room(
     is_active: bool,
     notes: str,
 ) -> dict:
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("rooms")
         .update({
             "name":                    name.strip(),
@@ -107,8 +124,12 @@ def update_room(
             "notes":                   notes.strip() or None,
         })
         .eq("id", room_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError(f"Room '{name}' could not be updated — no row returned from database.")
+    return result
 
 
 def soft_delete_room(room_id: str) -> None:
@@ -304,15 +325,15 @@ def log_breach(
             def parse_t(s):
                 parts = s.split(":")
                 return _time(int(parts[0]), int(parts[1]))
-            start = parse_t(breach_start_time)
-            end   = parse_t(breach_end_time)
+            start      = parse_t(breach_start_time)
+            end        = parse_t(breach_end_time)
             start_mins = start.hour * 60 + start.minute
-            end_mins   = end.hour * 60 + end.minute
+            end_mins   = end.hour   * 60 + end.minute
             duration   = max(0, end_mins - start_mins)
         except Exception:
             pass
 
-    return (
+    result = _one(
         sb.from_("ratio_breach_log")
         .insert({
             "centre_id":             centre_id,
@@ -328,8 +349,12 @@ def log_breach(
             "resolution_action":     resolution_action.strip() or None,
             "documented_by_user_id": documented_by_user_id,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
+    if not result:
+        raise ValueError("Breach record could not be saved — no row returned from database.")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,43 +384,32 @@ def calc_ratio_status(
     """
     if children_present == 0:
         return {
-            "status": "compliant",
-            "min_staff": 0,
-            "surplus": staff_present,
-            "label": "No children",
-            "colour": "#f0f4f8",
+            "status":      "compliant",
+            "min_staff":   0,
+            "surplus":     staff_present,
+            "label":       "No children",
+            "colour":      "#f0f4f8",
             "text_colour": "#4a6079",
-            "icon": "⚪",
+            "icon":        "⚪",
             "capacity_pct": 0,
         }
 
     import math
-    # min staff = ceil(children / ratio_children) * ratio_staff
-    min_staff   = math.ceil(children_present / required_ratio_children) * required_ratio_staff
-    surplus     = staff_present - min_staff
+    min_staff    = math.ceil(children_present / required_ratio_children) * required_ratio_staff
+    surplus      = staff_present - min_staff
     capacity_pct = round((children_present / licensed_capacity) * 100) if licensed_capacity > 0 else 0
 
     if surplus >= 0:
-        # Check if adding one more child would breach
         min_for_one_more = math.ceil((children_present + 1) / required_ratio_children) * required_ratio_staff
         if min_for_one_more > staff_present:
-            status     = "warning"
-            label      = "At limit"
-            colour     = "#fffbeb"
-            text_colour = "#92400e"
-            icon       = "⚠️"
+            status, label, colour, text_colour, icon = (
+                "warning", "At limit", "#fffbeb", "#92400e", "⚠️")
         else:
-            status     = "compliant"
-            label      = "Compliant"
-            colour     = "#f0fdf4"
-            text_colour = "#14532d"
-            icon       = "✅"
+            status, label, colour, text_colour, icon = (
+                "compliant", "Compliant", "#f0fdf4", "#14532d", "✅")
     else:
-        status     = "breach"
-        label      = "Ratio breach"
-        colour     = "#fff1f2"
-        text_colour = "#881337"
-        icon       = "❌"
+        status, label, colour, text_colour, icon = (
+            "breach", "Ratio breach", "#fff1f2", "#881337", "❌")
 
     return {
         "status":       status,
@@ -415,7 +429,7 @@ def age_in_months(dob_str: str | None) -> int | None:
         return None
     try:
         from datetime import date as _date
-        dob = _date.fromisoformat(dob_str[:10])
+        dob   = _date.fromisoformat(dob_str[:10])
         today = _date.today()
         months = (today.year - dob.year) * 12 + (today.month - dob.month)
         if today.day < dob.day:
@@ -443,7 +457,7 @@ def fmt_age_range(min_months: int, max_months: int) -> str:
     def label(m):
         if m < 24:
             return f"{m}m"
-        y = m // 12
+        y   = m // 12
         rem = m % 12
         return f"{y}y" if rem == 0 else f"{y}y{rem}m"
     return f"{label(min_months)} – {label(max_months)}"
