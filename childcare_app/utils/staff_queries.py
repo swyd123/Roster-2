@@ -11,6 +11,17 @@ from utils.supabase_client import get_supabase_client, get_organisation_id
 # INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _one(resp) -> Optional[dict]:
+    """
+    Return the first row from a query response, or None.
+    Replaces .single() which is not available on SyncQueryRequestBuilder.
+    """
+    data = resp.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
 def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
     """
     Fetch user_centre_roles rows for a list of user_ids, joined to centres
@@ -102,7 +113,7 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
     sb = get_supabase_client()
 
     # Query 1 — profile + user
-    profile = (
+    profile = _one(
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
@@ -115,9 +126,9 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
         )
         .eq("id", profile_id)
         .is_("deleted_at", "null")
-        .single()
+        .limit(1)
         .execute()
-    ).data
+    )
 
     if not profile:
         return None
@@ -147,7 +158,7 @@ def create_staff_member(
     org_id = get_organisation_id()
 
     # 1 — create user account
-    u = (
+    u = _one(
         sb.from_("users")
         .insert({
             "first_name": first_name.strip(),
@@ -156,13 +167,14 @@ def create_staff_member(
             "phone":      phone.strip() or None,
             "is_active":  True,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
     if not u:
         raise ValueError("User account could not be created.")
 
     # 2 — create staff profile
-    profile = (
+    profile = _one(
         sb.from_("staff_profiles")
         .insert({
             "user_id":                        u["id"],
@@ -176,8 +188,9 @@ def create_staff_member(
             "emergency_contact_relationship": emergency_contact_relationship.strip() or None,
             "notes":                          notes.strip() or None,
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
 
     # 3 — assign centre role
     if centre_id:
@@ -212,7 +225,7 @@ def update_staff_member(
         "is_active":  is_active,
     }).eq("id", user_id).execute()
 
-    profile = (
+    profile = _one(
         sb.from_("staff_profiles")
         .update({
             "employee_number":                employee_number.strip() or None,
@@ -225,8 +238,9 @@ def update_staff_member(
             "notes":                          notes.strip() or None,
         })
         .eq("id", profile_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
     return profile
 
 
@@ -313,7 +327,7 @@ def add_qualification(
     notes: str,
 ) -> dict:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("staff_qualifications")
         .insert({
             "staff_profile_id":      profile_id,
@@ -327,8 +341,9 @@ def add_qualification(
             "notes":                 notes.strip() or None,
             "status":                "pending_verification",
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
 
 
 def update_qualification(
@@ -336,7 +351,7 @@ def update_qualification(
     issuing_body: str, certificate_number: str, notes: str,
 ) -> dict:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("staff_qualifications")
         .update({
             "issue_date":         issue_date or None,
@@ -346,8 +361,9 @@ def update_qualification(
             "notes":              notes.strip() or None,
         })
         .eq("id", qual_id)
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
 
 
 def verify_qualification(qual_id: str, verifier_user_id: str) -> None:
@@ -424,7 +440,7 @@ def fetch_leave_requests(centre_id: str | None = None, user_id: str | None = Non
 
 def fetch_leave_by_id(leave_id: str) -> Optional[dict]:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("leave_requests")
         .select(
             "id, leave_type, start_date, end_date, start_time, end_time,"
@@ -434,9 +450,9 @@ def fetch_leave_by_id(leave_id: str) -> Optional[dict]:
             "reviewer:users!leave_requests_reviewed_by_user_id_fkey(first_name, last_name)"
         )
         .eq("id", leave_id)
-        .single()
+        .limit(1)
         .execute()
-    ).data
+    )
 
 
 def create_leave_request(
@@ -446,7 +462,7 @@ def create_leave_request(
     start_time: str | None = None, end_time: str | None = None,
 ) -> dict:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("leave_requests")
         .insert({
             "user_id":        user_id,
@@ -460,8 +476,9 @@ def create_leave_request(
             "reason":         reason.strip() or None,
             "status":         "pending",
         })
-        .select().single().execute()
-    ).data
+        .select()
+        .execute()
+    )
 
 
 def update_leave_status(
