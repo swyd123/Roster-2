@@ -7,6 +7,17 @@ from datetime import date, datetime, timedelta, timezone
 from utils.supabase_client import get_supabase_client
 
 
+def _one(resp) -> Optional[dict]:
+    """
+    Return the first row from a query response, or None.
+    Replaces .single() which is not available on SyncQueryRequestBuilder.
+    """
+    data = resp.data
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
+
+
 # ── READ ──────────────────────────────────────────────────────────────────────
 
 def fetch_breaks_today(centre_id: str, break_date: str | None = None) -> list[dict]:
@@ -105,13 +116,13 @@ def fetch_break_history(
 
 def fetch_break_by_id(break_id: str) -> Optional[dict]:
     sb = get_supabase_client()
-    return (
+    return _one(
         sb.from_("break_records")
         .select("*")
         .eq("id", break_id)
-        .single()
+        .limit(1)
         .execute()
-    ).data
+    )
 
 
 # ── CREATE ────────────────────────────────────────────────────────────────────
@@ -128,8 +139,8 @@ def create_break(
     notes: str = "",
 ) -> dict:
     """Schedule a new break."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .insert({
             "centre_id":               centre_id,
@@ -144,9 +155,11 @@ def create_break(
             "notes":                   notes.strip() or None,
         })
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError("Break could not be created — no row returned from database.")
+    return result
 
 
 # ── UPDATE ────────────────────────────────────────────────────────────────────
@@ -160,8 +173,8 @@ def update_break_schedule(
     notes: str = "",
 ) -> dict:
     """Edit the scheduled times of a break."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .update({
             "planned_start_time":       planned_start_time,
@@ -172,15 +185,17 @@ def update_break_schedule(
         })
         .eq("id", break_id)
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError("Break schedule could not be updated — no row returned from database.")
+    return result
 
 
 def mark_break_started(break_id: str, actual_start: str) -> dict:
     """Record the actual start time when a break begins."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .update({
             "actual_start_time": actual_start,
@@ -188,9 +203,11 @@ def mark_break_started(break_id: str, actual_start: str) -> dict:
         })
         .eq("id", break_id)
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError("Break start could not be recorded — no row returned from database.")
+    return result
 
 
 def mark_break_completed(
@@ -201,27 +218,29 @@ def mark_break_completed(
     notes: str = "",
 ) -> dict:
     """Record actual break times and mark as completed."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .update({
-            "actual_start_time":      actual_start,
-            "actual_end_time":        actual_end,
+            "actual_start_time":       actual_start,
+            "actual_end_time":         actual_end,
             "actual_duration_minutes": actual_duration_minutes,
-            "status":                 "completed",
-            "notes":                  notes.strip() or None,
+            "status":                  "completed",
+            "notes":                   notes.strip() or None,
         })
         .eq("id", break_id)
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError("Break completion could not be recorded — no row returned from database.")
+    return result
 
 
 def mark_break_missed(break_id: str, notes: str = "") -> dict:
     """Mark a break as missed."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .update({
             "status": "missed",
@@ -229,22 +248,26 @@ def mark_break_missed(break_id: str, notes: str = "") -> dict:
         })
         .eq("id", break_id)
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError("Break could not be marked missed — no row returned from database.")
+    return result
 
 
 def update_break_status(break_id: str, new_status: str) -> dict:
     """Update break status directly."""
-    sb = get_supabase_client()
-    return (
+    sb     = get_supabase_client()
+    result = _one(
         sb.from_("break_records")
         .update({"status": new_status})
         .eq("id", break_id)
         .select()
-        .single()
         .execute()
-    ).data
+    )
+    if not result:
+        raise ValueError(f"Break status could not be set to '{new_status}' — no row returned from database.")
+    return result
 
 
 def delete_break(break_id: str) -> None:
