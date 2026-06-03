@@ -180,6 +180,39 @@ def fetch_children_for_room(room_id: str) -> list[dict]:
     ).data or []
 
 
+def fetch_enrolled_counts_by_room(centre_id: str) -> dict[str, int]:
+    """
+    Return {room_id: enrolled_count} for all active, non-deleted children
+    at this centre who have a room assigned.
+
+    Counts only children where:
+        enrolment_status = 'active'
+        deleted_at IS NULL
+        room_id IS NOT NULL
+
+    Used by the Room Allocation page to show enrolled vs capacity.
+    Returns a plain dict so callers do not need to handle None.
+    No .single() — plain list query grouped in Python.
+    """
+    sb = get_supabase_client()
+    rows = (
+        sb.from_("children")
+        .select("room_id")
+        .eq("centre_id", centre_id)
+        .eq("enrolment_status", "active")
+        .is_("deleted_at", "null")
+        .not_.is_("room_id", "null")
+        .execute()
+    ).data or []
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        rid = row.get("room_id")
+        if rid:
+            counts[rid] = counts.get(rid, 0) + 1
+    return counts
+
+
 def move_child_to_room(child_id: str, new_room_id: str | None) -> None:
     """Reassign a child to a different room (or unassigned if None)."""
     sb = get_supabase_client()
