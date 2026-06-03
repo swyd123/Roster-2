@@ -14,7 +14,8 @@
 #       Returns room_counts (flat, one date only).
 #       CSV counts → actual_children (not expected_children).
 #
-# Both share private _parse_date / _parse_time / _duration_str helpers only.
+# Both share private helpers only — _is_blank_time, _parse_date,
+# _parse_time, _duration_str, _bulk_fail, _single_fail.
 
 from __future__ import annotations
 import io
@@ -45,8 +46,11 @@ def parse_csv_bulk(
         start_time        HH:MM or HH:MM:SS
         end_time          HH:MM or HH:MM:SS
 
-    CSV counts are placed into actual_children, not expected_children,
-    because the CSV represents real attendance records.
+    Rows with blank, null, NaN, or "nan" start_time or end_time are silently
+    skipped and counted. A single consolidated warning is added at the end:
+        "Skipped X rows with missing start/end times."
+
+    CSV counts are placed into actual_children, not expected_children.
 
     Returns
     -------
@@ -55,12 +59,11 @@ def parse_csv_bulk(
         warnings          list[str]         — non-blocking
         preview_df        pd.DataFrame|None — one row per valid child-day
         summary_df        pd.DataFrame|None — one row per date × room
-        bulk_room_counts  dict|None         — primary key
-                          {date_str: {room_id: {interval_start: count}}}
+        bulk_room_counts  dict|None         — {date_str: {room_id: {interval_start: count}}}
         date_room_counts  dict|None         — alias for bulk_room_counts
         dates             list[str]         — sorted unique dates in import
         n_children        int               — valid rows parsed
-        n_skipped         int               — rows skipped
+        n_skipped         int               — rows skipped (all reasons)
     """
     errors:   list[str] = []
     warnings: list[str] = []
@@ -104,9 +107,10 @@ def parse_csv_bulk(
     room_by_name: dict[str, dict] = {_norm(r["name"]): r for r in rooms}
 
     # ── 4. Parse and validate each row ───────────────────────────────
-    parsed_rows:  list[dict] = []
-    unknown_rooms: set[str]  = set()
-    n_total = len(df)
+    parsed_rows:   list[dict] = []
+    unknown_rooms: set[str]   = set()
+    n_total        = len(df)
+    n_blank_times  = 0          # rows silently skipped for missing times
 
     for idx, row in df.iterrows():
         rownum     = int(idx) + 2
@@ -114,6 +118,11 @@ def parse_csv_bulk(
         csv_room   = str(row.get("room_name", "")).strip()
         start_raw  = row.get("start_time", "")
         end_raw    = row.get("end_time",   "")
+
+        # ── Silently skip rows with missing/blank/nan times ───────────
+        if _is_blank_time(start_raw) or _is_blank_time(end_raw):
+            n_blank_times += 1
+            continue
 
         # Date
         if has_date_col:
@@ -134,7 +143,7 @@ def parse_csv_bulk(
             unknown_rooms.add(csv_room)
             continue
 
-        # Times
+        # Times (non-blank but possibly still unparseable format)
         start_str = _parse_time(start_raw)
         end_str   = _parse_time(end_raw)
 
@@ -162,6 +171,12 @@ def parse_csv_bulk(
             "start":      start_str,
             "end":        end_str,
         })
+
+    # ── Consolidated warning for blank-time rows ──────────────────────
+    if n_blank_times > 0:
+        warnings.append(
+            f"Skipped {n_blank_times} row(s) with missing start/end times."
+        )
 
     for ur in sorted(unknown_rooms):
         known = ", ".join(f"'{r['name']}'" for r in rooms)
@@ -283,6 +298,9 @@ def parse_csv(
     Required CSV columns: child_name, room_name, start_time, end_time
     attendance_date column is ignored if present.
 
+    Rows with blank, null, NaN, or "nan" start_time or end_time are silently
+    skipped and counted. A consolidated warning is added at the end.
+
     CSV counts → actual_children (not expected_children).
 
     Returns
@@ -325,9 +343,10 @@ def parse_csv(
 
     room_by_name: dict[str, dict] = {_norm(r["name"]): r for r in rooms}
 
-    parsed_rows:  list[dict] = []
-    unknown_rooms: set[str]  = set()
-    n_total = len(df)
+    parsed_rows:   list[dict] = []
+    unknown_rooms: set[str]   = set()
+    n_total       = len(df)
+    n_blank_times = 0
 
     for idx, row in df.iterrows():
         rownum     = int(idx) + 2
@@ -335,6 +354,11 @@ def parse_csv(
         csv_room   = str(row.get("room_name", "")).strip()
         start_raw  = row.get("start_time", "")
         end_raw    = row.get("end_time",   "")
+
+        # Silently skip rows with missing/blank/nan times
+        if _is_blank_time(start_raw) or _is_blank_time(end_raw):
+            n_blank_times += 1
+            continue
 
         matched_room = room_by_name.get(_norm(csv_room))
         if matched_room is None:
@@ -367,6 +391,12 @@ def parse_csv(
             "start":      start_str,
             "end":        end_str,
         })
+
+    # Consolidated warning for blank-time rows
+    if n_blank_times > 0:
+        warnings.append(
+            f"Skipped {n_blank_times} row(s) with missing start/end times."
+        )
 
     for ur in sorted(unknown_rooms):
         known = ", ".join(f"'{r['name']}'" for r in rooms)
@@ -489,6 +519,31 @@ def build_bulk_upsert_plan(
 # PRIVATE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_blank_time(val) -> bool:
+    """
+    Return True if val represents a missing or blank time value that should
+    be silently skipped — no error, no per-row warning.
+
+    Covers every form a blank cell can take after pandas reads a CSV:
+        Python None
+        float NaN   (pandas fill value for empty numeric-looking cells)
+        empty string
+        whitespace-only string
+        the string "nan" (what str(float('nan')) produces)
+        the string "NaN", "NAN", "Nan", "none", "null", "n/a", "-"
+    """
+    if val is None:
+        return True
+    if isinstance(val, float) and math.isnan(val):
+        return True
+    s = str(val).strip()
+    if not s:
+        return True
+    if s.lower() in {"nan", "none", "null", "n/a", "na", "-", "—"}:
+        return True
+    return False
+
+
 def _parse_date(val) -> str | None:
     """Parse a date value into ISO 'YYYY-MM-DD' string, or None."""
     if val is None:
@@ -507,7 +562,11 @@ def _parse_date(val) -> str | None:
 
 
 def _parse_time(val) -> str | None:
-    """Parse a time value into 'HH:MM:SS' string, or None."""
+    """
+    Parse a time value into 'HH:MM:SS' string, or None.
+    Called only after _is_blank_time has already returned False,
+    so val is non-blank and non-null here.
+    """
     if val is None:
         return None
     if isinstance(val, float) and math.isnan(val):
