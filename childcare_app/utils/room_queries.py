@@ -190,8 +190,11 @@ def fetch_enrolled_counts_by_room(centre_id: str) -> dict[str, int]:
         deleted_at IS NULL
         room_id IS NOT NULL
 
-    Used by the Room Allocation page to show enrolled vs capacity.
-    Returns a plain dict so callers do not need to handle None.
+    The room_id IS NOT NULL filter is applied in Python (not via PostgREST)
+    to avoid .not_.is_() compatibility issues across supabase-py versions.
+
+    Returns {} when the children table has no matching rows — callers must
+    treat a missing key as 0, not as an error.
     No .single() — plain list query grouped in Python.
     """
     sb = get_supabase_client()
@@ -201,14 +204,13 @@ def fetch_enrolled_counts_by_room(centre_id: str) -> dict[str, int]:
         .eq("centre_id", centre_id)
         .eq("enrolment_status", "active")
         .is_("deleted_at", "null")
-        .not_.is_("room_id", "null")
         .execute()
     ).data or []
 
     counts: dict[str, int] = {}
     for row in rows:
         rid = row.get("room_id")
-        if rid:
+        if rid:                                 # skip rows where room_id is None
             counts[rid] = counts.get(rid, 0) + 1
     return counts
 
