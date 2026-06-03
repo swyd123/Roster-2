@@ -37,6 +37,7 @@ from utils.attendance_queries import (
     upsert_single_date_from_bulk,
 )
 from utils.csv_attendance_import import parse_csv_bulk
+from utils.child_queries import upsert_children_from_csv
 from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_centres
 from utils.centre_queries import fetch_centre_by_id
@@ -273,7 +274,16 @@ def _render_bulk_csv_section(
         key="bulk_save_all_btn",
         use_container_width=True,
     ):
-        prog_bar = st.progress(0, text="Preparing rows…")
+        child_records = result.get("child_records") or []
+
+        # Step 1 — upsert child enrolment records
+        if child_records:
+            with st.spinner(f"Creating/updating {len(child_records)} child record(s)…"):
+                child_result = upsert_children_from_csv(child_records, centre_id)
+            _show_child_import_result(child_result)
+
+        # Step 2 — upsert attendance intervals
+        prog_bar = st.progress(0, text="Saving attendance intervals…")
         def _prog_all(frac: float):
             prog_bar.progress(min(int(frac * 100), 100), text=f"Saving… {int(frac * 100)}%")
         total_ivs, total_rooms, errors = upsert_all_dates_from_bulk(
@@ -302,8 +312,17 @@ def _render_bulk_csv_section(
             key="bulk_save_date_btn",
             use_container_width=True,
         ):
+            child_records = result.get("child_records") or []
+
+            # Step 1 — upsert child enrolment records
+            if child_records:
+                with st.spinner(f"Creating/updating {len(child_records)} child record(s)…"):
+                    child_result = upsert_children_from_csv(child_records, centre_id)
+                _show_child_import_result(child_result)
+
+            # Step 2 — upsert attendance intervals for this date only
             room_counts_for_date = date_room_counts[selected_review_date]
-            prog_bar2 = st.progress(0, text="Preparing rows…")
+            prog_bar2 = st.progress(0, text="Saving attendance intervals…")
             def _prog_date(frac: float):
                 prog_bar2.progress(
                     min(int(frac * 100), 100),
@@ -327,6 +346,28 @@ def _render_bulk_csv_section(
                 for rid in room_counts_for_date:
                     _clear_prefill(rid, selected_review_date)
                 st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Child import result display
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _show_child_import_result(result: dict) -> None:
+    """Show a compact inline summary of the child enrolment upsert result."""
+    added   = result.get("added",   0)
+    updated = result.get("updated", 0)
+    skipped = result.get("skipped", 0)
+    errors  = result.get("errors",  [])
+
+    parts = []
+    if added:   parts.append(f"**{added}** added")
+    if updated: parts.append(f"**{updated}** updated")
+    if skipped: parts.append(f"**{skipped}** skipped")
+
+    if parts:
+        toast_success(f"👶 Children: {', '.join(parts)}.")
+    for e in errors:
+        toast_error(f"Child import error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
