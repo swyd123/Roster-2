@@ -1,6 +1,14 @@
 # pages/room_allocation.py — Room Allocation
 # Shows per-room: capacity, active enrolments, vacancy, peak attendance for date.
 # Children can be moved between rooms inline.
+#
+# Data sources
+# ─────────────
+# Enrolled count:  children table  (enrolment_status='active', deleted_at IS NULL)
+# Peak attendance: room_attendance_intervals  (actual_children preferred,
+#                  expected_children fallback — expected can be null/0)
+#
+# Both sources are independent — attendance shows even when children table is empty.
 
 import streamlit as st
 from datetime import date
@@ -10,7 +18,7 @@ from utils.room_queries import (
     move_child_to_room,
     fmt_age, age_in_months, is_child_near_age_out,
 )
-from utils.attendance_queries import fetch_intervals_for_centre, summarise_day
+from utils.attendance_queries import fetch_intervals_for_centre
 from utils.staff_queries import fetch_centres
 from utils.helpers import toast_success, toast_error
 
@@ -65,32 +73,40 @@ def render():
     )
     date_str = selected_date.isoformat()
 
-    # ── Load all data in one pass ─────────────────────────────────────
+    # ── Load all data ─────────────────────────────────────────────────
     with st.spinner("Loading…"):
         try:
-            rooms          = fetch_rooms(centre_id)
-            children       = fetch_children_by_centre(centre_id)
+            rooms           = fetch_rooms(centre_id)
+            children        = fetch_children_by_centre(centre_id)
             enrolled_counts = fetch_enrolled_counts_by_room(centre_id)
-            day_intervals  = fetch_intervals_for_centre(centre_id, date_str)
+            day_intervals   = fetch_intervals_for_centre(centre_id, date_str)
         except Exception as e:
             toast_error(f"Could not load data: {e}")
             return
 
-    # ── Build peak attendance lookup: {room_id → peak_count} ─────────
-    # Prefer actual_children; fall back to expected_children.
+    # ── Build peak attendance from raw intervals ───────────────────────
+    # Done directly from the interval rows — does NOT require the rooms
+    # list, so attendance shows even when the children table is empty.
+    #
+    # Rule: use actual_children when it is not None; otherwise fall back
+    # to expected_children. expected_children may be null (CSV import only
+    # sets actual_children).
     peak_attendance: dict[str, int] = {}
-    for room in rooms:
-        rid     = room["id"]
-        summary = summarise_day(day_intervals, rid)
-        # summarise_day returns peak_actual and peak_expected
-        peak = summary["peak_actual"] if summary["peak_actual"] > 0 else summary["peak_expected"]
-        if peak > 0:
-            peak_attendance[rid] = peak
+    for iv in day_intervals:
+        rid = iv.get("room_id")
+        if not rid:
+            continue
+        act = iv.get("actual_children")
+        exp = iv.get("expected_children")
 
-    has_enrolment_data = bool(children)
-    has_attendance_data = bool(day_intervals)
+        # Prefer actual; fall back to expected only when actual is absent
+        count = int(act) if act is not None else (int(exp) if exp is not None else 0)
 
-    # ── Age-up alerts ─────────────────────────────────────────────────
+        if count > 0:
+            if peak_attendance.get(rid, 0) < count:
+                peak_attendance[rid] = count
+
+    # ── Age-up alerts (only when children exist) ──────────────────────
     age_out_kids = []
     for child in children:
         room_full = next((r for r in rooms if r["id"] == child.get("room_id")), None)
@@ -106,9 +122,9 @@ def render():
         )
         with st.expander(f"See {len(age_out_kids)} age-up suggestion(s)"):
             for child, room_full in age_out_kids:
-                cname  = f"{child.get('first_name','')} {child.get('last_name','')}".strip()
-                age_m  = age_in_months(child.get("date_of_birth"))
-                max_m  = room_full.get("age_max_months", 72)
+                cname   = f"{child.get('first_name','')} {child.get('last_name','')}".strip()
+                age_m   = age_in_months(child.get("date_of_birth"))
+                max_m   = room_full.get("age_max_months", 72)
                 in_room = room_full.get("name", "")
                 st.markdown(
                     f'<div style="display:flex;justify-content:space-between;'
@@ -124,15 +140,14 @@ def render():
     st.markdown("---")
 
     # ── Centre-level summary metrics ──────────────────────────────────
-    unassigned      = [c for c in children if not c.get("room_id")]
-    total_enrolled  = len(children)
-    total_capacity  = sum(r.get("licensed_capacity", 0) for r in rooms)
-    total_vacancies = max(0, total_capacity - total_enrolled)
+    unassigned     = [c for c in children if not c.get("room_id")]
+    total_enrolled = len(children)
+    total_capacity = sum(r.get("licensed_capacity", 0) for r in rooms)
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Active Rooms",     len(rooms))
-    m2.metric("Total Enrolled",   total_enrolled)
-    m3.metric("Total Capacity",   total_capacity)
+    m1.metric("Active Rooms",   len(rooms))
+    m2.metric("Total Enrolled", total_enrolled)
+    m3.metric("Total Capacity", total_capacity)
     m4.metric(
         "Unassigned",
         len(unassigned),
@@ -140,22 +155,28 @@ def render():
         delta_color="inverse" if unassigned else "off",
     )
 
-    if not has_enrolment_data:
+    if not children:
         st.info(
             "No child enrolment records found. "
             "Add children or use attendance import for actual daily counts."
         )
 
-    if not has_attendance_data:
+    if not day_intervals:
         st.caption(
             f"No attendance interval data for {date_str}. "
             "Upload a CSV on the **👶 Child Attendance** page to see peak figures."
         )
+    else:
+        rooms_with_data = len(peak_attendance)
+        st.caption(
+            f"Attendance data loaded for {date_str} — "
+            f"{len(day_intervals)} interval(s) across {rooms_with_data} room(s)."
+        )
 
     st.markdown("---")
 
-    # ── Group children by room for the move panel ─────────────────────
-    room_map  = {r["id"]: r for r in rooms}
+    # ── Group children by room ────────────────────────────────────────
+    room_map: dict[str, dict] = {r["id"]: r for r in rooms}
     room_kids: dict[str, list] = {r["id"]: [] for r in rooms}
     room_kids["__none__"] = []
 
@@ -166,7 +187,7 @@ def render():
         else:
             room_kids["__none__"].append(child)
 
-    move_opts = {"": "— Unassigned —"}
+    move_opts: dict[str, str] = {"": "— Unassigned —"}
     move_opts.update({r["id"]: r["name"] for r in rooms})
 
     # ── Room cards (2-up grid) ────────────────────────────────────────
@@ -188,7 +209,7 @@ def render():
                     move_opts=move_opts,
                 )
 
-    # ── Unassigned children section ───────────────────────────────────
+    # ── Unassigned children ───────────────────────────────────────────
     if room_kids["__none__"]:
         st.markdown("---")
         st.markdown(
@@ -216,20 +237,18 @@ def _render_room_card(
     room_map: dict,
     move_opts: dict,
 ):
-    rid     = room["id"]
-    colour  = room.get("colour", "#3498DB")
-    rname   = room.get("name", "Room")
-    cap     = room.get("licensed_capacity", 0)
+    rid    = room["id"]
+    colour = room.get("colour", "#3498DB")
+    rname  = room.get("name", "Room")
+    cap    = room.get("licensed_capacity", 0)
 
-    # Enrolled = count from children table (active, non-deleted, this room)
     n_enrolled = enrolled_counts.get(rid, 0)
     vacancy    = max(0, cap - n_enrolled)
+    peak       = peak_attendance.get(rid)   # None = no interval data for this room
 
-    # Peak attendance for selected date from room_attendance_intervals
-    peak = peak_attendance.get(rid)
-
-    # Capacity bar uses enrolled count; colour by fill level
-    fill_pct = round((n_enrolled / cap) * 100) if cap > 0 else 0
+    # Capacity bar fill — use peak attendance when available, else enrolment
+    fill_n   = peak if peak is not None else n_enrolled
+    fill_pct = round((fill_n / cap) * 100) if cap > 0 else 0
     if fill_pct >= 100:
         bar_colour = "#dc2626"
     elif fill_pct >= 80:
@@ -237,7 +256,22 @@ def _render_room_card(
     else:
         bar_colour = colour
 
-    # ── Card header ───────────────────────────────────────────────────
+    # Peak cell content
+    if peak is not None:
+        peak_value_html = (
+            f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
+            f'color:#1d4ed8;line-height:1;">{peak}</div>'
+            f'<div style="font-size:0.65rem;color:#7a90a8;text-transform:uppercase;'
+            f'letter-spacing:0.04em;margin-top:2px;">Peak {date_str[5:]}</div>'
+        )
+    else:
+        peak_value_html = (
+            f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
+            f'color:#cbd5e1;line-height:1;">—</div>'
+            f'<div style="font-size:0.65rem;color:#94a3b8;text-transform:uppercase;'
+            f'letter-spacing:0.04em;margin-top:2px;">No data</div>'
+        )
+
     st.markdown(
         f'<div style="border:2px solid {colour};border-radius:12px;'
         f'overflow:hidden;margin-bottom:0.6rem;">'
@@ -251,16 +285,15 @@ def _render_room_card(
         f'Cap {cap}</span>'
         f'</div>'
 
-        # Enrolment fill bar (based on enrolled vs capacity)
+        # Fill bar
         f'<div style="height:4px;background:#f0f4f8;">'
         f'<div style="height:4px;width:{min(fill_pct,100)}%;background:{bar_colour};'
         f'transition:width 0.3s;"></div></div>'
 
-        # Stats row
+        # Stats row: Enrolled | Vacancies | Peak
         f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;'
         f'gap:0;border-top:1px solid {colour}22;">'
 
-        # Enrolled
         f'<div style="padding:0.55rem 0.5rem;text-align:center;'
         f'border-right:1px solid #f0f4f8;">'
         f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
@@ -269,7 +302,6 @@ def _render_room_card(
         f'letter-spacing:0.04em;margin-top:2px;">Enrolled</div>'
         f'</div>'
 
-        # Vacancy
         f'<div style="padding:0.55rem 0.5rem;text-align:center;'
         f'border-right:1px solid #f0f4f8;">'
         f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
@@ -278,36 +310,18 @@ def _render_room_card(
         f'letter-spacing:0.04em;margin-top:2px;">Vacancies</div>'
         f'</div>'
 
-        # Peak attendance
-        + (
-            f'<div style="padding:0.55rem 0.5rem;text-align:center;">'
-            f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
-            f'color:#1d4ed8;line-height:1;">{peak}</div>'
-            f'<div style="font-size:0.65rem;color:#7a90a8;text-transform:uppercase;'
-            f'letter-spacing:0.04em;margin-top:2px;">Peak {date_str[5:]}</div>'
-            f'</div>'
-            if peak is not None
-            else
-            f'<div style="padding:0.55rem 0.5rem;text-align:center;">'
-            f'<div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
-            f'color:#cbd5e1;line-height:1;">—</div>'
-            f'<div style="font-size:0.65rem;color:#94a3b8;text-transform:uppercase;'
-            f'letter-spacing:0.04em;margin-top:2px;">No attendance</div>'
-            f'</div>'
-        )
-        + f'</div></div>',
+        f'<div style="padding:0.55rem 0.5rem;text-align:center;">'
+        f'{peak_value_html}'
+        f'</div>'
+
+        f'</div></div>',
         unsafe_allow_html=True,
     )
 
-    # ── Children list + move controls ─────────────────────────────────
+    # Children list + move controls
     if not kids:
-        if n_enrolled == 0:
-            st.caption("No enrolled children.")
-        else:
-            st.caption(
-                "No child enrolment records assigned to this room yet. "
-                "Add children or use the attendance import."
-            )
+        st.caption("No children enrolled in this room." if n_enrolled == 0
+                   else "No child records assigned to this room yet.")
     else:
         for child in kids:
             _render_child_row(child, room_map, move_opts, colour)
@@ -321,7 +335,9 @@ def _render_room_card(
 
 def _render_child_row(child: dict, room_map: dict, move_opts: dict, accent: str):
     cid         = child.get("id", "")
-    cname       = f"{child.get('first_name','')}{' ' if child.get('last_name') else ''}{child.get('last_name','')}".strip()
+    first       = child.get("first_name", "") or ""
+    last        = child.get("last_name", "")  or ""
+    cname       = f"{first} {last}".strip() or "Unnamed"
     age_m       = age_in_months(child.get("date_of_birth"))
     age_s       = fmt_age(age_m)
     cur_room_id = child.get("room_id", "")
