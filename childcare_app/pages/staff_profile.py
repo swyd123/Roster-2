@@ -19,6 +19,9 @@ from utils.helpers import (
     toast_success, toast_error, toast_warn, workdays_between,
 )
 from components.staff_form import staff_form
+from utils.break_preferences_queries import (
+    fetch_all_break_prefs_for_user, upsert_break_prefs_bulk, DAY_NAMES,
+)
 import time
 
 
@@ -102,8 +105,8 @@ def render():
 
     # ── Tabs ──────────────────────────────────────────────────────────
     default_tab = st.session_state.pop("profile_tab", "overview")
-    tab_labels  = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave", "✏️ Edit"]
-    tab_map     = {"overview": 0, "quals": 1, "avail": 2, "leave": 3, "edit": 4}
+    tab_labels  = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave", "☕ Break Prefs", "✏️ Edit"]
+    tab_map     = {"overview": 0, "quals": 1, "avail": 2, "leave": 3, "breaks": 4, "edit": 5}
 
     tabs = st.tabs(tab_labels)
 
@@ -165,9 +168,15 @@ def render():
         _render_leave(user_id, centre_id)
 
     # ════════════════════════════════════════════════════════════════
-    # TAB 5 — Edit
+    # TAB 5 — Break Preferences
     # ════════════════════════════════════════════════════════════════
     with tabs[4]:
+        _render_break_preferences(user_id, centre_id, staff)
+
+    # ════════════════════════════════════════════════════════════════
+    # TAB 6 — Edit
+    # ════════════════════════════════════════════════════════════════
+    with tabs[5]:
         st.markdown("")
 
         # Pass show_role_fields=True so centre/role can be added or changed.
@@ -194,6 +203,7 @@ def render():
                         emergency_contact_relationship=values["emergency_contact_relationship"],
                         notes=values["notes"],
                         is_active=values["is_active"],
+                        allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
                     )
 
                     # Step 2 — upsert the centre role assignment.
@@ -612,3 +622,130 @@ def _render_leave(user_id: str, centre_id: str | None):
             st.markdown(f"**Reason:** {reason}")
             if lv.get("review_notes"):
                 st.markdown(f"**Manager's note:** {lv['review_notes']}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BREAK PREFERENCES TAB
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_break_preferences(user_id: str, centre_id: str, staff: dict):
+    """
+    Tab 5 — Weekly unpaid break opt-out preferences.
+    Managers set which weekdays this educator opts out of the unpaid meal break.
+    Paid rest breaks are always unaffected.
+    Only visible/editable when the profile has allows_unpaid_break_opt_out=True.
+    """
+    allows = bool(staff.get("allows_unpaid_break_opt_out", False))
+
+    st.markdown("### ☕ Break Preferences")
+    st.caption(
+        "Set recurring weekday preferences for the unpaid meal break opt-out. "
+        "These defaults are applied automatically when a shift is created. "
+        "The roster form can override them per shift."
+    )
+
+    if not allows:
+        st.info(
+            "This educator's profile does not currently allow unpaid break opt-out. "
+            "Enable **Allow unpaid break opt-out** in the **✏️ Edit** tab first."
+        )
+        return
+
+    st.warning(
+        "⚠️ **Confirm each opted-out day complies with the applicable award, "
+        "enterprise agreement, and employee agreement.** "
+        "Paid rest break entitlement is always retained."
+    )
+
+    # Load existing preferences
+    try:
+        existing_rows = fetch_all_break_prefs_for_user(user_id, centre_id)
+    except Exception as e:
+        st.error(f"Could not load break preferences: {e}")
+        return
+
+    # Build current {dow: bool} from most recent row per day
+    today      = date.today().isoformat()
+    current: dict[int, bool] = {}
+    for row in existing_rows:
+        dow   = row.get("day_of_week")
+        until = row.get("effective_until")
+        if dow is None or dow in current:
+            continue
+        if until and until < today:
+            continue
+        current[dow] = bool(row.get("unpaid_break_opt_out", False))
+
+    st.markdown("**Select which weekdays to opt out of the unpaid meal break:**")
+    st.caption("Paid rest break is always required regardless of these settings.")
+
+    with st.form(key="break_prefs_form"):
+        new_prefs: dict[int, bool] = {}
+        cols = st.columns(7)
+        # Mon=1 … Sat=6, Sun=0  (Python isoweekday() % 7)
+        for i, (col, (dow, day_name)) in enumerate(
+            zip(cols, [(1,"Mon"),(2,"Tue"),(3,"Wed"),(4,"Thu"),(5,"Fri"),(6,"Sat"),(0,"Sun")])
+        ):
+            full_name = DAY_NAMES.get(dow, day_name)
+            val       = current.get(dow, False)
+            new_prefs[dow] = col.checkbox(
+                full_name,
+                value=val,
+                key=f"bp_{dow}",
+            )
+
+        eff_from = st.date_input(
+            "Effective from",
+            value=date.today(),
+            key="bp_eff_from",
+            format="DD/MM/YYYY",
+            help="Preferences will apply from this date. Use today to take effect immediately.",
+        )
+        bp_notes = st.text_input(
+            "Notes (optional)",
+            placeholder="e.g. per EA clause 12.3",
+            key="bp_notes",
+        )
+
+        saved = st.form_submit_button("💾 Save Break Preferences", type="primary",
+                                       use_container_width=False)
+
+    if saved:
+        with st.spinner("Saving…"):
+            try:
+                n = upsert_break_prefs_bulk(
+                    user_id=user_id,
+                    centre_id=centre_id,
+                    prefs=new_prefs,
+                    effective_from=eff_from.isoformat(),
+                    notes=bp_notes,
+                )
+                opted_days = [DAY_NAMES.get(d,"") for d, v in new_prefs.items() if v]
+                toast_success(
+                    f"Break preferences saved for {n} day(s). "
+                    + (f"Opted out: {', '.join(opted_days)}." if opted_days else "No days opted out.")
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not save: {e}")
+
+    # ── History ────────────────────────────────────────────────────────
+    if existing_rows:
+        with st.expander("📜 Preference history", expanded=False):
+            for row in existing_rows:
+                dow      = row.get("day_of_week", "?")
+                day_name = DAY_NAMES.get(dow, str(dow))
+                opt_out  = row.get("unpaid_break_opt_out", False)
+                eff_f    = row.get("effective_from","")
+                eff_u    = row.get("effective_until","—")
+                notes    = row.get("notes","") or ""
+                st.markdown(
+                    f'<div style="font-size:0.82rem;padding:0.25rem 0;'
+                    f'border-bottom:1px solid #f0f4f8;">'
+                    f'<strong>{day_name}</strong> · '
+                    f'{"✅ Opted out" if opt_out else "❌ Not opted out"} · '
+                    f'From {eff_f} until {eff_u}'
+                    + (f' · {notes}' if notes else '')
+                    + f'</div>',
+                    unsafe_allow_html=True,
+                )
