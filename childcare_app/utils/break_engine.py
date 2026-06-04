@@ -3,12 +3,14 @@
 # Pure-Python break calculation engine.
 # No database calls — all inputs come from the caller.
 #
-# Australian Children's Services Award 2010 break entitlements:
-#   Shift ≥ 4 hours  → 1 × 10-min paid rest break
-#   Shift ≥ 5 hours  → 1 × 30-min unpaid meal break  (+ the rest break)
-#   Shift ≥ 8 hours  → 2 × rest breaks + 1 meal break
+# Break entitlement rules (configurable — see BREAK_RULES_DEFAULT):
+#   Shift < 4 hours  → no break
+#   Shift 4–5 hours  → 1 × 10-min paid rest break
+#   Shift 5–7 hours  → 1 × 10-min paid rest + 1 × 30-min unpaid meal
+#   Shift 7+ hours   → 1 × 20-min paid rest + 1 × 30-min unpaid meal
 #
 # Staff on break are NOT counted in ratio calculations.
+# Rules are configurable via the break_rules table (fetched by break_queries).
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -17,119 +19,207 @@ from typing import Optional
 import math
 
 
-# ── Break status labels & colours ────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT BREAK RULES (used when no DB rules are found)
+# ─────────────────────────────────────────────────────────────────────────────
+# Each tier: min_minutes (inclusive) to max_minutes (exclusive), break spec.
+# Tiers are evaluated in ascending order; first match wins.
+# paid_minutes   — total paid break minutes for this tier
+# unpaid_minutes — total unpaid meal break minutes for this tier
+# paid_count     — number of distinct paid break slots (affects scheduling)
+# paid_duration  — minutes per paid break slot
+
+BREAK_RULES_DEFAULT: list[dict] = [
+    {
+        "min_hours":      0,
+        "max_hours":      4,       # < 4 hours
+        "paid_minutes":   0,
+        "unpaid_minutes": 0,
+        "paid_count":     0,
+        "paid_duration":  0,
+        "label":          "No break entitlement",
+    },
+    {
+        "min_hours":      4,
+        "max_hours":      5,       # 4h ≤ shift < 5h
+        "paid_minutes":   10,
+        "unpaid_minutes": 0,
+        "paid_count":     1,
+        "paid_duration":  10,
+        "label":          "1 × 10-min paid rest",
+    },
+    {
+        "min_hours":      5,
+        "max_hours":      7,       # 5h ≤ shift < 7h
+        "paid_minutes":   10,
+        "unpaid_minutes": 30,
+        "paid_count":     1,
+        "paid_duration":  10,
+        "label":          "1 × 10-min paid rest + 1 × 30-min unpaid meal",
+    },
+    {
+        "min_hours":      7,
+        "max_hours":      999,     # 7h+
+        "paid_minutes":   20,
+        "unpaid_minutes": 30,
+        "paid_count":     1,
+        "paid_duration":  20,
+        "label":          "1 × 20-min paid rest + 1 × 30-min unpaid meal",
+    },
+]
+
+
+# ── Break status labels & colours ─────────────────────────────────────────────
 
 BREAK_STATUS_CONFIG = {
     "scheduled": {
-        "label": "Scheduled",
-        "icon":  "📅",
-        "bg":    "#eff6ff",
-        "text":  "#1d4ed8",
-        "border":"#bfdbfe",
+        "label":  "Scheduled",
+        "icon":   "📅",
+        "bg":     "#eff6ff",
+        "text":   "#1d4ed8",
+        "border": "#bfdbfe",
     },
     "in_progress": {
-        "label": "In Progress",
-        "icon":  "☕",
-        "bg":    "#fffbeb",
-        "text":  "#92400e",
-        "border":"#fcd34d",
+        "label":  "In Progress",
+        "icon":   "☕",
+        "bg":     "#fffbeb",
+        "text":   "#92400e",
+        "border": "#fcd34d",
     },
     "completed": {
-        "label": "Completed",
-        "icon":  "✅",
-        "bg":    "#f0fdf4",
-        "text":  "#14532d",
-        "border":"#86efac",
+        "label":  "Completed",
+        "icon":   "✅",
+        "bg":     "#f0fdf4",
+        "text":   "#14532d",
+        "border": "#86efac",
     },
     "missed": {
-        "label": "Missed",
-        "icon":  "⚠️",
-        "bg":    "#fff1f2",
-        "text":  "#881337",
-        "border":"#fca5a5",
+        "label":  "Missed",
+        "icon":   "⚠️",
+        "bg":     "#fff1f2",
+        "text":   "#881337",
+        "border": "#fca5a5",
     },
     "rescheduled": {
-        "label": "Rescheduled",
-        "icon":  "🔄",
-        "bg":    "#f5f3ff",
-        "text":  "#5b21b6",
-        "border":"#c4b5fd",
+        "label":  "Rescheduled",
+        "icon":   "🔄",
+        "bg":     "#f5f3ff",
+        "text":   "#5b21b6",
+        "border": "#c4b5fd",
     },
     "not_yet_due": {
-        "label": "Not yet due",
-        "icon":  "⏳",
-        "bg":    "#f8fafc",
-        "text":  "#64748b",
-        "border":"#e2e8f0",
+        "label":  "Not yet due",
+        "icon":   "⏳",
+        "bg":     "#f8fafc",
+        "text":   "#64748b",
+        "border": "#e2e8f0",
+    },
+    # New statuses for break schedule table
+    "ratio_conflict": {
+        "label":  "Ratio conflict",
+        "icon":   "❌",
+        "bg":     "#fff1f2",
+        "text":   "#991b1b",
+        "border": "#fca5a5",
+    },
+    "manual_review": {
+        "label":  "Manual review required",
+        "icon":   "🔍",
+        "bg":     "#fffbeb",
+        "text":   "#92400e",
+        "border": "#fcd34d",
     },
 }
 
 BREAK_TYPE_LABELS = {
-    "meal": "Meal Break",
-    "rest": "Rest Break",
+    "meal": "Meal Break (unpaid)",
+    "rest": "Rest Break (paid)",
 }
 
 
-# ── Award entitlement calculation ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTITLEMENT CALCULATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def shift_duration_minutes(start_str: str, end_str: str) -> int:
     """Minutes between two HH:MM or HH:MM:SS strings."""
     try:
-        s = datetime.strptime(start_str[:5], "%H:%M")
-        e = datetime.strptime(end_str[:5],   "%H:%M")
+        s    = datetime.strptime(start_str[:5], "%H:%M")
+        e    = datetime.strptime(end_str[:5],   "%H:%M")
         diff = int((e - s).total_seconds() / 60)
         return max(0, diff)
     except Exception:
         return 0
 
 
-def calc_break_entitlement(shift_minutes: int) -> dict:
+def _match_tier(shift_minutes: int, rules: list[dict]) -> dict:
+    """Find the first matching tier for the given shift length."""
+    shift_hours = shift_minutes / 60
+    for tier in sorted(rules, key=lambda t: t["min_hours"]):
+        if tier["min_hours"] <= shift_hours < tier["max_hours"]:
+            return tier
+    # Fallback: last tier (covers unbounded top)
+    return rules[-1] if rules else BREAK_RULES_DEFAULT[-1]
+
+
+def calc_break_entitlement(
+    shift_minutes: int,
+    rules: list[dict] | None = None,
+) -> dict:
     """
-    Calculate the break entitlement for a given shift length.
+    Calculate break entitlement for a given shift length using configurable rules.
 
-    Returns:
-        meal_breaks     — number of unpaid meal breaks (30 min each)
-        rest_breaks     — number of paid rest breaks (10 min each)
-        total_paid_min  — total paid break minutes
-        total_unpaid_min— total unpaid break minutes
-        total_min       — total break minutes
-        summary         — human-readable description
+    Parameters
+    ----------
+    shift_minutes   Total shift duration in minutes.
+    rules           Optional list of rule tier dicts (see BREAK_RULES_DEFAULT).
+                    When None, uses BREAK_RULES_DEFAULT.
+
+    Returns
+    -------
+    dict with keys:
+        paid_minutes      int    — total paid break minutes
+        unpaid_minutes    int    — total unpaid break minutes
+        paid_count        int    — number of distinct paid break slots
+        paid_duration     int    — minutes per paid break slot
+        total_min         int    — total break minutes (paid + unpaid)
+        has_meal          bool
+        has_rest          bool
+        summary           str    — human-readable description
+        tier              dict   — the matched rule tier
     """
-    meal_breaks = 0
-    rest_breaks = 0
+    active_rules = rules if rules else BREAK_RULES_DEFAULT
+    tier         = _match_tier(shift_minutes, active_rules)
 
-    if shift_minutes >= 8 * 60:
-        meal_breaks = 1
-        rest_breaks = 2
-    elif shift_minutes >= 5 * 60:
-        meal_breaks = 1
-        rest_breaks = 1
-    elif shift_minutes >= 4 * 60:
-        meal_breaks = 0
-        rest_breaks = 1
-    # Under 4 hours: no entitlement
-
-    total_paid_min   = rest_breaks * 10
-    total_unpaid_min = meal_breaks * 30
-    total_min        = total_paid_min + total_unpaid_min
-
-    parts = []
-    if rest_breaks:
-        parts.append(f"{rest_breaks} × 10min rest")
-    if meal_breaks:
-        parts.append(f"{meal_breaks} × 30min meal")
-
-    summary = " + ".join(parts) if parts else "No break entitlement"
+    paid_min    = tier.get("paid_minutes",   0)
+    unpaid_min  = tier.get("unpaid_minutes", 0)
+    paid_count  = tier.get("paid_count",     0)
+    paid_dur    = tier.get("paid_duration",  0)
+    total_min   = paid_min + unpaid_min
+    has_meal    = unpaid_min > 0
+    has_rest    = paid_min > 0
 
     return {
-        "meal_breaks":      meal_breaks,
-        "rest_breaks":      rest_breaks,
-        "total_paid_min":   total_paid_min,
-        "total_unpaid_min": total_unpaid_min,
-        "total_min":        total_min,
-        "summary":          summary,
+        "paid_minutes":   paid_min,
+        "unpaid_minutes": unpaid_min,
+        "paid_count":     paid_count,
+        "paid_duration":  paid_dur,
+        "total_min":      total_min,
+        "has_meal":       has_meal,
+        "has_rest":       has_rest,
+        "summary":        tier.get("label", "No break entitlement"),
+        "tier":           tier,
+        # Legacy aliases kept for backwards compatibility
+        "meal_breaks":    1 if has_meal else 0,
+        "rest_breaks":    paid_count,
+        "total_paid_min":   paid_min,
+        "total_unpaid_min": unpaid_min,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BREAK SCHEDULING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def suggest_break_times(
     shift_start: str,
@@ -138,8 +228,11 @@ def suggest_break_times(
 ) -> list[dict]:
     """
     Suggest ideal break times spread across the shift.
-    Meal break is placed at the midpoint.
-    Rest breaks are at the 1/3 and 2/3 points.
+
+    Placement strategy:
+        Single rest break (10m or 20m) — at 40% of shift
+        Meal break (30m) — at 52% of shift (after rest)
+        Two rest breaks — at 25% and 65% of shift (legacy rule support)
 
     Returns list of {break_type, planned_start, planned_end, duration_minutes}.
     """
@@ -153,46 +246,162 @@ def suggest_break_times(
     except Exception:
         return suggestions
 
-    n_meal = entitlement["meal_breaks"]
-    n_rest = entitlement["rest_breaks"]
+    paid_count  = entitlement.get("paid_count",    0)
+    paid_dur    = entitlement.get("paid_duration",  10)
+    has_meal    = entitlement.get("has_meal",       False)
 
-    # Place rest breaks evenly across shift
-    if n_rest == 1:
-        # Single rest break: 40% into shift
+    # Place paid rest break(s)
+    if paid_count == 1:
         offset = int(shift_mins * 0.40)
         t      = start_dt + timedelta(minutes=offset)
         suggestions.append({
-            "break_type":        "rest",
-            "planned_start":     t.strftime("%H:%M:%S"),
-            "planned_end":       (t + timedelta(minutes=10)).strftime("%H:%M:%S"),
-            "duration_minutes":  10,
+            "break_type":       "rest",
+            "planned_start":    t.strftime("%H:%M:%S"),
+            "planned_end":      (t + timedelta(minutes=paid_dur)).strftime("%H:%M:%S"),
+            "duration_minutes": paid_dur,
         })
-    elif n_rest == 2:
+    elif paid_count == 2:
         for frac in [0.25, 0.65]:
             offset = int(shift_mins * frac)
             t      = start_dt + timedelta(minutes=offset)
             suggestions.append({
-                "break_type":        "rest",
-                "planned_start":     t.strftime("%H:%M:%S"),
-                "planned_end":       (t + timedelta(minutes=10)).strftime("%H:%M:%S"),
-                "duration_minutes":  10,
+                "break_type":       "rest",
+                "planned_start":    t.strftime("%H:%M:%S"),
+                "planned_end":      (t + timedelta(minutes=paid_dur)).strftime("%H:%M:%S"),
+                "duration_minutes": paid_dur,
             })
 
-    # Meal break at midpoint (push slightly past middle so rest comes first)
-    if n_meal >= 1:
+    # Meal break (unpaid, 30m) — past midpoint so rest comes first
+    if has_meal:
         offset = int(shift_mins * 0.52)
         t      = start_dt + timedelta(minutes=offset)
         suggestions.append({
-            "break_type":        "meal",
-            "planned_start":     t.strftime("%H:%M:%S"),
-            "planned_end":       (t + timedelta(minutes=30)).strftime("%H:%M:%S"),
-            "duration_minutes":  30,
+            "break_type":       "meal",
+            "planned_start":    t.strftime("%H:%M:%S"),
+            "planned_end":      (t + timedelta(minutes=30)).strftime("%H:%M:%S"),
+            "duration_minutes": 30,
         })
 
     return suggestions
 
 
-# ── Live status derivation ────────────────────────────────────────────────────
+def generate_break_recommendations(
+    shifts: list[dict],
+    existing_breaks: list[dict],
+    rooms: list[dict],
+    rules: list[dict] | None = None,
+) -> list[dict]:
+    """
+    Generate break recommendations for all shifts, checking for ratio conflicts.
+
+    Each recommendation dict:
+        user_id, user_name, shift_id, room_id, room_name,
+        shift_start, shift_end, shift_minutes,
+        entitlement (dict), suggestions (list[dict]),
+        schedule_status ("scheduled"|"ratio_conflict"|"manual_review"|"no_entitlement"),
+        status_reason (str)
+
+    schedule_status values:
+        "scheduled"       — breaks recommended without ratio issues
+        "ratio_conflict"  — one or more suggested breaks would cause a ratio breach
+        "manual_review"   — could not auto-resolve; needs human decision
+        "no_entitlement"  — shift too short, no break required
+    """
+    room_map    = {r["id"]: r for r in rooms}
+    breaks_by_uid: dict[str, list] = {}
+    for b in existing_breaks:
+        uid = b.get("user_id", "")
+        breaks_by_uid.setdefault(uid, []).append(b)
+
+    # Build staff-per-room count at each 15-min slot (for ratio checking)
+    room_staff_counts = _build_room_staff_counts(shifts)
+
+    recommendations = []
+
+    # Prioritise educators finishing earliest — they need their breaks
+    # scheduled before the end of their shift, so they come first.
+    for shift in sorted(shifts, key=lambda s: (s.get("end_time") or "99:99")):
+        u       = shift.get("users") or {}
+        uid     = shift.get("user_id", "")
+        rid     = shift.get("room_id", "")
+        ss      = (shift.get("start_time") or "")[:5]
+        se      = (shift.get("end_time")   or "")[:5]
+        sname   = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
+        room_d  = room_map.get(rid, {})
+
+        if not ss or not se:
+            continue
+
+        dur_mins = shift_duration_minutes(ss, se)
+        ent      = calc_break_entitlement(dur_mins, rules)
+
+        if ent["total_min"] == 0:
+            recommendations.append({
+                "user_id":        uid,
+                "user_name":      sname,
+                "shift_id":       shift.get("id", ""),
+                "room_id":        rid,
+                "room_name":      room_d.get("name", ""),
+                "shift_start":    ss,
+                "shift_end":      se,
+                "shift_minutes":  dur_mins,
+                "entitlement":    ent,
+                "suggestions":    [],
+                "schedule_status": "no_entitlement",
+                "status_reason":   "Shift under 4 hours — no break required.",
+            })
+            continue
+
+        suggestions = suggest_break_times(ss + ":00", se + ":00", ent)
+
+        # Check ratio impact for each suggested break
+        ratio_conflict  = False
+        manual_review   = False
+        conflict_reason = ""
+
+        for sug in suggestions:
+            conflict, reason = _check_break_ratio_conflict(
+                sug, rid, uid, room_d, room_staff_counts
+            )
+            if conflict == "breach":
+                ratio_conflict  = True
+                conflict_reason = reason
+                break
+            elif conflict == "warning":
+                manual_review   = True
+                conflict_reason = reason
+
+        if ratio_conflict:
+            status        = "ratio_conflict"
+            status_reason = conflict_reason or "Break causes ratio breach."
+        elif manual_review:
+            status        = "manual_review"
+            status_reason = conflict_reason or "Break causes ratio warning — review manually."
+        else:
+            status        = "scheduled"
+            status_reason = f"Breaks fit within ratio limits. {ent['summary']}."
+
+        recommendations.append({
+            "user_id":         uid,
+            "user_name":       sname,
+            "shift_id":        shift.get("id", ""),
+            "room_id":         rid,
+            "room_name":       room_d.get("name", ""),
+            "shift_start":     ss,
+            "shift_end":       se,
+            "shift_minutes":   dur_mins,
+            "entitlement":     ent,
+            "suggestions":     suggestions,
+            "schedule_status": status,
+            "status_reason":   status_reason,
+        })
+
+    return recommendations
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE STATUS DERIVATION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def derive_break_status(
     break_record: dict,
@@ -200,73 +409,57 @@ def derive_break_status(
 ) -> str:
     """
     Derive the live status of a break based on current time.
-    Overrides the stored status if the break is now in progress or overdue.
+    Overrides stored status if the break is now in progress or overdue.
     """
-    stored_status   = break_record.get("status", "scheduled")
-    planned_start   = (break_record.get("planned_start_time") or "")[:5]
-    planned_end     = (break_record.get("planned_end_time") or "")[:5]
-    actual_start    = break_record.get("actual_start_time")
-    actual_end      = break_record.get("actual_end_time")
-    now_5           = now_str[:5]
+    stored_status = break_record.get("status", "scheduled")
+    planned_start = (break_record.get("planned_start_time") or "")[:5]
+    planned_end   = (break_record.get("planned_end_time")   or "")[:5]
+    actual_start  = break_record.get("actual_start_time")
+    actual_end    = break_record.get("actual_end_time")
+    now_5         = now_str[:5]
 
-    # Already completed with actuals
     if stored_status == "completed" and actual_start and actual_end:
         return "completed"
-
-    # Marked missed
     if stored_status == "missed":
         return "missed"
-
-    # Rescheduled
     if stored_status == "rescheduled":
         return "rescheduled"
+    if stored_status in ("ratio_conflict", "manual_review"):
+        return stored_status
 
-    # Break window has passed and not taken
-    if planned_end < now_5 and stored_status == "scheduled":
+    if planned_end and now_5 and planned_end < now_5 and stored_status == "scheduled":
         return "missed"
-
-    # Break window is active
-    if planned_start <= now_5 <= planned_end:
+    if planned_start and planned_end and planned_start <= now_5 <= planned_end:
         if actual_start and not actual_end:
             return "in_progress"
         if not actual_start:
-            return "in_progress"   # Should have started
-
-    # Not yet due
-    if planned_start > now_5:
+            return "in_progress"
+    if planned_start and planned_start > now_5:
         return "not_yet_due"
 
     return stored_status
 
 
 def is_break_overdue(break_record: dict, now_str: str) -> bool:
-    """True if break was due but hasn't been taken."""
-    status = derive_break_status(break_record, now_str)
-    return status in ("missed",)
+    return derive_break_status(break_record, now_str) in ("missed",)
 
 
-# ── Compliance summary ────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPLIANCE SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
 
 def compliance_summary(
     breaks: list[dict],
     entitlement: dict,
 ) -> dict:
     """
-    Determine whether a staff member's breaks for a day meet their entitlement.
-
-    Returns:
-        compliant       — bool
-        taken_minutes   — total break minutes actually taken
-        entitled_minutes— what they were entitled to
-        shortfall       — minutes short (0 if compliant)
-        status          — "compliant" | "partial" | "missed" | "not_required"
-        note            — human-readable explanation
+    Determine whether a staff member's breaks meet their entitlement.
     """
     entitled = entitlement["total_min"]
 
     if entitled == 0:
         return {
-            "compliant": True,
+            "compliant":        True,
             "taken_minutes":    0,
             "entitled_minutes": 0,
             "shortfall":        0,
@@ -301,7 +494,56 @@ def compliance_summary(
     }
 
 
-# ── Timeline rendering helpers ────────────────────────────────────────────────
+def break_schedule_summary(
+    recommendations: list[dict],
+    existing_breaks: list[dict],
+) -> dict:
+    """
+    Compute the break schedule summary metrics for the top-of-page banner.
+
+    Returns:
+        total_paid_breaks      int
+        total_unpaid_breaks    int
+        unresolved_conflicts   int  — ratio_conflict + manual_review
+        scheduled_ok           int
+        no_entitlement         int
+    """
+    total_paid    = 0
+    total_unpaid  = 0
+    unresolved    = 0
+    scheduled_ok  = 0
+    no_ent        = 0
+
+    for rec in recommendations:
+        ent    = rec.get("entitlement", {})
+        status = rec.get("schedule_status", "")
+
+        if status == "no_entitlement":
+            no_ent += 1
+            continue
+
+        if status in ("ratio_conflict", "manual_review"):
+            unresolved += 1
+        else:
+            scheduled_ok += 1
+
+        if ent.get("has_rest"):
+            total_paid += 1
+        if ent.get("has_meal"):
+            total_unpaid += 1
+
+    return {
+        "total_paid_breaks":    total_paid,
+        "total_unpaid_breaks":  total_unpaid,
+        "unresolved_conflicts": unresolved,
+        "scheduled_ok":         scheduled_ok,
+        "no_entitlement":       no_ent,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIMELINE RENDERING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def time_to_pct(t_str: str, day_start: int = 6, day_end: int = 20) -> float:
     """Convert a HH:MM time string to a % position in the day window."""
@@ -323,9 +565,7 @@ def build_gantt_bars(
 ) -> list[dict]:
     """
     Build a list of coloured bar segments for one staff member's Gantt row.
-
-    Each segment: {left_pct, width_pct, colour, label, type}
-    Types: "shift", "break_scheduled", "break_taken", "break_missed"
+    Each segment: {left_pct, width_pct, colour, border, opacity, type, label, z_index}
     """
     segments = []
 
@@ -333,11 +573,10 @@ def build_gantt_bars(
     shift_right = time_to_pct(shift_end[:5],   day_start, day_end)
     shift_width = shift_right - shift_left
 
-    # Main shift bar
     segments.append({
         "left_pct":  shift_left,
         "width_pct": shift_width,
-        "colour":    "#3b82f6",   # Blue
+        "colour":    "#3b82f6",
         "border":    "#2563eb",
         "opacity":   "0.75",
         "type":      "shift",
@@ -345,16 +584,12 @@ def build_gantt_bars(
         "z_index":   1,
     })
 
-    # Break segments overlaid on top
     for b in breaks:
-        ps   = (b.get("planned_start_time") or "")[:5]
-        pe   = (b.get("planned_end_time")   or "")[:5]
-        as_  = (b.get("actual_start_time")  or "")[:5]
-        ae   = (b.get("actual_end_time")    or "")[:5]
-        btype = b.get("break_type", "meal")
+        ps    = (b.get("planned_start_time") or "")[:5]
+        pe    = (b.get("planned_end_time")   or "")[:5]
+        btype  = b.get("break_type", "meal")
         status = b.get("status", "scheduled")
 
-        # Planned break — always shown
         if ps and pe:
             left  = time_to_pct(ps, day_start, day_end)
             width = time_to_pct(pe, day_start, day_end) - left
@@ -364,7 +599,11 @@ def build_gantt_bars(
                 elif status == "missed":
                     colour, border, label = "#fecdd3", "#f43f5e", f"Missed {ps}"
                 elif status == "in_progress":
-                    colour, border, label = "#fef9c3", "#eab308", f"On break"
+                    colour, border, label = "#fef9c3", "#eab308", "On break"
+                elif status == "ratio_conflict":
+                    colour, border, label = "#fee2e2", "#ef4444", f"❌ Conflict {ps}"
+                elif status == "manual_review":
+                    colour, border, label = "#fef3c7", "#f59e0b", f"🔍 Review {ps}"
                 else:
                     colour, border, label = "#e0e7ff", "#6366f1", f"Break {ps}"
 
@@ -382,7 +621,9 @@ def build_gantt_bars(
     return segments
 
 
-# ── Format helpers ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMAT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def fmt_duration(minutes: int | None) -> str:
     """30 → '30 min', 90 → '1h 30m', 0 → '—'."""
@@ -390,10 +631,8 @@ def fmt_duration(minutes: int | None) -> str:
         return "—"
     h = minutes // 60
     m = minutes % 60
-    if h == 0:
-        return f"{m} min"
-    if m == 0:
-        return f"{h}h"
+    if h == 0: return f"{m} min"
+    if m == 0: return f"{h}h"
     return f"{h}h {m}m"
 
 
@@ -405,3 +644,92 @@ def fmt_time(t_str: str | None) -> str:
         return datetime.strptime(str(t_str)[:5], "%H:%M").strftime("%-I:%M %p")
     except Exception:
         return str(t_str)[:5]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE — ratio impact helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_room_staff_counts(shifts: list[dict]) -> dict[str, dict[str, int]]:
+    """
+    Build {room_id: {hhmm_slot: staff_count}} for 15-min slots across the day.
+    Used to check ratio impact when inserting a break.
+    """
+    from datetime import datetime as _dt
+
+    result: dict[str, dict[str, int]] = {}
+    slots = [
+        f"{h:02d}:{m:02d}"
+        for h in range(6, 21)
+        for m in (0, 15, 30, 45)
+    ]
+
+    for shift in shifts:
+        rid = shift.get("room_id", "")
+        ss  = (shift.get("start_time") or "")[:5]
+        se  = (shift.get("end_time")   or "")[:5]
+        if not rid or not ss or not se:
+            continue
+        if rid not in result:
+            result[rid] = {slot: 0 for slot in slots}
+        for slot in slots:
+            if ss <= slot < se:
+                result[rid][slot] = result[rid].get(slot, 0) + 1
+
+    return result
+
+
+def _check_break_ratio_conflict(
+    suggestion: dict,
+    room_id: str,
+    user_id: str,
+    room_cfg: dict,
+    room_staff_counts: dict[str, dict[str, int]],
+) -> tuple[str, str]:
+    """
+    Check if a suggested break would cause a ratio breach.
+
+    Returns ("breach"|"warning"|"ok", reason_str)
+    """
+    if not room_id or not room_cfg:
+        return ("ok", "")
+
+    r_staff    = room_cfg.get("required_ratio_staff",    1)
+    r_children = room_cfg.get("required_ratio_children", 4)
+    capacity   = room_cfg.get("licensed_capacity",       0)
+    rname      = room_cfg.get("name", "")
+
+    ps  = (suggestion.get("planned_start") or "")[:5]
+    pe  = (suggestion.get("planned_end")   or "")[:5]
+
+    slots_map = room_staff_counts.get(room_id, {})
+    worst     = "ok"
+    reason    = ""
+
+    # Check every 15-min slot covered by the break
+    slots_in_break = [s for s in slots_map if ps <= s < pe]
+    for slot in slots_in_break:
+        staff_at_slot = slots_map.get(slot, 0)
+        # Remove this staff member during the break
+        staff_during  = max(0, staff_at_slot - 1)
+
+        # We don't have children count here — use a ratio-only check
+        # If staff drops to 0 and there are normally staff, flag it
+        if staff_at_slot > 0 and staff_during == 0:
+            worst  = "breach"
+            reason = (
+                f"Break at {ps} leaves {rname} with 0 staff in slot {slot}."
+            )
+            break
+        elif r_children > 0 and staff_at_slot > 0:
+            # Minimum staff needed based on ratio (rough — no child count)
+            # If removing one staff drops below 1, that's a breach
+            if staff_during < r_staff and staff_at_slot >= r_staff:
+                if worst != "breach":
+                    worst  = "warning"
+                    reason = (
+                        f"Break at {ps} reduces {rname} to {staff_during} staff "
+                        f"(ratio requires {r_staff}). Manual review recommended."
+                    )
+
+    return (worst, reason)
