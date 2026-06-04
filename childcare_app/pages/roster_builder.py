@@ -34,6 +34,7 @@ from utils.room_overflow_engine import (
     peak_adjusted_staff,
     peak_overflow,
 )
+from utils.break_preferences_queries import fetch_break_prefs_for_centre
 from utils.helpers import toast_success, toast_error, toast_warn, fmt_date
 
 
@@ -134,6 +135,7 @@ def render():
             leave_map   = fetch_approved_leave_for_period(
                 centre_id, period["start_date"], period["end_date"])
             avail_map   = fetch_availability_map(centre_id)
+            break_prefs = fetch_break_prefs_for_centre(centre_id)
         except Exception as e:
             toast_error(f"Could not load data: {e}"); return
 
@@ -167,7 +169,7 @@ def render():
 
             with sub_staffing:
                 _render_staffing_allocation_tab(
-                    day, day_shifts, rooms, children, centre_id,
+                    day, day_shifts, rooms, children, centre_id, break_prefs,
                 )
 
 
@@ -273,6 +275,7 @@ def _render_staffing_allocation_tab(
     rooms: list[dict],
     children: list[dict],
     centre_id: str,
+    break_prefs: dict[str, dict[int, bool]] | None = None,
 ):
     """
     Loads attendance intervals for this day, runs the overflow engine,
@@ -816,6 +819,47 @@ def _render_add_shift_form(day, period_id, centre_id, rooms, staff_list,
 
         notes = st.text_input("Notes", key=f"as_notes_{day.isoformat()}")
 
+        # Unpaid break opt-out — three-way override, shown when profile allows it
+        allows_opt_out = False
+        uid_prefs: dict[int, bool] = {}
+        for s in staff_list:
+            u_chk = s.get("users") or {}
+            if u_chk.get("id") == selected_uid:
+                for profile in (u_chk.get("staff_profiles") or []):
+                    if profile.get("allows_unpaid_break_opt_out"):
+                        allows_opt_out = True
+                uid_prefs = break_prefs.get(selected_uid, {})
+
+        override_value = "use_staff_default"
+        if allows_opt_out:
+            dow            = day.isoweekday() % 7
+            default_opt_out = uid_prefs.get(dow, False)
+            default_label  = (
+                f"Use staff default — **{'Opted out' if default_opt_out else 'Not opted out'}** "
+                f"on {day.strftime('%A')}s"
+            )
+            radio_opts     = [
+                ("use_staff_default", default_label),
+                ("opted_out",         "Opted out — remove unpaid break this shift"),
+                ("not_opted_out",     "Not opted out — keep unpaid break this shift"),
+            ]
+            choice = st.radio(
+                "Unpaid break opt-out",
+                options=[k for k, _ in radio_opts],
+                format_func=lambda x: next(v for k, v in radio_opts if k == x),
+                index=0,
+                key=f"as_override_{day.isoformat()}",
+                horizontal=True,
+            )
+            override_value = choice
+            if override_value in ("opted_out", "use_staff_default") and (
+                override_value == "opted_out" or default_opt_out
+            ):
+                st.warning(
+                    "⚠️ **Confirm this complies with the applicable award/enterprise "
+                    "agreement and employee agreement.** Paid rest break is unchanged."
+                )
+
         dow_db = day.isoweekday() % 7
         if selected_uid and selected_uid in avail_map:
             av = avail_map[selected_uid].get(dow_db, {})
@@ -850,6 +894,7 @@ def _render_add_shift_form(day, period_id, centre_id, rooms, staff_list,
                 shift_type=stype,
                 notes=notes,
                 template_id=template_id or None,
+                unpaid_break_opt_out_override=override_value,
             )
             toast_success(f"Shift added for {staff_opts[selected_uid]}.")
             st.session_state.pop(key, None)
@@ -865,12 +910,21 @@ def _render_edit_shift_form(s: dict, rooms: list, sid: str):
     room_opts = {r["id"]: r["name"] for r in rooms}
     time_opts = generate_time_options(15, DAY_START_HOUR, 20)
 
-    cur_room  = s.get("room_id","")
-    cur_start = (s.get("start_time") or "07:00")[:5]
-    cur_end   = (s.get("end_time")   or "15:00")[:5]
-    cur_brk   = s.get("break_duration_minutes", 0)
-    cur_type  = s.get("shift_type","standard")
-    cur_notes = s.get("notes","") or ""
+    cur_room     = s.get("room_id","")
+    cur_start    = (s.get("start_time") or "07:00")[:5]
+    cur_end      = (s.get("end_time")   or "15:00")[:5]
+    cur_brk      = s.get("break_duration_minutes", 0)
+    cur_type     = s.get("shift_type","standard")
+    cur_notes    = s.get("notes","") or ""
+    cur_opted_out = bool(s.get("unpaid_break_opted_out", False))
+    cur_override  = s.get("unpaid_break_opt_out_override", "use_staff_default") or "use_staff_default"
+
+    # Determine if this staff member's profile allows opt-out
+    u_data = s.get("users") or {}
+    allows_opt_out = any(
+        p.get("allows_unpaid_break_opt_out")
+        for p in (u_data.get("staff_profiles") or [])
+    )
 
     start_idx = time_opts.index(cur_start) if cur_start in time_opts else 4
     end_idx   = time_opts.index(cur_end)   if cur_end   in time_opts else 16
@@ -892,6 +946,40 @@ def _render_edit_shift_form(s: dict, rooms: list, sid: str):
                                   format_func=lambda x: x.title(), key=f"ety_{sid}")
         new_notes = st.text_input("Notes", value=cur_notes, key=f"en_{sid}")
 
+        new_override = "use_staff_default"
+        if allows_opt_out:
+            # Show what the staff default is for this shift's weekday
+            uid_prefs  = break_prefs.get(s.get("user_id",""), {}) if "break_prefs" in dir() else {}
+            shift_date = s.get("shift_date","")
+            try:
+                from datetime import date as _date
+                dow_edit = _date.fromisoformat(shift_date[:10]).isoweekday() % 7
+            except Exception:
+                dow_edit = -1
+            default_opt_out = uid_prefs.get(dow_edit, False) if dow_edit >= 0 else False
+            default_label = (
+                f"Use staff default — **{'Opted out' if default_opt_out else 'Not opted out'}**"
+            )
+            radio_opts = [
+                ("use_staff_default", default_label),
+                ("opted_out",         "Opted out — remove unpaid break this shift"),
+                ("not_opted_out",     "Not opted out — keep unpaid break this shift"),
+            ]
+            cur_idx = next((i for i, (k, _) in enumerate(radio_opts) if k == cur_override), 0)
+            new_override = st.radio(
+                "Unpaid break opt-out",
+                options=[k for k, _ in radio_opts],
+                format_func=lambda x: next(v for k, v in radio_opts if k == x),
+                index=cur_idx,
+                key=f"eo_{sid}",
+                horizontal=True,
+            )
+            if new_override in ("opted_out",) or (new_override == "use_staff_default" and default_opt_out):
+                st.warning(
+                    "⚠️ **Confirm this complies with the applicable award/enterprise "
+                    "agreement and employee agreement.** Paid rest break is unchanged."
+                )
+
         sc1, sc2 = st.columns(2)
         saved     = sc1.form_submit_button("💾 Save", type="primary", use_container_width=True)
         cancelled = sc2.form_submit_button("Cancel", use_container_width=True)
@@ -901,7 +989,8 @@ def _render_edit_shift_form(s: dict, rooms: list, sid: str):
     if saved:
         try:
             update_shift(sid, new_room, new_start+":00", new_end+":00",
-                         int(new_brk), new_type, new_notes)
+                         int(new_brk), new_type, new_notes,
+                         unpaid_break_opt_out_override=new_override)
             toast_success("Shift updated.")
             st.session_state.pop(key, None)
             st.rerun()
