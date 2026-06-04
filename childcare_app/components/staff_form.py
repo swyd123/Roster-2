@@ -204,13 +204,30 @@ def staff_form(
         st.divider()
 
         # ── Section 5 · Account status + notes ────────────────────────
-        c11, _ = st.columns([1, 3])
+        c11, c12, _ = st.columns([1, 2, 1])
         is_active = c11.toggle(
             "Account active",
             value=user.get("is_active", True),
             key=f"{key_prefix}_active",
             help="Inactive staff cannot log in and are hidden from rosters.",
         )
+        allows_opt_out = c12.toggle(
+            "Allow unpaid break opt-out",
+            value=bool(d.get("allows_unpaid_break_opt_out", False)),
+            key=f"{key_prefix}_allows_opt_out",
+            help=(
+                "When enabled, a manager may opt this educator out of the "
+                "30-minute unpaid meal break on individual shifts. "
+                "Paid rest break entitlement is always retained. "
+                "Only enable if permitted by the applicable award, enterprise "
+                "agreement, or individual employment agreement."
+            ),
+        )
+        if allows_opt_out and not d.get("allows_unpaid_break_opt_out", False):
+            st.warning(
+                "⚠️ **Confirm this complies with the applicable award/enterprise "
+                "agreement and employee agreement** before enabling unpaid break opt-out."
+            )
         notes = st.text_area(
             "Internal notes (not shown to staff member)",
             value=d.get("notes", "") or "",
@@ -265,4 +282,5 @@ def staff_form(
         "emergency_contact_relationship":   ec_rel.strip(),
         "notes":                            notes.strip(),
         "is_active":                        is_active,
+        "allows_unpaid_break_opt_out":      allows_opt_out,
     }
