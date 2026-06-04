@@ -165,28 +165,27 @@ def _match_tier(shift_minutes: int, rules: list[dict]) -> dict:
 def calc_break_entitlement(
     shift_minutes: int,
     rules: list[dict] | None = None,
+    unpaid_opted_out: bool = False,
 ) -> dict:
     """
     Calculate break entitlement for a given shift length using configurable rules.
 
     Parameters
     ----------
-    shift_minutes   Total shift duration in minutes.
-    rules           Optional list of rule tier dicts (see BREAK_RULES_DEFAULT).
-                    When None, uses BREAK_RULES_DEFAULT.
+    shift_minutes     Total shift duration in minutes.
+    rules             Optional list of rule tier dicts. None → BREAK_RULES_DEFAULT.
+    unpaid_opted_out  When True, the 30-minute unpaid meal break is removed.
+                      Paid rest break(s) are always retained regardless of this flag.
+                      Only applies when the staff profile allows_unpaid_break_opt_out
+                      AND the shift has unpaid_break_opted_out set.
 
     Returns
     -------
     dict with keys:
-        paid_minutes      int    — total paid break minutes
-        unpaid_minutes    int    — total unpaid break minutes
-        paid_count        int    — number of distinct paid break slots
-        paid_duration     int    — minutes per paid break slot
-        total_min         int    — total break minutes (paid + unpaid)
-        has_meal          bool
-        has_rest          bool
-        summary           str    — human-readable description
-        tier              dict   — the matched rule tier
+        paid_minutes, unpaid_minutes, paid_count, paid_duration,
+        total_min, has_meal, has_rest, summary, tier,
+        unpaid_opted_out (bool — reflects the input flag),
+        meal_breaks, rest_breaks, total_paid_min, total_unpaid_min (legacy aliases)
     """
     active_rules = rules if rules else BREAK_RULES_DEFAULT
     tier         = _match_tier(shift_minutes, active_rules)
@@ -195,25 +194,36 @@ def calc_break_entitlement(
     unpaid_min  = tier.get("unpaid_minutes", 0)
     paid_count  = tier.get("paid_count",     0)
     paid_dur    = tier.get("paid_duration",  0)
+
+    # Apply opt-out: remove unpaid meal break only; paid rest is always kept
+    if unpaid_opted_out and unpaid_min > 0:
+        unpaid_min = 0
+
     total_min   = paid_min + unpaid_min
     has_meal    = unpaid_min > 0
     has_rest    = paid_min > 0
 
+    if unpaid_opted_out and tier.get("unpaid_minutes", 0) > 0:
+        summary = f"{tier.get('label','')} — unpaid break opted out · paid rest still required"
+    else:
+        summary = tier.get("label", "No break entitlement")
+
     return {
-        "paid_minutes":   paid_min,
-        "unpaid_minutes": unpaid_min,
-        "paid_count":     paid_count,
-        "paid_duration":  paid_dur,
-        "total_min":      total_min,
-        "has_meal":       has_meal,
-        "has_rest":       has_rest,
-        "summary":        tier.get("label", "No break entitlement"),
-        "tier":           tier,
-        # Legacy aliases kept for backwards compatibility
-        "meal_breaks":    1 if has_meal else 0,
-        "rest_breaks":    paid_count,
-        "total_paid_min":   paid_min,
-        "total_unpaid_min": unpaid_min,
+        "paid_minutes":      paid_min,
+        "unpaid_minutes":    unpaid_min,
+        "paid_count":        paid_count,
+        "paid_duration":     paid_dur,
+        "total_min":         total_min,
+        "has_meal":          has_meal,
+        "has_rest":          has_rest,
+        "summary":           summary,
+        "tier":              tier,
+        "unpaid_opted_out":  unpaid_opted_out,
+        # Legacy aliases
+        "meal_breaks":       1 if has_meal else 0,
+        "rest_breaks":       paid_count,
+        "total_paid_min":    paid_min,
+        "total_unpaid_min":  unpaid_min,
     }
 
 
@@ -290,28 +300,38 @@ def generate_break_recommendations(
     existing_breaks: list[dict],
     rooms: list[dict],
     rules: list[dict] | None = None,
+    staff_prefs: dict[str, dict[int, bool]] | None = None,
 ) -> list[dict]:
     """
     Generate break recommendations for all shifts, checking for ratio conflicts.
+
+    Parameters
+    ----------
+    shifts          List of enriched shift dicts from fetch_shifts_for_period().
+    existing_breaks Scheduled break records from fetch_breaks_today().
+    rooms           Room dicts from fetch_rooms().
+    rules           Optional break rule tiers (None → BREAK_RULES_DEFAULT).
+    staff_prefs     {user_id: {day_of_week: unpaid_break_opt_out}} loaded from
+                    fetch_break_prefs_for_centre(). When None, defaults to {}.
 
     Each recommendation dict:
         user_id, user_name, shift_id, room_id, room_name,
         shift_start, shift_end, shift_minutes,
         entitlement (dict), suggestions (list[dict]),
         schedule_status ("scheduled"|"ratio_conflict"|"manual_review"|"no_entitlement"),
-        status_reason (str)
-
-    schedule_status values:
-        "scheduled"       — breaks recommended without ratio issues
-        "ratio_conflict"  — one or more suggested breaks would cause a ratio breach
-        "manual_review"   — could not auto-resolve; needs human decision
-        "no_entitlement"  — shift too short, no break required
+        status_reason (str),
+        unpaid_opted_out (bool),
+        opt_out_source   ("Staff default"|"Manual override — opted out"|
+                          "Manual override — not opted out"|"No opt-out")
     """
     room_map    = {r["id"]: r for r in rooms}
     breaks_by_uid: dict[str, list] = {}
     for b in existing_breaks:
         uid = b.get("user_id", "")
         breaks_by_uid.setdefault(uid, []).append(b)
+
+    if staff_prefs is None:
+        staff_prefs = {}
 
     # Build staff-per-room count at each 15-min slot (for ratio checking)
     room_staff_counts = _build_room_staff_counts(shifts)
@@ -332,23 +352,30 @@ def generate_break_recommendations(
         if not ss or not se:
             continue
 
+        # ── Resolve unpaid break opt-out (three-way override) ─────────
+        # override column: 'use_staff_default' | 'opted_out' | 'not_opted_out'
+        # staff_prefs: {user_id: {day_of_week: bool}} passed in by caller
+        unpaid_opted_out, opt_out_source = resolve_opt_out(shift, staff_prefs)
+
         dur_mins = shift_duration_minutes(ss, se)
-        ent      = calc_break_entitlement(dur_mins, rules)
+        ent      = calc_break_entitlement(dur_mins, rules, unpaid_opted_out=unpaid_opted_out)
 
         if ent["total_min"] == 0:
             recommendations.append({
-                "user_id":        uid,
-                "user_name":      sname,
-                "shift_id":       shift.get("id", ""),
-                "room_id":        rid,
-                "room_name":      room_d.get("name", ""),
-                "shift_start":    ss,
-                "shift_end":      se,
-                "shift_minutes":  dur_mins,
-                "entitlement":    ent,
-                "suggestions":    [],
+                "user_id":         uid,
+                "user_name":       sname,
+                "shift_id":        shift.get("id", ""),
+                "room_id":         rid,
+                "room_name":       room_d.get("name", ""),
+                "shift_start":     ss,
+                "shift_end":       se,
+                "shift_minutes":   dur_mins,
+                "entitlement":     ent,
+                "suggestions":     [],
                 "schedule_status": "no_entitlement",
                 "status_reason":   "Shift under 4 hours — no break required.",
+                "unpaid_opted_out":  unpaid_opted_out,
+                "opt_out_source":    opt_out_source,
             })
             continue
 
@@ -394,6 +421,8 @@ def generate_break_recommendations(
             "suggestions":     suggestions,
             "schedule_status": status,
             "status_reason":   status_reason,
+            "unpaid_opted_out":  unpaid_opted_out,
+            "opt_out_source":    opt_out_source,
         })
 
     return recommendations
@@ -644,6 +673,75 @@ def fmt_time(t_str: str | None) -> str:
         return datetime.strptime(str(t_str)[:5], "%H:%M").strftime("%-I:%M %p")
     except Exception:
         return str(t_str)[:5]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPT-OUT RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_opt_out(
+    shift: dict,
+    staff_prefs: dict[str, dict[int, bool]],
+) -> tuple[bool, str]:
+    """
+    Determine whether a shift's unpaid meal break is opted out, and why.
+
+    Logic (in priority order):
+        1. If shift.unpaid_break_opt_out_override == 'opted_out'     → True,  "Manual override — opted out"
+        2. If shift.unpaid_break_opt_out_override == 'not_opted_out' → False, "Manual override — not opted out"
+        3. If shift.unpaid_break_opt_out_override == 'use_staff_default' (or missing):
+              Look up staff_prefs[user_id][day_of_week].
+              If found and True  → True,  "Staff default"
+              If found and False → False, "Staff default"
+              If not found       → False, "No opt-out"
+
+    The profile-level allows_unpaid_break_opt_out flag is a prerequisite
+    stored on the staff profile and checked by the UI before showing the
+    controls; the engine trusts the override value stored on the shift.
+
+    Parameters
+    ----------
+    shift       Shift dict — needs user_id, shift_date,
+                unpaid_break_opt_out_override (may be absent → default).
+    staff_prefs {user_id: {day_of_week: bool}} — loaded once per page render
+                via fetch_break_prefs_for_centre().
+
+    Returns
+    -------
+    (opted_out: bool, source: str)
+    """
+    override = shift.get("unpaid_break_opt_out_override", "use_staff_default") or "use_staff_default"
+
+    if override == "opted_out":
+        return True, "Manual override — opted out"
+
+    if override == "not_opted_out":
+        return False, "Manual override — not opted out"
+
+    # use_staff_default: look up weekly preference
+    uid        = shift.get("user_id", "")
+    shift_date = shift.get("shift_date", "")
+    dow        = _shift_day_of_week(shift_date)
+
+    user_prefs = staff_prefs.get(uid, {})
+    if dow in user_prefs:
+        return user_prefs[dow], "Staff default"
+
+    return False, "No opt-out"
+
+
+def _shift_day_of_week(shift_date: str) -> int:
+    """
+    Convert a shift_date ISO string to day_of_week int.
+    Returns Python date.isoweekday() % 7: Mon=1 … Sat=6, Sun=0.
+    Returns -1 on parse failure.
+    """
+    try:
+        from datetime import date as _date
+        d = _date.fromisoformat(shift_date[:10])
+        return d.isoweekday() % 7
+    except Exception:
+        return -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
