@@ -125,6 +125,37 @@ def fetch_break_by_id(break_id: str) -> Optional[dict]:
     )
 
 
+def fetch_break_rules(centre_id: str) -> list[dict]:
+    """
+    Fetch configurable break rules from the break_rules table.
+
+    The break_rules table stores per-centre (or global) break entitlement tiers.
+    Expected columns: min_hours, max_hours, paid_minutes, unpaid_minutes,
+                      paid_count, paid_duration, label, is_active.
+
+    If the table does not exist or has no rows for this centre, returns [] so
+    the caller can fall back to BREAK_RULES_DEFAULT without error.
+    No .single() — plain list query.
+    """
+    sb = get_supabase_client()
+    try:
+        rows = (
+            sb.from_("break_rules")
+            .select(
+                "min_hours, max_hours, paid_minutes, unpaid_minutes, "
+                "paid_count, paid_duration, label"
+            )
+            .eq("is_active", True)
+            .or_(f"centre_id.eq.{centre_id},centre_id.is.null")
+            .order("min_hours")
+            .execute()
+        ).data or []
+        return rows
+    except Exception:
+        # Table may not exist yet — fall back to defaults silently
+        return []
+
+
 # ── CREATE ────────────────────────────────────────────────────────────────────
 
 def create_break(
