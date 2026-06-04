@@ -10,6 +10,7 @@ from utils.break_queries import (
     create_break, update_break_schedule,
     mark_break_completed, mark_break_missed, delete_break,
 )
+from utils.break_preferences_queries import fetch_break_prefs_for_centre
 from utils.break_engine import (
     BREAK_STATUS_CONFIG, BREAK_TYPE_LABELS, BREAK_RULES_DEFAULT,
     shift_duration_minutes, calc_break_entitlement,
@@ -81,6 +82,7 @@ def render():
             rooms        = fetch_rooms(centre_id)
             attendance   = fetch_today_attendance(centre_id)
             db_rules     = fetch_break_rules(centre_id)
+            break_prefs  = fetch_break_prefs_for_centre(centre_id)
         except Exception as e:
             toast_error(f"Could not load data: {e}")
             return
@@ -102,6 +104,7 @@ def render():
         existing_breaks=all_breaks,
         rooms=rooms,
         rules=active_rules,
+        staff_prefs=break_prefs,
     )
 
     # ── Summary metrics ───────────────────────────────────────────────
@@ -270,6 +273,12 @@ def _render_recommendations_table(recommendations: list[dict]):
             f'<span style="font-size:0.8rem;color:{cfg[1]};">{ent["summary"]}</span>'
             f'</div>'
             + (
+                f'<div style="font-size:0.75rem;color:#166534;margin-top:3px;">'
+                f'✅ Unpaid break opted out ({rec.get("opt_out_source","")}) · '
+                f'Paid rest break still required</div>'
+                if rec.get("unpaid_opted_out") else ""
+            )
+            + (
                 f'<div style="font-size:0.78rem;color:{cfg[1]};margin-top:3px;">'
                 f'{reason}</div>'
                 if status in ("ratio_conflict", "manual_review") else ""
@@ -376,13 +385,19 @@ def _render_gantt_row(shift: dict, breaks: list, centre_id: str, now: str, rules
             if entitlement["total_min"] > 0 else ""
         )
     )
+    opt_out_badge = (
+        f'<span style="background:#f0fdf4;color:#166534;font-size:0.62rem;'
+        f'padding:0 5px;border-radius:99px;margin-left:4px;border:1px solid #86efac;">'
+        f'unpaid opted out · paid rest ✓</span>'
+        if entitlement.get("unpaid_opted_out") else ""
+    )
 
     row_html = (
         f'<div style="display:flex;align-items:center;margin-bottom:4px;">'
         f'<div style="width:{name_w}%;flex-shrink:0;padding-right:8px;'
         f'font-size:0.82rem;color:#1e3a55;overflow:hidden;text-overflow:ellipsis;'
         f'white-space:nowrap;">'
-        f'{sname}{room_dot}{break_badge}'
+        f'{sname}{room_dot}{break_badge}{opt_out_badge}'
         f'</div>'
         f'<div style="width:{tl_w}%;position:relative;height:28px;'
         f'background:#f1f5f9;border-radius:4px;overflow:hidden;">'
