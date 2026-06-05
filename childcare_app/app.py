@@ -19,6 +19,7 @@ NAV = [
     ("───", None),
     ("ROSTERING",         None),
     ("📅  Rosters",             "roster_list"),
+    ("🤖  Auto Roster",         "auto_roster"),
     ("🗓️  Roster Builder",      "roster_builder"),
     ("📋  Shift Templates",     "shift_templates"),
     ("📊  Roster Report",       "roster_report"),
@@ -97,6 +98,7 @@ elif page == "leave_list":     from pages.leave_list     import render; render()
 elif page == "leave_review":   from pages.leave_review   import render; render()
 elif page == "leave_add":      from pages.leave_add      import render; render()
 elif page == "roster_list":    from pages.roster_list    import render; render()
+elif page == "auto_roster":    from pages.auto_roster     import render; render()
 elif page == "roster_builder": from pages.roster_builder import render; render()
 elif page == "shift_templates":from pages.shift_templates import render; render()
 elif page == "roster_report":  from pages.roster_report  import render; render()
