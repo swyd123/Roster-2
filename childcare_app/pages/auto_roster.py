@@ -25,6 +25,7 @@ from utils.attendance_queries import fetch_intervals_for_centre
 from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_all_staff, fetch_centres
 from utils.helpers import toast_success, toast_error, toast_warn
+from utils.roster_timeline import build_roster_grid
 
 
 def render():
