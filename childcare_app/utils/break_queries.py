@@ -195,6 +195,37 @@ def create_break(
 
 # ── UPDATE ────────────────────────────────────────────────────────────────────
 
+def create_breaks_batch(rows: list[dict]) -> int:
+    """
+    Batch-insert multiple break records in a single Supabase call.
+    Each row must contain: centre_id, user_id, break_date, break_type,
+    planned_start_time, planned_end_time, planned_duration_minutes.
+    Optional: roster_shift_id, notes, status.
+    Returns count of rows inserted.
+    No .single() — plain insert.
+    """
+    if not rows:
+        return 0
+    sb = get_supabase_client()
+    payload = [
+        {
+            "centre_id":               r["centre_id"],
+            "user_id":                 r["user_id"],
+            "break_date":              r["break_date"],
+            "break_type":              r["break_type"],
+            "planned_start_time":      r["planned_start_time"],
+            "planned_end_time":        r["planned_end_time"],
+            "planned_duration_minutes": r["planned_duration_minutes"],
+            "roster_shift_id":         r.get("roster_shift_id"),
+            "status":                  r.get("status", "scheduled"),
+            "notes":                   (r.get("notes") or "").strip() or None,
+        }
+        for r in rows
+    ]
+    resp = sb.from_("break_records").insert(payload).execute()
+    return len(resp.data or [])
+
+
 def update_break_schedule(
     break_id: str,
     planned_start_time: str,
