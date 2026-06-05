@@ -217,21 +217,7 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     st.info("No shifts could be generated. Check attendance data and staff availability.")
 else:
     _render_shift_table(shifts, room_map)
-
-    roster_rows = [
-        {
-            "educator": s.user_name,
-            "room": s.room_name,
-            "start": s.start_time[:5],
-            "finish": s.end_time[:5],
-        }
-        for s in shifts
-    ]
-
-    timeline_df = build_roster_grid(roster_rows)
-
-    st.markdown("### Timeline roster view")
-    st.dataframe(timeline_df, use_container_width=True, hide_index=True)
+    
     # ── Break schedule table ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("### ☕ Generated Break Schedule")
