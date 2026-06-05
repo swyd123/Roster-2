@@ -102,10 +102,11 @@ def fetch_shifts_for_period(period_id: str) -> list[dict]:
         .select(
             "id, shift_date, start_time, end_time, break_duration_minutes,"
             "shift_type, status, notes, room_id, user_id, shift_template_id,"
+            "unpaid_break_opted_out, unpaid_break_opt_out_override,"
             "users!roster_shifts_user_id_fkey("
             "  id, first_name, last_name,"
             "  staff_profiles!staff_profiles_user_id_fkey("
-            "    employment_type,"
+            "    employment_type, allows_unpaid_break_opt_out,"
             "    staff_qualifications!staff_qualifications_staff_profile_id_fkey("
             "      status, qualification_types!staff_qualifications_qualification_type_id_fkey("
             "        short_name, category)"
@@ -149,24 +150,26 @@ def create_shift(
     shift_type: str = "standard", notes: str = "",
     template_id: str | None = None,
     created_by: str | None = None,
+    unpaid_break_opt_out_override: str = "use_staff_default",
 ) -> dict:
     sb     = get_supabase_client()
     result = _one(
         sb.from_("roster_shifts")
         .insert({
-            "roster_period_id":       period_id,
-            "centre_id":              centre_id,
-            "user_id":                user_id,
-            "room_id":                room_id or None,
-            "shift_date":             shift_date,
-            "start_time":             start_time,
-            "end_time":               end_time,
-            "break_duration_minutes": break_duration_minutes,
-            "shift_type":             shift_type,
-            "status":                 "scheduled",
-            "notes":                  notes.strip() or None,
-            "shift_template_id":      template_id,
-            "created_by_user_id":     created_by,
+            "roster_period_id":             period_id,
+            "centre_id":                    centre_id,
+            "user_id":                      user_id,
+            "room_id":                      room_id or None,
+            "shift_date":                   shift_date,
+            "start_time":                   start_time,
+            "end_time":                     end_time,
+            "break_duration_minutes":       break_duration_minutes,
+            "shift_type":                   shift_type,
+            "status":                       "scheduled",
+            "notes":                        notes.strip() or None,
+            "shift_template_id":            template_id,
+            "created_by_user_id":           created_by,
+            "unpaid_break_opt_out_override": unpaid_break_opt_out_override,
         })
         .select()
         .execute()
@@ -180,17 +183,19 @@ def update_shift(
     shift_id: str,
     room_id: str, start_time: str, end_time: str,
     break_duration_minutes: int, shift_type: str, notes: str,
+    unpaid_break_opt_out_override: str = "use_staff_default",
 ) -> dict:
     sb     = get_supabase_client()
     result = _one(
         sb.from_("roster_shifts")
         .update({
-            "room_id":                room_id or None,
-            "start_time":             start_time,
-            "end_time":               end_time,
-            "break_duration_minutes": break_duration_minutes,
-            "shift_type":             shift_type,
-            "notes":                  notes.strip() or None,
+            "room_id":                      room_id or None,
+            "start_time":                   start_time,
+            "end_time":                     end_time,
+            "break_duration_minutes":       break_duration_minutes,
+            "shift_type":                   shift_type,
+            "notes":                        notes.strip() or None,
+            "unpaid_break_opt_out_override": unpaid_break_opt_out_override,
         })
         .eq("id", shift_id)
         .select()
@@ -201,7 +206,50 @@ def update_shift(
     return result
 
 
-def delete_shift(shift_id: str) -> None:
+def create_shifts_batch(
+    period_id: str,
+    centre_id: str,
+    rows: list[dict],
+) -> int:
+    """
+    Batch-insert multiple shifts in a single Supabase call.
+    Each row must contain: user_id, room_id, shift_date, start_time,
+    end_time, shift_type, break_duration_minutes.
+    Optional: notes, unpaid_break_opt_out_override.
+    Returns count of rows inserted.
+    No .single() — plain insert.
+    """
+    if not rows:
+        return 0
+    sb = get_supabase_client()
+    payload = [
+        {
+            "roster_period_id":              period_id,
+            "centre_id":                     centre_id,
+            "user_id":                       r["user_id"],
+            "room_id":                       r.get("room_id") or None,
+            "shift_date":                    r["shift_date"],
+            "start_time":                    r["start_time"],
+            "end_time":                      r["end_time"],
+            "break_duration_minutes":        r.get("break_duration_minutes", 0),
+            "shift_type":                    r.get("shift_type", "standard"),
+            "status":                        "scheduled",
+            "notes":                         (r.get("notes") or "").strip() or None,
+            "unpaid_break_opt_out_override": r.get("unpaid_break_opt_out_override", "use_staff_default"),
+        }
+        for r in rows
+    ]
+    resp = sb.from_("roster_shifts").insert(payload).execute()
+    return len(resp.data or [])
+
+
+def delete_all_draft_shifts(period_id: str) -> None:
+    """
+    Hard-delete all shifts for a draft period so auto-roster can re-generate.
+    Only call on draft periods — published periods are protected by the UI.
+    """
+    sb = get_supabase_client()
+    sb.from_("roster_shifts").delete().eq("roster_period_id", period_id).execute()
     sb  = get_supabase_client()
     now = datetime.now(timezone.utc).isoformat()
     sb.from_("roster_shifts").update({"deleted_at": now}).eq("id", shift_id).execute()
