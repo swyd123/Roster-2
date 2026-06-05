@@ -215,6 +215,9 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     st.info("No shifts could be generated. Check attendance data and staff availability.")
 else:
     _render_shift_table(shifts, room_map)
+
+    st.markdown("---")
+    st.markdown("### ☕ Generated Break Schedule")
     
     # ── Break schedule table ──────────────────────────────────────────
     st.markdown("---")
