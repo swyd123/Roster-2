@@ -228,11 +228,6 @@ else:
         for s in shifts
     ]
 
-    timeline_df = build_roster_grid(roster_rows)
-
-    st.markdown("### Timeline roster view")
-    st.dataframe(timeline_df, use_container_width=True, hide_index=True)
-
     # ── Break schedule table ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("### ☕ Generated Break Schedule")
