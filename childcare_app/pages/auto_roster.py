@@ -140,10 +140,10 @@ def render():
                     break_rules=db_rules or None,
                     centre_id=centre_id,
                 )
-            st.session_state["ar_result"]    = result
+            st.session_state["ar_result"] = result
             st.session_state["ar_centre_id"] = centre_id
-            st.session_state["ar_start"]     = start_d.isoformat()
-            st.session_state["ar_end"]        = end_d.isoformat()
+            st.session_state["ar_result_start"] = start_d.isoformat()
+            st.session_state["ar_result_end"] = end_d.isoformat()
         else:
             result = st.session_state["ar_result"]
 
