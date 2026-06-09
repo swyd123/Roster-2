@@ -26,6 +26,7 @@ from utils.room_queries import fetch_rooms
 from utils.staff_queries import fetch_all_staff, fetch_centres
 from utils.helpers import toast_success, toast_error, toast_warn
 
+
 def render():
     # ── Header ────────────────────────────────────────────────────────
     st.title("Auto Roster & Breaks")
@@ -139,10 +140,10 @@ def render():
                     break_rules=db_rules or None,
                     centre_id=centre_id,
                 )
-            st.session_state["ar_result"] = result
+            st.session_state["ar_result"]    = result
             st.session_state["ar_centre_id"] = centre_id
-            st.session_state["ar_result_start"] = start_d.isoformat()
-            st.session_state["ar_result_end"] = end_d.isoformat()
+            st.session_state["ar_start"]     = start_d.isoformat()
+            st.session_state["ar_end"]        = end_d.isoformat()
         else:
             result = st.session_state["ar_result"]
 
@@ -212,13 +213,10 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     )
 
     if not shifts:
-    st.info("No shifts could be generated. Check attendance data and staff availability.")
-else:
-    _render_shift_table(shifts, room_map)
+        st.info("No shifts could be generated. Check attendance data and staff availability.")
+    else:
+        _render_shift_table(shifts, room_map)
 
-    st.markdown("---")
-    st.markdown("### ☕ Generated Break Schedule")
-    
     # ── Break schedule table ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("### ☕ Generated Break Schedule")
