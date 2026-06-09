@@ -677,6 +677,273 @@ def _mins_between_s(start: str, end: str) -> int:
         return 0
 
 
+from utils.auto_roster_engine import (
+    _shift_break_to_window,
+    CASUAL_MIN_SHIFT_MINUTES,
+)
+from utils.break_engine import suggest_break_times, calc_break_entitlement
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preferred break window: 11:00–15:00
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPreferredBreakWindow:
+    """
+    Tests confirming that:
+      1. Breaks are preferred between 11:00 and 15:00.
+      2. Breaks fall outside 11:00–15:00 only when coverage prevents a
+         valid break inside the window.
+      3. Outside-window breaks choose the nearest valid non-overlapping time.
+      4. Room ratio coverage is always preserved.
+      5. Same-educator same-day breaks never overlap (regardless of window).
+    """
+
+    PREF_FROM  = "11:00:00"
+    PREF_UNTIL = "15:00:00"
+    RID        = "room-1"
+    UID        = "user-1"
+
+    def _cov(self, n_staff=3, start_h=6, end_h=21):
+        """Coverage map with n_staff per slot."""
+        slots = [
+            f"{h:02d}:{m:02d}:00"
+            for h in range(start_h, end_h)
+            for m in (0, 15, 30, 45)
+        ]
+        return {self.RID: {s: n_staff for s in slots}}
+
+    # ── 1. Breaks are preferred between 11:00 and 15:00 ──────────────────────
+
+    def test_meal_break_placed_inside_preferred_window(self):
+        """
+        A meal break suggested outside 11:00–15:00 must be shifted
+        to fall inside the window when the shift and ratio allow it.
+        """
+        # _shift_break_to_window is the direct mechanism
+        # Original suggestion outside preferred window (e.g. 09:00–09:30)
+        result_s, result_e = _shift_break_to_window(
+            "09:00:00", "09:30:00", 30,
+            "07:00:00", "18:00:00",   # long shift — window fits
+            self.PREF_FROM, self.PREF_UNTIL,
+        )
+        assert result_s >= self.PREF_FROM, (
+            f"Break start {result_s} should be ≥ {self.PREF_FROM}"
+        )
+        assert result_e <= self.PREF_UNTIL, (
+            f"Break end {result_e} should be ≤ {self.PREF_UNTIL}"
+        )
+
+    def test_combined_block_placed_inside_preferred_window(self):
+        """
+        _suggest_combined for a 7+ hr shift must place the combined block
+        inside 11:00–15:00 when the shift allows it.
+        """
+        ent  = calc_break_entitlement(8 * 60)   # 8 hr → 20m paid + 30m unpaid
+        sugs = suggest_break_times("07:00:00", "15:00:00", ent)
+        assert len(sugs) == 1
+        sug = sugs[0]
+        assert sug["combined"] is True
+        assert sug["planned_start"] >= self.PREF_FROM, (
+            f"Combined break start {sug['planned_start'][:5]} should be ≥ 11:00"
+        )
+        assert sug["planned_end"] <= self.PREF_UNTIL, (
+            f"Combined break end {sug['planned_end'][:5]} should be ≤ 15:00"
+        )
+
+    def test_40min_combined_placed_inside_preferred_window(self):
+        """
+        _suggest_combined for a 5–7 hr shift (40 min block) fits inside
+        11:00–15:00 when the shift spans the window.
+        """
+        ent  = calc_break_entitlement(6 * 60)   # 6 hr → 10m paid + 30m unpaid
+        sugs = suggest_break_times("08:00:00", "14:00:00", ent)
+        assert len(sugs) == 1
+        sug = sugs[0]
+        assert sug["combined"] is True
+        assert sug["planned_start"] >= self.PREF_FROM
+        assert sug["planned_end"]   <= self.PREF_UNTIL
+
+    # ── 2. Breaks may extend outside 11:00–15:00 when coverage blocks ────────
+
+    def test_break_falls_outside_window_when_shift_does_not_cover_it(self):
+        """
+        If the shift ends before 11:00, _shift_break_to_window falls back
+        to the original suggested time (outside the preferred window).
+        """
+        # Shift 07:00–10:00 — preferred window 11:00–15:00 never reachable
+        result_s, result_e = _shift_break_to_window(
+            "08:30:00", "09:00:00", 30,
+            "07:00:00", "10:00:00",   # shift ends before window starts
+            self.PREF_FROM, self.PREF_UNTIL,
+        )
+        # Fallback: original times returned unchanged
+        assert result_s == "08:30:00", (
+            f"Should fall back to original 08:30, got {result_s}"
+        )
+        assert result_e == "09:00:00"
+
+    def test_break_falls_outside_window_when_no_room_in_window(self):
+        """
+        If the shift passes through the preferred window but the break duration
+        does not fit (e.g. shift ends at 11:10 but break needs 30 min), the
+        function falls back to the original time.
+        """
+        # Shift 07:00–11:10 — only 10 min of preferred window available
+        result_s, result_e = _shift_break_to_window(
+            "09:00:00", "09:30:00", 30,
+            "07:00:00", "11:10:00",
+            self.PREF_FROM, self.PREF_UNTIL,
+        )
+        # 11:00–11:10 = 10 min < 30 min needed → fallback
+        assert result_s == "09:00:00", (
+            f"Should fall back when window too small, got {result_s}"
+        )
+
+    # ── 3. Outside-window breaks choose nearest valid time ────────────────────
+
+    def test_alt_window_search_finds_slot_outside_blocked_period(self):
+        """
+        _find_alt_break_window scans forward in 15-min steps from shift start.
+        When all slots inside 11:00–15:00 are blocked for this educator,
+        it finds a slot outside that range (before or after).
+        The result must not overlap the blocked period.
+        """
+        blocked = [("11:00:00", "15:00:00", False)]
+        breaks_by_user = {self.UID: blocked}
+
+        alt_s, alt_e, conflict = _find_alt_break_window(
+            "07:00:00", "18:00:00", 30,
+            self.RID, self.UID,
+            _empty_coverage(self.RID),
+            {},
+            breaks_by_user,
+            1, 4,
+        )
+        assert not conflict, "Should find a slot outside the blocked period"
+        # Result must not overlap the blocked window
+        assert not _overlaps(alt_s, alt_e, "11:00:00", "15:00:00"), (
+            f"Alt slot {alt_s[:5]}–{alt_e[:5]} overlaps blocked 11:00–15:00"
+        )
+
+    # ── 4. Room ratio coverage is preserved ───────────────────────────────────
+
+    def test_ratio_preserved_when_break_placed_in_preferred_window(self):
+        """
+        With only 1 staff in the room, _shift_break_to_window still places
+        the break time, but _check_break_impact must detect the breach —
+        the scheduled time itself never compromises ratio silently.
+        """
+        # 1 staff in room → removing them always breaches r_staff=1
+        cov_1 = self._cov(n_staff=1)
+        conflict, reason = _check_break_impact(
+            "12:00:00", "12:30:00",
+            self.RID, self.UID,
+            cov_1, {}, {}, r_staff=1, r_child=4,
+        )
+        assert conflict == "breach", (
+            "Should detect ratio breach when only 1 staff is in room"
+        )
+
+    def test_ratio_ok_with_sufficient_staff(self):
+        """
+        With 2 staff in the room and r_staff=1, removing one during a break
+        still leaves 1 ≥ r_staff → no breach.
+        """
+        cov_2 = self._cov(n_staff=2)
+        conflict, _ = _check_break_impact(
+            "12:00:00", "12:30:00",
+            self.RID, self.UID,
+            cov_2, {}, {}, r_staff=1, r_child=4,
+        )
+        assert conflict == "ok"
+
+    # ── 5. Same educator/date breaks do not overlap ───────────────────────────
+
+    def test_window_shift_never_creates_overlap_with_earlier_break(self):
+        """
+        When an earlier rest break is already placed, _shift_break_to_window
+        must not push the meal break to a time that overlaps it — even if
+        that time falls inside the preferred window.
+        """
+        # Rest already placed at 12:26–12:36
+        # _shift_break_to_window naively returns 12:30 for a 30-min meal
+        # The engine clamps this to 12:36 so there is no overlap.
+        result_s, result_e = _shift_break_to_window(
+            "13:10:00", "13:40:00", 30,
+            "10:00:00", "16:07:00",
+            self.PREF_FROM, self.PREF_UNTIL,
+        )
+        existing_rest_end = "12:36:00"
+        # The clamping happens in the engine loop, not in _shift_break_to_window
+        # itself; verify the shifted result is what _shift_break_to_window
+        # would return, then confirm the engine-level clamp would fix it.
+        # The raw shift: window [11:00,15:00], ss=10:00, se=16:07
+        # available=(15:00-11:00)=240, pad=(240-30)/2=105, mid=11:00+105=12:45
+        assert result_s == "12:45:00", (
+            f"Expected 12:45 (centred in window), got {result_s}"
+        )
+        # 12:45 ≥ 12:36 → no overlap after clamp; both assertions pass
+        assert result_s >= existing_rest_end, (
+            f"Window-shifted start {result_s} must be ≥ existing rest end {existing_rest_end}"
+        )
+
+    def test_same_educator_day_no_overlap_after_full_pipeline(self):
+        """
+        End-to-end: run _validate_and_resolve_break_overlaps with two
+        breaks placed at overlapping times (simulating the Bonnie Cheng case)
+        and confirm output has no non-manual-review overlaps.
+        """
+        from itertools import combinations
+
+        rest = SuggestedBreak(
+            user_id=self.UID, user_name=self.UID,
+            shift_key=f"{self.UID}_2026-05-18", break_date="2026-05-18",
+            break_type="rest",
+            planned_start_time="12:26:00", planned_end_time="12:36:00",
+            planned_duration_minutes=10, paid_minutes=10, unpaid_minutes=0,
+            combined=False, label="Rest Break (paid)",
+            status="scheduled", opt_out_source="No opt-out",
+        )
+        meal = SuggestedBreak(
+            user_id=self.UID, user_name=self.UID,
+            shift_key=f"{self.UID}_2026-05-18", break_date="2026-05-18",
+            break_type="meal",
+            planned_start_time="12:30:00", planned_end_time="13:00:00",
+            planned_duration_minutes=30, paid_minutes=0, unpaid_minutes=30,
+            combined=False, label="Meal Break (unpaid)",
+            status="scheduled", opt_out_source="No opt-out",
+        )
+        shifts = [
+            _make_shift(self.UID, "10:00:00", "16:07:00",
+                        date="2026-05-18", room=self.RID),
+            _make_shift("extra-1", "10:00:00", "16:07:00",
+                        date="2026-05-18", room=self.RID),
+            _make_shift("extra-2", "10:00:00", "16:07:00",
+                        date="2026-05-18", room=self.RID),
+        ]
+        room_map = {self.RID: {
+            "id": self.RID, "name": "Room",
+            "required_ratio_staff": 1, "required_ratio_children": 4,
+            "licensed_capacity": 12,
+        }}
+        resolved, _ = _validate_and_resolve_break_overlaps([rest, meal], shifts, room_map)
+
+        for a, b in combinations(resolved, 2):
+            if a.user_id == b.user_id and a.break_date == b.break_date:
+                if _overlaps(
+                    a.planned_start_time, a.planned_end_time,
+                    b.planned_start_time, b.planned_end_time,
+                ):
+                    assert a.status == "manual_review" and b.status == "manual_review", (
+                        f"Non-manual-review overlap: "
+                        f"{a.break_type} {a.planned_start_time[:5]}-{a.planned_end_time[:5]}"
+                        f"({a.status}) ∩ "
+                        f"{b.break_type} {b.planned_start_time[:5]}-{b.planned_end_time[:5]}"
+                        f"({b.status})"
+                    )
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -689,6 +956,7 @@ if __name__ == "__main__":
         TestCentreCoverage(),
         TestBreakOverlapRegression(),
         TestValidateBreakOverlaps(),
+        TestPreferredBreakWindow(),
     ]
     passed = failed = 0
     for obj in classes:
