@@ -238,28 +238,25 @@ def suggest_break_times(
     entitlement: dict,
 ) -> list[dict]:
     """
-    Suggest ideal break times spread across the shift.
+    Suggest ideal break times.
 
-    For 7+ hour shifts (paid_duration=20, has_meal=True), attempts to produce
-    one combined 50-minute block (20 min paid + 30 min unpaid).  A combined
-    suggestion carries:
-        break_type         "combined"
-        duration_minutes   50
-        paid_minutes       20
-        unpaid_minutes     30
-        label              "50 min combined break"
-        combined           True
+    Combined-block rules (only when has_meal=True and unpaid NOT opted out):
+        5–7 hr tier  (paid_dur=10, paid_count=1, has_meal=True):
+            → one 40-min combined block  (10 paid + 30 unpaid)
+        7+  hr tier  (paid_dur=20, paid_count=1, has_meal=True):
+            → one 50-min combined block  (20 paid + 30 unpaid)
 
-    If the caller's ratio-check rejects the 50-min window it should call
-    suggest_break_times_separate() to get the two distinct blocks instead.
+    When unpaid is opted out (has_meal=False), only the paid rest break
+    is scheduled — no combined block.
 
-    For all other tiers, returns the separate paid/unpaid blocks as before.
+    If the caller's ratio-check rejects the combined block it should call
+    suggest_break_times_separate() to get two distinct blocks instead.
 
-    Returns list of suggestion dicts:
-        {break_type, planned_start, planned_end, duration_minutes,
-         paid_minutes, unpaid_minutes, combined, label}
+    Every suggestion dict includes:
+        break_type, planned_start, planned_end, duration_minutes,
+        paid_minutes, unpaid_minutes, combined (bool), label
     """
-    shift_mins  = shift_duration_minutes(shift_start, shift_end)
+    shift_mins = shift_duration_minutes(shift_start, shift_end)
     if shift_mins <= 0:
         return []
 
@@ -272,11 +269,18 @@ def suggest_break_times(
     paid_dur   = entitlement.get("paid_duration",  10)
     has_meal   = entitlement.get("has_meal",       False)
 
-    # ── 7+ hour shift: try a single combined 50-min block ─────────────
-    if paid_dur == 20 and paid_count == 1 and has_meal:
-        return _suggest_combined(start_dt, shift_mins, shift_start, shift_end)
+    # ── Combined block tiers (only when meal break is not opted out) ───
+    if paid_count == 1 and has_meal:
+        if paid_dur == 10:
+            # 5–7 hr tier: 10 paid + 30 unpaid = 40 min combined
+            return _suggest_combined(start_dt, shift_mins, shift_start, shift_end,
+                                     paid_component=10, label="40 min combined break")
+        if paid_dur == 20:
+            # 7+ hr tier: 20 paid + 30 unpaid = 50 min combined
+            return _suggest_combined(start_dt, shift_mins, shift_start, shift_end,
+                                     paid_component=20, label="50 min combined break")
 
-    # ── All other tiers: separate paid then meal ───────────────────────
+    # ── Opt-out or legacy tiers: separate blocks ───────────────────────
     return _suggest_separate(start_dt, shift_mins, paid_count, paid_dur, has_meal)
 
 
@@ -308,15 +312,18 @@ def _suggest_combined(
     shift_mins: int,
     shift_start: str,
     shift_end: str,
+    paid_component: int = 20,
+    label: str = "50 min combined break",
 ) -> list[dict]:
     """
-    Produce one 50-min combined suggestion (20 paid + 30 unpaid).
-    Preferred window: 11:00–14:30 (to fit a 50-min block before 14:30).
+    Produce one combined suggestion (paid_component + 30 min unpaid).
+    Preferred window: 11:00 – (preferred_until) where preferred_until is
+    set so the full block fits before 14:30.
     Falls back to 45% of the shift if the preferred window doesn't fit.
     """
-    combined_dur = 50
-    pref_from    = datetime(1900, 1, 1, 11, 0)
-    pref_until   = datetime(1900, 1, 1, 14, 30)
+    combined_dur  = paid_component + 30
+    pref_from     = datetime(1900, 1, 1, 11, 0)
+    pref_until    = datetime(1900, 1, 1, 14, 30)
 
     try:
         ss_dt = datetime.strptime(shift_start[:5], "%H:%M")
@@ -330,7 +337,6 @@ def _suggest_combined(
     window_end   = min(se_dt, pref_until)
 
     if window_start + timedelta(minutes=combined_dur) <= window_end:
-        # Centre it in the preferred window
         available  = (window_end - window_start).total_seconds() / 60
         pad        = max(0, (available - combined_dur) / 2)
         b_start_dt = window_start + timedelta(minutes=pad)
@@ -352,10 +358,10 @@ def _suggest_combined(
         "planned_start":    b_start_dt.strftime("%H:%M:%S"),
         "planned_end":      b_end_dt.strftime("%H:%M:%S"),
         "duration_minutes": combined_dur,
-        "paid_minutes":     20,
+        "paid_minutes":     paid_component,
         "unpaid_minutes":   30,
         "combined":         True,
-        "label":            "50 min combined break",
+        "label":            label,
     }]
 
 
