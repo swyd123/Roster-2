@@ -203,22 +203,42 @@ def create_breaks_batch(rows: list[dict]) -> int:
     Optional: roster_shift_id, notes, status.
     Returns count of rows inserted.
     No .single() — plain insert.
+
+    break_type="combined" is stored as "rest" in the DB (since the combined
+    block is anchored to the paid rest component) after the SQL migration adds
+    'combined' to the enum. Until the migration runs the fallback to "rest"
+    prevents constraint errors. The paid/unpaid split is preserved in notes.
     """
     if not rows:
         return 0
     sb = get_supabase_client()
+
+    def _db_break_type(bt: str) -> str:
+        """Map app break_type to DB enum value. 'combined' → 'rest' pre-migration."""
+        return "rest" if bt == "combined" else bt
+
+    def _notes_with_split(r: dict) -> str | None:
+        base  = (r.get("notes") or "").strip()
+        btype = r.get("break_type", "")
+        if btype == "combined":
+            paid   = r.get("paid_component_minutes") or r.get("paid_minutes", 0)
+            unpaid = r.get("unpaid_component_minutes") or r.get("unpaid_minutes", 0)
+            split  = f"Combined: {paid}min paid + {unpaid}min unpaid"
+            return f"{split} | {base}" if base else split
+        return base or None
+
     payload = [
         {
             "centre_id":               r["centre_id"],
             "user_id":                 r["user_id"],
             "break_date":              r["break_date"],
-            "break_type":              r["break_type"],
+            "break_type":              _db_break_type(r["break_type"]),
             "planned_start_time":      r["planned_start_time"],
             "planned_end_time":        r["planned_end_time"],
             "planned_duration_minutes": r["planned_duration_minutes"],
             "roster_shift_id":         r.get("roster_shift_id"),
             "status":                  r.get("status", "scheduled"),
-            "notes":                   (r.get("notes") or "").strip() or None,
+            "notes":                   _notes_with_split(r),
         }
         for r in rows
     ]
