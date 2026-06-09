@@ -77,7 +77,7 @@ def fetch_all_staff() -> list[dict]:
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
-            "employment_end_date, notes, organisation_id,"
+            "employment_end_date, notes, organisation_id, allows_unpaid_break_opt_out,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active, created_at"
             ")"
@@ -119,7 +119,7 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
             "id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, date_of_birth, super_fund_name, super_member_number,"
             "emergency_contact_name, emergency_contact_phone,"
-            "emergency_contact_relationship, notes, organisation_id,"
+            "emergency_contact_relationship, notes, organisation_id, allows_unpaid_break_opt_out,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active"
             ")"
@@ -316,6 +316,7 @@ def update_staff_member(
     emergency_contact_name: str, emergency_contact_phone: str,
     emergency_contact_relationship: str, notes: str,
     is_active: bool,
+    allows_unpaid_break_opt_out: bool = False,
 ) -> dict:
     sb = get_supabase_client()
 
@@ -338,6 +339,7 @@ def update_staff_member(
             "emergency_contact_phone":        emergency_contact_phone.strip() or None,
             "emergency_contact_relationship": emergency_contact_relationship.strip() or None,
             "notes":                          notes.strip() or None,
+            "allows_unpaid_break_opt_out":    allows_unpaid_break_opt_out,
         })
         .eq("id", profile_id)
         .select()
