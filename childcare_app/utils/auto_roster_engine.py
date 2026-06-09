@@ -295,6 +295,21 @@ def generate_roster(
                         b_start, b_end, b_dur, ss, se, "11:00:00", "14:30:00"
                     )
 
+                # Hard clamp: if the shifted break now overlaps a break this
+                # educator already has today, push it forward to start at the
+                # latest already-placed break end (still within the shift).
+                # This prevents _shift_break_to_window from moving a meal break
+                # backwards into a rest break that was already placed.
+                for ex_s, ex_e, _ in breaks_by_user.get(uid, []):
+                    if _overlaps(b_start, b_end, ex_s, ex_e):
+                        # Push forward: new start = ex_e, recalculate end
+                        if ex_e < se:
+                            b_start = ex_e
+                            b_end_dt = datetime.strptime(b_start[:8], "%H:%M:%S") + timedelta(minutes=b_dur)
+                            b_end = b_end_dt.strftime("%H:%M:%S")
+                            # If pushed end exceeds shift end, let _check_break_impact handle it
+                        break
+
                 # Check educator-level overlap AND room ratio impact
                 conflict, reason = _check_break_impact(
                     b_start, b_end, rid, uid,
