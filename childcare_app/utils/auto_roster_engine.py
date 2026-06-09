@@ -231,8 +231,11 @@ def generate_roster(
         # Build room→shift-coverage map for ratio checking during breaks
         room_coverage = _build_room_coverage(day_shifts, room_map)
 
-        # Track break windows already assigned to avoid overlap
-        breaks_by_room: dict[str, list[tuple[str, str]]] = {}
+        # breaks_by_room: {room_id:  [(start, end), ...]}   — room-level stagger
+        # breaks_by_user: {user_id:  [(start, end, fixed)]} — per-educator overlap guard
+        # "fixed" = True means this break must not be moved (e.g. a pre-existing record)
+        breaks_by_room: dict[str, list[tuple[str, str]]]        = {}
+        breaks_by_user: dict[str, list[tuple[str, str, bool]]]  = {}
 
         for shift in day_shifts:
             uid  = shift.user_id
@@ -265,7 +268,8 @@ def generate_roster(
                 conflict_chk, _ = _check_break_impact(
                     suggestions[0]["planned_start"][:8],
                     suggestions[0]["planned_end"][:8],
-                    rid, uid, room_coverage, breaks_by_room, r_staff, r_child,
+                    rid, uid, room_coverage, breaks_by_room,
+                    breaks_by_user, r_staff, r_child,
                 )
                 if conflict_chk == "breach":
                     from utils.break_engine import suggest_break_times_separate
@@ -285,17 +289,19 @@ def generate_roster(
                         b_start, b_end, b_dur, ss, se, "11:00:00", "14:30:00"
                     )
 
-                # Check: if this staff is removed, does coverage drop below ratio?
+                # Check educator-level overlap AND room ratio impact
                 conflict, reason = _check_break_impact(
                     b_start, b_end, rid, uid,
-                    room_coverage, breaks_by_room, r_staff, r_child,
+                    room_coverage, breaks_by_room,
+                    breaks_by_user, r_staff, r_child,
                 )
 
                 if conflict == "breach":
-                    # Try to find an alternate window
+                    # Try to find an alternate window that avoids both conflicts
                     alt_start, alt_end, alt_conflict = _find_alt_break_window(
                         ss, se, b_dur, rid, uid,
-                        room_coverage, breaks_by_room, r_staff, r_child,
+                        room_coverage, breaks_by_room,
+                        breaks_by_user, r_staff, r_child,
                     )
                     if alt_conflict:
                         brk = SuggestedBreak(
@@ -333,6 +339,27 @@ def generate_roster(
                             status="scheduled",
                             opt_out_source=opt_src,
                         )
+                elif conflict == "fixed_conflict":
+                    # Both breaks are fixed — flag, do not move either one
+                    brk = SuggestedBreak(
+                        user_id=uid, user_name=shift.user_name,
+                        shift_key=shift_key, break_date=date_str,
+                        break_type=btype,
+                        planned_start_time=b_start,
+                        planned_end_time=b_end,
+                        planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
+                        status="manual_review",
+                        opt_out_source=opt_src,
+                        warnings=[f"Fixed break conflict: {reason}"],
+                    )
+                    review_warns.append(
+                        f"{shift.user_name} on {date_str}: "
+                        f"fixed break conflict — {reason}"
+                    )
                 else:
                     brk = SuggestedBreak(
                         user_id=uid, user_name=shift.user_name,
@@ -350,8 +377,11 @@ def generate_roster(
                     )
 
                 all_breaks.append(brk)
-                # Record this break so next educator avoids same window
+                # Register in both trackers so subsequent breaks avoid this window
                 breaks_by_room.setdefault(rid, []).append((b_start, b_end))
+                breaks_by_user.setdefault(uid, []).append(
+                    (b_start, b_end, False)   # False = not a fixed/pre-existing break
+                )
 
     return RosterResult(
         shifts=all_shifts,
@@ -590,6 +620,15 @@ def _build_room_coverage(
     return result
 
 
+def _overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    """
+    Return True when two time windows overlap.
+    Canonical half-open interval test: a_start < b_end AND b_start < a_end.
+    All arguments must be HH:MM:SS strings.
+    """
+    return a_start < b_end and b_start < a_end
+
+
 def _check_break_impact(
     b_start: str,
     b_end: str,
@@ -597,25 +636,45 @@ def _check_break_impact(
     user_id: str,
     room_coverage: dict[str, dict[str, int]],
     breaks_by_room: dict[str, list[tuple[str, str]]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
     r_staff: int,
     r_child: int,
 ) -> tuple[str, str]:
     """
-    Return ("ok" | "breach", reason).
+    Return ("ok" | "breach" | "fixed_conflict", reason).
 
-    Checks that:
-    1. Removing this staff member during b_start–b_end doesn't drop
-       room coverage below r_staff.
-    2. Another staff from the same room isn't already on break in this window.
+    Checks in priority order:
+    1. Educator-level overlap — does this educator already have a break
+       covering any part of [b_start, b_end]?
+       - If the existing break is NOT fixed  → "breach"  (can be moved)
+       - If the existing break IS fixed      → "fixed_conflict" (both breaks
+         are immovable; caller must flag the conflict, not silently reschedule)
+    2. Room-level stagger — is another staff member from the same room
+       already on break in this window?
+    3. Ratio coverage — does removing this staff member during the window
+       drop the room below the minimum ratio?
     """
-    cov = room_coverage.get(room_id, {})
+    # 1. Educator overlap — checked first and hardest
+    for ex_start, ex_end, ex_fixed in breaks_by_user.get(user_id, []):
+        if _overlaps(b_start, b_end, ex_start, ex_end):
+            if ex_fixed:
+                return (
+                    "fixed_conflict",
+                    f"Overlaps a fixed break {ex_start[:5]}–{ex_end[:5]} "
+                    f"that cannot be moved.",
+                )
+            return (
+                "breach",
+                f"Overlaps educator's own break {ex_start[:5]}–{ex_end[:5]}.",
+            )
 
-    # Check no simultaneous room break
+    # 2. Room-level stagger
     for existing_start, existing_end in breaks_by_room.get(room_id, []):
-        if existing_start < b_end and existing_end > b_start:
+        if _overlaps(b_start, b_end, existing_start, existing_end):
             return "breach", "Another staff member is already on break in this window."
 
-    # Check ratio coverage
+    # 3. Ratio coverage
+    cov = room_coverage.get(room_id, {})
     slots_in_break = [s for s in cov if b_start <= s < b_end]
     for slot in slots_in_break:
         staff_at_slot  = cov.get(slot, 0)
@@ -634,15 +693,16 @@ def _find_alt_break_window(
     user_id: str,
     room_coverage: dict[str, dict[str, int]],
     breaks_by_room: dict[str, list[tuple[str, str]]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
     r_staff: int,
     r_child: int,
 ) -> tuple[str, str, bool]:
     """
-    Scan the shift for a compliant break window.
+    Scan the shift in 15-minute steps for a window that satisfies all
+    educator-overlap, room-stagger, and ratio constraints.
     Returns (start, end, still_conflict).
     """
-    slots = sorted(room_coverage.get(room_id, {}).keys())
-    step  = timedelta(minutes=15)
+    step = timedelta(minutes=15)
 
     try:
         current = datetime.strptime(shift_start[:8], "%H:%M:%S")
@@ -655,7 +715,7 @@ def _find_alt_break_window(
         b_e = (current + timedelta(minutes=dur_minutes)).strftime("%H:%M:%S")
         conflict, _ = _check_break_impact(
             b_s, b_e, room_id, user_id,
-            room_coverage, breaks_by_room, r_staff, r_child,
+            room_coverage, breaks_by_room, breaks_by_user, r_staff, r_child,
         )
         if conflict == "ok":
             return b_s, b_e, False
