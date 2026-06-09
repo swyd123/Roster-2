@@ -227,6 +227,12 @@ def generate_roster(
 
         all_shifts.extend(day_shifts)
 
+        # ── Coverage gap check: 07:15–18:00 must be continuously staffed ─
+        # At least one staff member must cover every 15-minute slot across
+        # all rooms combined. Gaps are added to ratio_warns.
+        coverage_warns = _check_centre_coverage(day_shifts, date_str)
+        ratio_warns.extend(coverage_warns)
+
         # ── Step 3: schedule breaks for each shift ────────────────────
         # Build room→shift-coverage map for ratio checking during breaks
         room_coverage = _build_room_coverage(day_shifts, room_map)
@@ -495,6 +501,21 @@ def _merge_slots_to_windows(
     return windows
 
 
+# Employment-type priority order for staff allocation.
+# Lower number = higher priority. Casual staff are last.
+EMPLOYMENT_PRIORITY: dict[str, int] = {
+    "full_time":  0,
+    "part_time":  1,
+    "casual":     2,
+}
+CASUAL_MIN_SHIFT_MINUTES: int = 180   # 3 hours — casual staff floor
+
+
+def _employment_rank(s: dict) -> int:
+    """Return sort key for employment type (lower = higher priority)."""
+    return EMPLOYMENT_PRIORITY.get(s.get("employment_type", "casual"), 2)
+
+
 def _eligible_staff(
     centre_staff: list[dict],
     room_id: str,
@@ -504,9 +525,12 @@ def _eligible_staff(
     leave_map: dict[str, list[str]],
 ) -> list[dict]:
     """
-    Return staff eligible to work in room_id on date_str, sorted by preference:
-      1. Primary room matches (preferred).
-      2. Available and not on leave.
+    Return staff eligible to work in room_id on date_str, sorted by:
+        1. Primary room match (preferred over non-primary)
+        2. Employment type: full-time → part-time → casual
+        3. Name (stable tie-break)
+
+    Availability and leave are filtered before sorting.
     """
     result_primary = []
     result_other   = []
@@ -514,11 +538,9 @@ def _eligible_staff(
     for s in centre_staff:
         uid = s["uid"]
 
-        # Leave check
         if date_str in leave_map.get(uid, []):
             continue
 
-        # Availability check
         av = availability_map.get(uid, {}).get(dow)
         if av is not None and not av.get("is_available", True):
             continue
@@ -529,6 +551,11 @@ def _eligible_staff(
             result_primary.append(entry)
         else:
             result_other.append(entry)
+
+    # Sort each bucket by employment priority then name
+    key = lambda x: (_employment_rank(x), x.get("name", ""))
+    result_primary.sort(key=key)
+    result_other.sort(key=key)
 
     return result_primary + result_other
 
@@ -542,10 +569,19 @@ def _pick_staff(
     day_shifts: list[SuggestedShift],
 ) -> dict | None:
     """
-    Pick the best available staff member for this window, avoiding double-booking.
-    Returns {uid, name, source} or None if no one is available.
+    Pick the best available staff member for this window.
+
+    Priority (already enforced by _eligible_staff ordering):
+        1. Primary-room match
+        2. Full-time before part-time before casual
+
+    Additional constraint:
+        Casual staff must not be assigned shifts shorter than
+        CASUAL_MIN_SHIFT_MINUTES (3 hours = 180 min). If the window
+        is under 3 hours a casual staff member is skipped entirely.
+
+    Returns {uid, name, source, employment_type} or None.
     """
-    # Build set of already-booked (uid, overlapping) for this window
     already_in_window = set()
     for s in day_shifts:
         if s.shift_date == date_str:
@@ -555,11 +591,16 @@ def _pick_staff(
     window_dur = _mins_between(window.start, window.end)
 
     for s in eligible:
-        uid = s["uid"]
+        uid  = s["uid"]
+        etype = s.get("employment_type", "full_time")
+
         if uid in already_in_window:
             continue
 
-        # Check availability window fits
+        # Casual staff: enforce 3-hour minimum shift length
+        if etype == "casual" and window_dur < CASUAL_MIN_SHIFT_MINUTES:
+            continue
+
         av = s.get("avail")
         if av:
             av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
@@ -568,7 +609,7 @@ def _pick_staff(
                 continue
 
         source = "primary_room" if s.get("primary_room_id") == room_id else "available"
-        return {"uid": uid, "name": s["name"], "source": source}
+        return {"uid": uid, "name": s["name"], "source": source, "employment_type": etype}
 
     return None
 
@@ -596,6 +637,69 @@ def _mins_between(start: str, end: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # PRIVATE — BREAK SCHEDULING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+CENTRE_OPEN:  str = "07:15:00"   # earliest slot that must be covered
+CENTRE_CLOSE: str = "18:00:00"   # coverage must reach (exclusive) this time
+
+
+def _check_centre_coverage(
+    day_shifts: list[SuggestedShift],
+    date_str: str,
+) -> list[str]:
+    """
+    Verify that at least one staff member covers every 15-minute slot from
+    CENTRE_OPEN (07:15) to CENTRE_CLOSE (18:00) across all rooms combined.
+
+    Returns a list of warning strings for any uncovered slots.
+    """
+    warnings: list[str] = []
+
+    # Build set of 15-min slots that are covered by at least one shift
+    covered: set[str] = set()
+    for shift in day_shifts:
+        ss = shift.start_time
+        se = shift.end_time
+        # Walk 15-min slots
+        try:
+            current = datetime.strptime(ss[:8], "%H:%M:%S")
+            end_dt  = datetime.strptime(se[:8], "%H:%M:%S")
+        except Exception:
+            continue
+        while current < end_dt:
+            covered.add(current.strftime("%H:%M:%S"))
+            current += timedelta(minutes=15)
+
+    # Check every required slot
+    try:
+        slot_dt  = datetime.strptime(CENTRE_OPEN,  "%H:%M:%S")
+        close_dt = datetime.strptime(CENTRE_CLOSE, "%H:%M:%S")
+    except Exception:
+        return warnings
+
+    gap_start: str | None = None
+
+    while slot_dt < close_dt:
+        slot_str = slot_dt.strftime("%H:%M:%S")
+        if slot_str not in covered:
+            if gap_start is None:
+                gap_start = slot_str[:5]
+        else:
+            if gap_start is not None:
+                warnings.append(
+                    f"Coverage gap {date_str} {gap_start}–{slot_str[:5]}: "
+                    "no staff rostered across any room."
+                )
+                gap_start = None
+        slot_dt += timedelta(minutes=15)
+
+    if gap_start is not None:
+        warnings.append(
+            f"Coverage gap {date_str} {gap_start}–{CENTRE_CLOSE[:5]}: "
+            "no staff rostered across any room."
+        )
+
+    return warnings
+
 
 def _build_room_coverage(
     day_shifts: list[SuggestedShift],
