@@ -57,10 +57,14 @@ class SuggestedBreak:
     user_name:              str
     shift_key:              str   # f"{user_id}_{shift_date}" — links to SuggestedShift
     break_date:             str   # YYYY-MM-DD
-    break_type:             str   # rest | meal
+    break_type:             str   # rest | meal | combined
     planned_start_time:     str   # HH:MM:SS
     planned_end_time:       str   # HH:MM:SS
     planned_duration_minutes: int
+    paid_minutes:           int   # 20 for combined/rest, 0 for meal
+    unpaid_minutes:         int   # 30 for combined/meal, 0 for rest
+    combined:               bool  # True when paid+unpaid merged into one block
+    label:                  str   # display label
     status:                 str   # scheduled | manual_review
     opt_out_source:         str   # "Staff default" | "Manual override — opted out" | etc.
     warnings:               list[str] = field(default_factory=list)
@@ -251,6 +255,17 @@ def generate_roster(
                 continue   # no break required
 
             suggestions = suggest_break_times(ss, se, ent)
+            # For combined suggestions: if ratio conflict, fall back to two separate
+            if len(suggestions) == 1 and suggestions[0].get("combined"):
+                conflict_chk, _ = _check_break_impact(
+                    suggestions[0]["planned_start"][:8],
+                    suggestions[0]["planned_end"][:8],
+                    rid, uid, room_coverage, breaks_by_room, r_staff, r_child,
+                )
+                if conflict_chk == "breach":
+                    from utils.break_engine import suggest_break_times_separate
+                    suggestions = suggest_break_times_separate(ss, se, ent)
+
             room        = room_map.get(rid, {})
             r_staff     = room.get("required_ratio_staff",    1)
             r_child     = room.get("required_ratio_children", 4)
@@ -262,10 +277,10 @@ def generate_roster(
                 b_start  = sug["planned_start"][:8]
                 b_end    = sug["planned_end"][:8]
 
-                # Prefer unpaid (meal) breaks 11:00–14:00
-                if btype == "meal":
+                # Prefer unpaid (meal) or combined breaks 11:00–14:30
+                if btype in ("meal", "combined"):
                     b_start, b_end = _shift_break_to_window(
-                        b_start, b_end, b_dur, ss, se, "11:00:00", "14:00:00"
+                        b_start, b_end, b_dur, ss, se, "11:00:00", "14:30:00"
                     )
 
                 # Check: if this staff is removed, does coverage drop below ratio?
@@ -288,6 +303,10 @@ def generate_roster(
                             planned_start_time=b_start,
                             planned_end_time=b_end,
                             planned_duration_minutes=b_dur,
+                            paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                            unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                            combined=sug.get("combined", False),
+                            label=sug.get("label", btype.title()),
                             status="manual_review",
                             opt_out_source=opt_src,
                             warnings=[f"No compliant break window found. {reason}"],
@@ -305,6 +324,10 @@ def generate_roster(
                             planned_start_time=b_start,
                             planned_end_time=b_end,
                             planned_duration_minutes=b_dur,
+                            paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                            unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                            combined=sug.get("combined", False),
+                            label=sug.get("label", btype.title()),
                             status="scheduled",
                             opt_out_source=opt_src,
                         )
@@ -316,6 +339,10 @@ def generate_roster(
                         planned_start_time=b_start,
                         planned_end_time=b_end,
                         planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
                         status="scheduled",
                         opt_out_source=opt_src,
                     )
