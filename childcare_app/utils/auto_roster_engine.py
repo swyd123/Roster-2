@@ -389,6 +389,15 @@ def generate_roster(
                     (b_start, b_end, False)   # False = not a fixed/pre-existing break
                 )
 
+    # ── Final validation pass: resolve any remaining per-educator overlaps ──
+    # This runs after all break generation, fixed-break, paid/unpaid, and
+    # manual-review logic so it catches any edge-case overlaps not prevented
+    # by the per-suggestion checks above.
+    all_breaks, extra_review_warns = _validate_and_resolve_break_overlaps(
+        all_breaks, all_shifts, room_map,
+    )
+    review_warns.extend(extra_review_warns)
+
     return RosterResult(
         shifts=all_shifts,
         breaks=all_breaks,
@@ -722,6 +731,272 @@ def _build_room_coverage(
             if shift.start_time <= slot < shift.end_time:
                 result[rid][slot] = result[rid].get(slot, 0) + 1
     return result
+
+
+def _validate_and_resolve_break_overlaps(
+    breaks: list[SuggestedBreak],
+    shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+) -> tuple[list[SuggestedBreak], list[str]]:
+    """
+    Final validation pass: detect and resolve per-educator break overlaps.
+
+    Runs after ALL other break generation, fixed-break, paid/unpaid, and
+    manual-review logic — immediately before the result is returned.
+
+    For each (user_id, break_date) group with more than one break:
+        1. Sort by planned_start_time.
+        2. Walk adjacent pairs; test overlap with _overlaps().
+        3a. If overlap AND ratio allows the combined window:
+              Replace the pair with one SuggestedBreak spanning
+              min(starts)..max(ends).  paid_minutes and unpaid_minutes
+              are summed from both breaks.  status → "scheduled",
+              break_type → "combined", combined → True.
+        3b. If overlap AND ratio does NOT allow combined:
+              Try to move the later (non-fixed) break to the nearest
+              valid window after the first break ends.
+        3c. If neither break can be moved (both fixed, or no free slot):
+              Mark the overlapping break as status="manual_review" and
+              add an entry to review_warnings.
+
+    Different educators are checked independently.
+    The same educator on different days is also checked independently.
+
+    Returns (resolved_breaks, new_review_warnings).
+    """
+    review_warns: list[str] = []
+
+    # Build room coverage once per day from all shifts
+    day_coverage: dict[str, dict[str, dict[str, int]]] = {}  # date → room coverage
+    for shift in shifts:
+        d = shift.shift_date
+        if d not in day_coverage:
+            day_coverage[d] = _build_room_coverage(
+                [s for s in shifts if s.shift_date == d], room_map
+            )
+
+    # Group breaks by (user_id, break_date)
+    from collections import defaultdict
+    groups: dict[tuple, list[SuggestedBreak]] = defaultdict(list)
+    for b in breaks:
+        groups[(b.user_id, b.break_date)].append(b)
+
+    resolved: list[SuggestedBreak] = []
+
+    for (uid, date_str), group in groups.items():
+        if len(group) == 1:
+            resolved.append(group[0])
+            continue
+
+        # Sort by start time
+        group.sort(key=lambda b: b.planned_start_time)
+
+        # Identify the room for this educator on this day
+        room_id = next(
+            (s.room_id for s in shifts
+             if s.user_id == uid and s.shift_date == date_str),
+            None,
+        )
+        room = room_map.get(room_id, {}) if room_id else {}
+        r_staff = room.get("required_ratio_staff",    1)
+        r_child = room.get("required_ratio_children", 4)
+        cov     = day_coverage.get(date_str, {})
+
+        # Shift bounds for this educator (to constrain rescheduling)
+        shift_rec = next(
+            (s for s in shifts if s.user_id == uid and s.shift_date == date_str),
+            None,
+        )
+        shift_start = shift_rec.start_time if shift_rec else "06:00:00"
+        shift_end   = shift_rec.end_time   if shift_rec else "21:00:00"
+
+        # Walk pairs; merge or reschedule as needed
+        output: list[SuggestedBreak] = [group[0]]
+
+        for brk in group[1:]:
+            prev = output[-1]
+
+            if not _overlaps(
+                prev.planned_start_time, prev.planned_end_time,
+                brk.planned_start_time,  brk.planned_end_time,
+            ):
+                output.append(brk)
+                continue
+
+            # ── Overlap detected ──────────────────────────────────────
+            combined_start = min(prev.planned_start_time, brk.planned_start_time)
+            combined_end   = max(prev.planned_end_time,   brk.planned_end_time)
+            combined_dur   = _mins_between(combined_start, combined_end)
+            paid_total     = prev.paid_minutes   + brk.paid_minutes
+            unpaid_total   = prev.unpaid_minutes + brk.unpaid_minutes
+            uname          = prev.user_name
+
+            # Check whether ratio allows the combined window
+            ratio_ok = _ratio_allows_window(
+                combined_start, combined_end, room_id, uid, cov, r_staff,
+            )
+
+            if ratio_ok:
+                # ── Combine into one block ────────────────────────────
+                combined_label = (
+                    f"{combined_dur} min combined break"
+                    if (paid_total and unpaid_total)
+                    else prev.label
+                )
+                merged = SuggestedBreak(
+                    user_id=uid,
+                    user_name=uname,
+                    shift_key=prev.shift_key,
+                    break_date=date_str,
+                    break_type="combined",
+                    planned_start_time=combined_start,
+                    planned_end_time=combined_end,
+                    planned_duration_minutes=combined_dur,
+                    paid_minutes=paid_total,
+                    unpaid_minutes=unpaid_total,
+                    combined=True,
+                    label=combined_label,
+                    status="scheduled",
+                    opt_out_source=prev.opt_out_source,
+                )
+                output[-1] = merged   # replace prev with the merged block
+
+            else:
+                # ── Try to move the later break ───────────────────────
+                # Determine which break is movable (prefer moving brk;
+                # if brk is a combined/fixed block, try moving prev).
+                can_move_brk  = not (brk.combined  and brk.break_type == "combined")
+                can_move_prev = not (prev.combined  and prev.break_type == "combined")
+
+                moved = False
+                if can_move_brk:
+                    new_s, new_e = _next_free_slot(
+                        prev.planned_end_time, brk.planned_duration_minutes,
+                        shift_start, shift_end,
+                        room_id, uid, cov, r_staff,
+                        already_placed=[(b.planned_start_time, b.planned_end_time)
+                                        for b in output],
+                    )
+                    if new_s is not None:
+                        rescheduled = SuggestedBreak(
+                            user_id=uid,
+                            user_name=uname,
+                            shift_key=brk.shift_key,
+                            break_date=date_str,
+                            break_type=brk.break_type,
+                            planned_start_time=new_s,
+                            planned_end_time=new_e,
+                            planned_duration_minutes=brk.planned_duration_minutes,
+                            paid_minutes=brk.paid_minutes,
+                            unpaid_minutes=brk.unpaid_minutes,
+                            combined=brk.combined,
+                            label=brk.label,
+                            status="scheduled",
+                            opt_out_source=brk.opt_out_source,
+                        )
+                        output.append(rescheduled)
+                        moved = True
+
+                if not moved:
+                    # Cannot resolve — flag for manual review
+                    flagged = SuggestedBreak(
+                        user_id=uid,
+                        user_name=uname,
+                        shift_key=brk.shift_key,
+                        break_date=date_str,
+                        break_type=brk.break_type,
+                        planned_start_time=brk.planned_start_time,
+                        planned_end_time=brk.planned_end_time,
+                        planned_duration_minutes=brk.planned_duration_minutes,
+                        paid_minutes=brk.paid_minutes,
+                        unpaid_minutes=brk.unpaid_minutes,
+                        combined=brk.combined,
+                        label=brk.label,
+                        status="manual_review",
+                        opt_out_source=brk.opt_out_source,
+                        warnings=[
+                            f"Overlaps {prev.break_type} break "
+                            f"{prev.planned_start_time[:5]}–{prev.planned_end_time[:5]}. "
+                            "Ratio does not allow combined or rescheduled break."
+                        ],
+                    )
+                    output.append(flagged)
+                    review_warns.append(
+                        f"{uname} on {date_str}: break overlap "
+                        f"{prev.planned_start_time[:5]}–{prev.planned_end_time[:5]} ∩ "
+                        f"{brk.planned_start_time[:5]}–{brk.planned_end_time[:5]} "
+                        "— manual review required."
+                    )
+
+        resolved.extend(output)
+
+    return resolved, review_warns
+
+
+def _ratio_allows_window(
+    b_start: str,
+    b_end: str,
+    room_id: str | None,
+    user_id: str,
+    cov: dict[str, dict[str, int]],
+    r_staff: int,
+) -> bool:
+    """
+    Return True if removing this educator during [b_start, b_end] keeps
+    coverage at or above r_staff in every 15-minute slot.
+    """
+    if not room_id:
+        return True
+    room_cov = cov.get(room_id, {})
+    for slot, count in room_cov.items():
+        if b_start <= slot < b_end:
+            if max(0, count - 1) < r_staff:
+                return False
+    return True
+
+
+def _next_free_slot(
+    not_before: str,
+    dur_minutes: int,
+    shift_start: str,
+    shift_end: str,
+    room_id: str | None,
+    user_id: str,
+    cov: dict[str, dict[str, int]],
+    r_staff: int,
+    already_placed: list[tuple[str, str]],
+) -> tuple[str | None, str | None]:
+    """
+    Scan forward from `not_before` in 15-minute steps to find the next slot
+    where the educator can take a break without overlapping any already-placed
+    break and without breaching the room ratio.
+
+    Returns (start, end) strings or (None, None) if no slot found.
+    """
+    try:
+        current = datetime.strptime(not_before[:8], "%H:%M:%S")
+        end_dt  = datetime.strptime(shift_end[:8],  "%H:%M:%S")
+    except Exception:
+        return None, None
+
+    step = timedelta(minutes=15)
+
+    while current + timedelta(minutes=dur_minutes) <= end_dt:
+        b_s = current.strftime("%H:%M:%S")
+        b_e = (current + timedelta(minutes=dur_minutes)).strftime("%H:%M:%S")
+
+        # No overlap with already-placed breaks
+        if any(_overlaps(b_s, b_e, ps, pe) for ps, pe in already_placed):
+            current += step
+            continue
+
+        # Ratio check
+        if _ratio_allows_window(b_s, b_e, room_id, user_id, cov, r_staff):
+            return b_s, b_e
+
+        current += step
+
+    return None, None
 
 
 def _overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
