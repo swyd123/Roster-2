@@ -392,19 +392,25 @@ def _render_shift_table(shifts: list, room_map: dict):
 
 def _render_break_table(breaks: list):
     STATUS_ICON = {"scheduled": "✅", "manual_review": "🔍"}
-    TYPE_LABEL  = {"rest": "Rest (paid)", "meal": "Meal (unpaid)"}
+    TYPE_LABEL  = {
+        "rest":     "Rest (paid)",
+        "meal":     "Meal (unpaid)",
+        "combined": "50 min combined",
+    }
 
     rows = []
     for b in sorted(breaks, key=lambda x: (x.break_date, x.user_name, x.planned_start_time)):
         rows.append({
-            "Date":        b.break_date,
-            "Educator":    b.user_name,
-            "Type":        TYPE_LABEL.get(b.break_type, b.break_type.title()),
-            "Start":       b.planned_start_time[:5],
-            "End":         b.planned_end_time[:5],
-            "Duration":    f"{b.planned_duration_minutes} min",
-            "Status":      STATUS_ICON.get(b.status, "?") + " " + b.status.replace("_", " ").title(),
-            "Opt-out src": b.opt_out_source,
+            "Date":         b.break_date,
+            "Educator":     b.user_name,
+            "Type":         b.label if b.combined else TYPE_LABEL.get(b.break_type, b.break_type.title()),
+            "Start":        b.planned_start_time[:5],
+            "End":          b.planned_end_time[:5],
+            "Duration":     f"{b.planned_duration_minutes} min",
+            "Paid min":     b.paid_minutes,
+            "Unpaid min":   b.unpaid_minutes,
+            "Status":       STATUS_ICON.get(b.status, "?") + " " + b.status.replace("_", " ").title(),
+            "Opt-out src":  b.opt_out_source,
         })
 
     df = pd.DataFrame(rows)
