@@ -337,12 +337,16 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                         "user_id":     b.user_id,
                         "break_date":  b.break_date,
                         "break_type":  b.break_type,
-                        "planned_start_time":      b.planned_start_time,
-                        "planned_end_time":        b.planned_end_time,
+                        "planned_start_time":       b.planned_start_time,
+                        "planned_end_time":         b.planned_end_time,
                         "planned_duration_minutes": b.planned_duration_minutes,
+                        "paid_component_minutes":   getattr(b, "paid_minutes",   0),
+                        "unpaid_component_minutes": getattr(b, "unpaid_minutes", 0),
                         "status": b.status,
-                        "notes":  f"Auto-generated · {b.opt_out_source}"
-                                  + (" · MANUAL REVIEW" if b.status == "manual_review" else ""),
+                        "notes":  (
+                            f"Auto-generated · {b.opt_out_source}"
+                            + (" · MANUAL REVIEW" if b.status == "manual_review" else "")
+                        ),
                     }
                     for b in breaks
                 ]
