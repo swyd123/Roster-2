@@ -255,6 +255,11 @@ def generate_roster(
                 continue   # no break required
 
             suggestions = suggest_break_times(ss, se, ent)
+
+            room    = room_map.get(rid, {})
+            r_staff = room.get("required_ratio_staff",    1)
+            r_child = room.get("required_ratio_children", 4)
+
             # For combined suggestions: if ratio conflict, fall back to two separate
             if len(suggestions) == 1 and suggestions[0].get("combined"):
                 conflict_chk, _ = _check_break_impact(
@@ -266,10 +271,7 @@ def generate_roster(
                     from utils.break_engine import suggest_break_times_separate
                     suggestions = suggest_break_times_separate(ss, se, ent)
 
-            room        = room_map.get(rid, {})
-            r_staff     = room.get("required_ratio_staff",    1)
-            r_child     = room.get("required_ratio_children", 4)
-            shift_key   = f"{uid}_{date_str}"
+            shift_key = f"{uid}_{date_str}"
 
             for sug in suggestions:
                 btype    = sug["break_type"]
