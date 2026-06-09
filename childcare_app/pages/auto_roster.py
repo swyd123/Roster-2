@@ -403,12 +403,12 @@ def _render_break_table(breaks: list):
         rows.append({
             "Date":         b.break_date,
             "Educator":     b.user_name,
-            "Type":         b.label if b.combined else TYPE_LABEL.get(b.break_type, b.break_type.title()),
+            "Type":         (getattr(b, "label", None) or TYPE_LABEL.get(b.break_type, b.break_type.title())) if getattr(b, "combined", False) else TYPE_LABEL.get(b.break_type, b.break_type.title()),
             "Start":        b.planned_start_time[:5],
             "End":          b.planned_end_time[:5],
             "Duration":     f"{b.planned_duration_minutes} min",
-            "Paid min":     b.paid_minutes,
-            "Unpaid min":   b.unpaid_minutes,
+            "Paid min":     getattr(b, "paid_minutes", None),
+            "Unpaid min":   getattr(b, "unpaid_minutes", None),
             "Status":       STATUS_ICON.get(b.status, "?") + " " + b.status.replace("_", " ").title(),
             "Opt-out src":  b.opt_out_source,
         })
