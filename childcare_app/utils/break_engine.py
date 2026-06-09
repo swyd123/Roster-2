@@ -132,8 +132,9 @@ BREAK_STATUS_CONFIG = {
 }
 
 BREAK_TYPE_LABELS = {
-    "meal": "Meal Break (unpaid)",
-    "rest": "Rest Break (paid)",
+    "meal":     "Meal Break (unpaid)",
+    "rest":     "Rest Break (paid)",
+    "combined": "Combined Break (20 min paid + 30 min unpaid)",
 }
 
 
@@ -239,58 +240,158 @@ def suggest_break_times(
     """
     Suggest ideal break times spread across the shift.
 
-    Placement strategy:
-        Single rest break (10m or 20m) — at 40% of shift
-        Meal break (30m) — at 52% of shift (after rest)
-        Two rest breaks — at 25% and 65% of shift (legacy rule support)
+    For 7+ hour shifts (paid_duration=20, has_meal=True), attempts to produce
+    one combined 50-minute block (20 min paid + 30 min unpaid).  A combined
+    suggestion carries:
+        break_type         "combined"
+        duration_minutes   50
+        paid_minutes       20
+        unpaid_minutes     30
+        label              "50 min combined break"
+        combined           True
 
-    Returns list of {break_type, planned_start, planned_end, duration_minutes}.
+    If the caller's ratio-check rejects the 50-min window it should call
+    suggest_break_times_separate() to get the two distinct blocks instead.
+
+    For all other tiers, returns the separate paid/unpaid blocks as before.
+
+    Returns list of suggestion dicts:
+        {break_type, planned_start, planned_end, duration_minutes,
+         paid_minutes, unpaid_minutes, combined, label}
     """
-    suggestions = []
     shift_mins  = shift_duration_minutes(shift_start, shift_end)
     if shift_mins <= 0:
-        return suggestions
+        return []
 
     try:
         start_dt = datetime.strptime(shift_start[:5], "%H:%M")
     except Exception:
-        return suggestions
+        return []
 
-    paid_count  = entitlement.get("paid_count",    0)
-    paid_dur    = entitlement.get("paid_duration",  10)
-    has_meal    = entitlement.get("has_meal",       False)
+    paid_count = entitlement.get("paid_count",    0)
+    paid_dur   = entitlement.get("paid_duration",  10)
+    has_meal   = entitlement.get("has_meal",       False)
 
-    # Place paid rest break(s)
+    # ── 7+ hour shift: try a single combined 50-min block ─────────────
+    if paid_dur == 20 and paid_count == 1 and has_meal:
+        return _suggest_combined(start_dt, shift_mins, shift_start, shift_end)
+
+    # ── All other tiers: separate paid then meal ───────────────────────
+    return _suggest_separate(start_dt, shift_mins, paid_count, paid_dur, has_meal)
+
+
+def suggest_break_times_separate(
+    shift_start: str,
+    shift_end: str,
+    entitlement: dict,
+) -> list[dict]:
+    """
+    Return separate paid-rest and meal-break suggestions unconditionally.
+    Call this as the fallback when a combined 50-min block causes a ratio issue.
+    """
+    shift_mins = shift_duration_minutes(shift_start, shift_end)
+    if shift_mins <= 0:
+        return []
+    try:
+        start_dt = datetime.strptime(shift_start[:5], "%H:%M")
+    except Exception:
+        return []
+
+    paid_count = entitlement.get("paid_count",   0)
+    paid_dur   = entitlement.get("paid_duration", 10)
+    has_meal   = entitlement.get("has_meal",      False)
+    return _suggest_separate(start_dt, shift_mins, paid_count, paid_dur, has_meal)
+
+
+def _suggest_combined(
+    start_dt: "datetime",
+    shift_mins: int,
+    shift_start: str,
+    shift_end: str,
+) -> list[dict]:
+    """
+    Produce one 50-min combined suggestion (20 paid + 30 unpaid).
+    Preferred window: 11:00–14:30 (to fit a 50-min block before 14:30).
+    Falls back to 45% of the shift if the preferred window doesn't fit.
+    """
+    combined_dur = 50
+    pref_from    = datetime(1900, 1, 1, 11, 0)
+    pref_until   = datetime(1900, 1, 1, 14, 30)
+
+    try:
+        ss_dt = datetime.strptime(shift_start[:5], "%H:%M")
+        se_dt = datetime.strptime(shift_end[:5],   "%H:%M")
+    except Exception:
+        ss_dt = start_dt
+        se_dt = start_dt + timedelta(minutes=shift_mins)
+
+    # Try to place inside 11:00–14:30
+    window_start = max(ss_dt, pref_from)
+    window_end   = min(se_dt, pref_until)
+
+    if window_start + timedelta(minutes=combined_dur) <= window_end:
+        # Centre it in the preferred window
+        available  = (window_end - window_start).total_seconds() / 60
+        pad        = max(0, (available - combined_dur) / 2)
+        b_start_dt = window_start + timedelta(minutes=pad)
+    else:
+        # Fallback: 45% through the shift
+        b_start_dt = start_dt + timedelta(minutes=int(shift_mins * 0.45))
+
+    b_end_dt = b_start_dt + timedelta(minutes=combined_dur)
+
+    # Clamp to shift bounds
+    if b_end_dt > se_dt:
+        b_end_dt   = se_dt
+        b_start_dt = b_end_dt - timedelta(minutes=combined_dur)
+        if b_start_dt < ss_dt:
+            b_start_dt = ss_dt
+
+    return [{
+        "break_type":       "combined",
+        "planned_start":    b_start_dt.strftime("%H:%M:%S"),
+        "planned_end":      b_end_dt.strftime("%H:%M:%S"),
+        "duration_minutes": combined_dur,
+        "paid_minutes":     20,
+        "unpaid_minutes":   30,
+        "combined":         True,
+        "label":            "50 min combined break",
+    }]
+
+
+def _suggest_separate(
+    start_dt: "datetime",
+    shift_mins: int,
+    paid_count: int,
+    paid_dur: int,
+    has_meal: bool,
+) -> list[dict]:
+    """Place paid rest break(s) and meal break separately."""
+    suggestions = []
+
+    def _mk(t, dur, btype):
+        return {
+            "break_type":       btype,
+            "planned_start":    t.strftime("%H:%M:%S"),
+            "planned_end":      (t + timedelta(minutes=dur)).strftime("%H:%M:%S"),
+            "duration_minutes": dur,
+            "paid_minutes":     dur if btype == "rest" else 0,
+            "unpaid_minutes":   dur if btype == "meal" else 0,
+            "combined":         False,
+            "label":            BREAK_TYPE_LABELS.get(btype, btype.title()),
+        }
+
     if paid_count == 1:
         offset = int(shift_mins * 0.40)
-        t      = start_dt + timedelta(minutes=offset)
-        suggestions.append({
-            "break_type":       "rest",
-            "planned_start":    t.strftime("%H:%M:%S"),
-            "planned_end":      (t + timedelta(minutes=paid_dur)).strftime("%H:%M:%S"),
-            "duration_minutes": paid_dur,
-        })
+        suggestions.append(_mk(start_dt + timedelta(minutes=offset), paid_dur, "rest"))
     elif paid_count == 2:
         for frac in [0.25, 0.65]:
             offset = int(shift_mins * frac)
-            t      = start_dt + timedelta(minutes=offset)
-            suggestions.append({
-                "break_type":       "rest",
-                "planned_start":    t.strftime("%H:%M:%S"),
-                "planned_end":      (t + timedelta(minutes=paid_dur)).strftime("%H:%M:%S"),
-                "duration_minutes": paid_dur,
-            })
+            suggestions.append(_mk(start_dt + timedelta(minutes=offset), paid_dur, "rest"))
 
-    # Meal break (unpaid, 30m) — past midpoint so rest comes first
     if has_meal:
         offset = int(shift_mins * 0.52)
-        t      = start_dt + timedelta(minutes=offset)
-        suggestions.append({
-            "break_type":       "meal",
-            "planned_start":    t.strftime("%H:%M:%S"),
-            "planned_end":      (t + timedelta(minutes=30)).strftime("%H:%M:%S"),
-            "duration_minutes": 30,
-        })
+        suggestions.append(_mk(start_dt + timedelta(minutes=offset), 30, "meal"))
 
     return suggestions
 
@@ -380,6 +481,13 @@ def generate_break_recommendations(
             continue
 
         suggestions = suggest_break_times(ss + ":00", se + ":00", ent)
+
+        # For combined suggestions: if ratio conflict, fall back to separate blocks
+        if len(suggestions) == 1 and suggestions[0].get("combined"):
+            sug = suggestions[0]
+            conflict, _ = _check_break_ratio_conflict(sug, rid, uid, room_d, room_staff_counts)
+            if conflict == "breach":
+                suggestions = suggest_break_times_separate(ss + ":00", se + ":00", ent)
 
         # Check ratio impact for each suggested break
         ratio_conflict  = False
