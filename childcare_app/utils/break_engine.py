@@ -318,12 +318,12 @@ def _suggest_combined(
     """
     Produce one combined suggestion (paid_component + 30 min unpaid).
     Preferred window: 11:00 – (preferred_until) where preferred_until is
-    set so the full block fits before 14:30.
+    set so the full block fits before 15:00.
     Falls back to 45% of the shift if the preferred window doesn't fit.
     """
     combined_dur  = paid_component + 30
     pref_from     = datetime(1900, 1, 1, 11, 0)
-    pref_until    = datetime(1900, 1, 1, 14, 30)
+    pref_until    = datetime(1900, 1, 1, 15, 0)
 
     try:
         ss_dt = datetime.strptime(shift_start[:5], "%H:%M")
@@ -332,7 +332,7 @@ def _suggest_combined(
         ss_dt = start_dt
         se_dt = start_dt + timedelta(minutes=shift_mins)
 
-    # Try to place inside 11:00–14:30
+    # Try to place inside 11:00–15:00
     window_start = max(ss_dt, pref_from)
     window_end   = min(se_dt, pref_until)
 
