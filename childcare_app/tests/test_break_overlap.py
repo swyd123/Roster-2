@@ -633,6 +633,37 @@ class TestValidateBreakOverlaps:
             f"Day 2 non-overlapping breaks should stay as 2, got {len(day2_breaks)}"
         )
 
+    def test_window_shift_does_not_create_overlap(self):
+        """
+        Regression: Bonnie Cheng 2026-05-18 bug.
+
+        When suggest_break_times_separate places rest at 12:26–12:36 and then
+        _shift_break_to_window moves meal to 12:30–13:00, the meal must be
+        pushed forward to start no earlier than the rest break ends (12:36).
+
+        Hard assertion: no two scheduled/non-manual-review breaks for the same
+        educator on the same date may overlap.
+        """
+        rest = self._break("12:26:00", "12:36:00", "rest", paid=10, unpaid=0)
+        meal = self._break("12:30:00", "13:00:00", "meal", paid=0,  unpaid=30)
+        resolved, warns = self._run([rest, meal], n_staff=3)
+
+        from itertools import combinations
+        for a, b in combinations(resolved, 2):
+            if a.user_id == b.user_id and a.break_date == b.break_date:
+                if _overlaps(
+                    a.planned_start_time, a.planned_end_time,
+                    b.planned_start_time, b.planned_end_time,
+                ):
+                    # Both must be manual_review — any other overlap is a bug
+                    assert a.status == "manual_review" and b.status == "manual_review", (
+                        f"Overlap found outside manual_review: "
+                        f"{a.break_type} {a.planned_start_time[:5]}-{a.planned_end_time[:5]} "
+                        f"({a.status}) ∩ "
+                        f"{b.break_type} {b.planned_start_time[:5]}-{b.planned_end_time[:5]} "
+                        f"({b.status})"
+                    )
+
 
 # ── Tiny helper used only in tests ────────────────────────────────────────────
 
