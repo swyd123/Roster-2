@@ -289,10 +289,10 @@ def generate_roster(
                 b_start  = sug["planned_start"][:8]
                 b_end    = sug["planned_end"][:8]
 
-                # Prefer unpaid (meal) or combined breaks 11:00–14:30
+                # Prefer unpaid (meal) or combined breaks 11:00–15:00
                 if btype in ("meal", "combined"):
                     b_start, b_end = _shift_break_to_window(
-                        b_start, b_end, b_dur, ss, se, "11:00:00", "14:30:00"
+                        b_start, b_end, b_dur, ss, se, "11:00:00", "15:00:00"
                     )
 
                 # Hard clamp: if the shifted break now overlaps a break this
