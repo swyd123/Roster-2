@@ -286,8 +286,7 @@ def _render_recommendations_table(recommendations: list[dict]):
             + (
                 "".join(
                     f'<span style="font-size:0.75rem;color:#475569;margin-right:1rem;">'
-                    f'{"☕" if s["break_type"] == "meal" else "☕"} '
-                    f'{"Meal" if s["break_type"] == "meal" else "Rest"} '
+                    f'☕ {s.get("label") or BREAK_TYPE_LABELS.get(s["break_type"], s["break_type"].title())} '
                     f'{s["planned_start"][:5]}–{s["planned_end"][:5]} '
                     f'({s["duration_minutes"]}min)</span>'
                     for s in sugs
