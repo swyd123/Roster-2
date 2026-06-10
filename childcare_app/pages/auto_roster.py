@@ -412,51 +412,151 @@ def _render_shift_table(shifts: list, room_map: dict):
     st.caption("⭐ Primary room assignment  ·  ✅ Available  ·  ⚠️ Unmatched")
 
 
+def _collapse_breaks(breaks: list) -> list[dict]:
+    """
+    Collapse the raw SuggestedBreak list into display rows.
+
+    Groups by (date, educator_name).  Within each group, sorts by start time
+    then walks adjacent pairs: if two breaks overlap OR share the same
+    combined-period window, they are merged into one display dict.
+
+    Merge rules:
+      • start      = min of both starts
+      • end        = max of both ends
+      • paid_min   = sum
+      • unpaid_min = sum
+      • duration   = minutes from merged start to merged end
+      • break_type = "combined" when both paid_min > 0 and unpaid_min > 0,
+                     else whichever type has non-zero minutes
+      • status     = "manual_review" if either source row has that status,
+                     otherwise "scheduled"
+      • opt_out    = kept from the first row (both should agree)
+
+    Non-overlapping breaks are emitted as separate display dicts.
+    """
+    from datetime import datetime as _dt
+
+    def _mins(s: str, e: str) -> int:
+        try:
+            return max(0, int(
+                (_dt.strptime(e[:5], "%H:%M") - _dt.strptime(s[:5], "%H:%M"))
+                .total_seconds() / 60
+            ))
+        except Exception:
+            return 0
+
+    def _overlaps_display(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+        return a_start < b_end and b_start < a_end
+
+    # Group by (date, educator)
+    from collections import defaultdict
+    groups: dict[tuple, list] = defaultdict(list)
+    for b in breaks:
+        groups[(b.break_date, b.user_name)].append(b)
+
+    display_rows: list[dict] = []
+
+    for (date_str, educator), group in sorted(groups.items()):
+        # Sort within group by start time
+        group.sort(key=lambda b: b.planned_start_time)
+
+        # Walk and merge overlapping / same-window pairs
+        # Use plain dicts as accumulators so we can freely mutate them
+        accum: list[dict] = []
+        for b in group:
+            b_start = b.planned_start_time[:8]
+            b_end   = b.planned_end_time[:8]
+            b_paid   = getattr(b, "paid_minutes",   0) or 0
+            b_unpaid = getattr(b, "unpaid_minutes", 0) or 0
+            b_status = b.status or "scheduled"
+            b_opt    = b.opt_out_source or ""
+
+            if accum and _overlaps_display(
+                accum[-1]["_start"], accum[-1]["_end"], b_start, b_end
+            ):
+                # Merge into the last accumulator entry
+                prev = accum[-1]
+                prev["_start"]   = min(prev["_start"],   b_start)
+                prev["_end"]     = max(prev["_end"],     b_end)
+                prev["paid"]    += b_paid
+                prev["unpaid"]  += b_unpaid
+                if b_status == "manual_review":
+                    prev["status"] = "manual_review"
+            else:
+                accum.append({
+                    "_start":  b_start,
+                    "_end":    b_end,
+                    "paid":    b_paid,
+                    "unpaid":  b_unpaid,
+                    "status":  b_status,
+                    "opt_out": b_opt,
+                })
+
+        for row in accum:
+            paid    = row["paid"]
+            unpaid  = row["unpaid"]
+            start5  = row["_start"][:5]
+            end5    = row["_end"][:5]
+            dur     = _mins(row["_start"], row["_end"])
+
+            if paid > 0 and unpaid > 0:
+                btype = "Combined break"
+            elif paid > 0:
+                btype = "Rest (paid)"
+            else:
+                btype = "Meal (unpaid)"
+
+            STATUS_ICON = {"scheduled": "✅", "manual_review": "🔍"}
+            status_str = row["status"]
+            status_display = (
+                STATUS_ICON.get(status_str, "?") + " "
+                + status_str.replace("_", " ").title()
+            )
+
+            display_rows.append({
+                "Date":       date_str,
+                "Educator":   educator,
+                "Break":      btype,
+                "Start":      start5,
+                "End":        end5,
+                "Duration":   f"{dur} min",
+                "Paid min":   paid   if paid   > 0 else "—",
+                "Unpaid min": unpaid if unpaid > 0 else "—",
+                "Status":     status_display,
+                "Opt-out":    row["opt_out"],
+            })
+
+    return display_rows
+
+
 def _render_break_table(breaks: list):
     """
     Render the generated break schedule table.
-    Reads directly from SuggestedBreak objects — does NOT recalculate.
+
+    Calls _collapse_breaks first so that two SuggestedBreak objects that
+    occupy the same or overlapping window for the same educator/date are
+    always shown as one combined display row — never as two separate rows
+    with overlapping times.
     """
-    STATUS_ICON = {"scheduled": "✅", "manual_review": "🔍"}
-    # Fallback label map for breaks that lack a label attribute
-    TYPE_LABEL  = {
-        "rest":     "Rest (paid)",
-        "meal":     "Meal (unpaid)",
-        "combined": "Combined break",
-    }
+    if not breaks:
+        st.info("No breaks generated.")
+        return
 
-    rows = []
-    for b in sorted(breaks, key=lambda x: (x.break_date, x.user_name, x.planned_start_time)):
-        # Use label attribute when present (combined breaks carry their own label)
-        b_label = getattr(b, "label", None)
-        b_combined = getattr(b, "combined", False)
-        display_type = (
-            b_label or TYPE_LABEL.get(b.break_type, b.break_type.title())
-            if b_combined
-            else TYPE_LABEL.get(b.break_type, b.break_type.title())
-        )
-        rows.append({
-            "Date":        b.break_date,
-            "Educator":    b.user_name,
-            "Break":       display_type,
-            "Start":       b.planned_start_time[:5],
-            "End":         b.planned_end_time[:5],
-            "Duration":    f"{b.planned_duration_minutes} min",
-            "Paid min":    getattr(b, "paid_minutes",   "—"),
-            "Unpaid min":  getattr(b, "unpaid_minutes", "—"),
-            "Status":      STATUS_ICON.get(b.status, "?") + " " + b.status.replace("_", " ").title(),
-            "Opt-out":     b.opt_out_source,
-        })
+    display_rows = _collapse_breaks(breaks)
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(display_rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    n_combined = sum(1 for b in breaks if getattr(b, "combined", False))
-    n_separate = len(breaks) - n_combined
+    n_combined = sum(1 for r in display_rows if r["Break"] == "Combined break")
+    n_separate = len(display_rows) - n_combined
+    n_review   = sum(1 for r in display_rows if "Manual Review" in r["Status"])
     notes = []
     if n_combined:
         notes.append(f"🔵 {n_combined} combined block(s)")
     if n_separate:
         notes.append(f"⚪ {n_separate} separate break(s)")
-    notes.append("🔍 = manual review required")
+    if n_review:
+        notes.append(f"🔍 {n_review} manual review")
+    else:
+        notes.append("🔍 = manual review required")
     st.caption("  ·  ".join(notes))
