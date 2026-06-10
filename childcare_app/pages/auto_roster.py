@@ -171,6 +171,9 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     from utils.break_engine import BREAK_RULES_DEFAULT
     room_map = {r["id"]: r["name"] for r in rooms}
 
+    movements = getattr(result, "movements", [])
+    n_movements = len(movements)
+
     shifts = result.shifts
     breaks = result.breaks
 
@@ -182,16 +185,19 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     n_unmet       = len(result.unmet_rooms)
 
     st.markdown("### 📊 Generation Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Shifts suggested",  n_shifts)
     m2.metric("Breaks suggested",  n_breaks)
-    m3.metric("Ratio warnings",    n_ratio_warn,
+    m3.metric("Movements needed",  n_movements,
+              delta="cover required" if n_movements else None,
+              delta_color="normal" if n_movements else "off")
+    m4.metric("Ratio warnings",    n_ratio_warn,
               delta="review needed" if n_ratio_warn else None,
               delta_color="inverse" if n_ratio_warn else "off")
-    m4.metric("Break conflicts",   n_review_warn,
+    m5.metric("Break conflicts",   n_review_warn,
               delta="manual review" if n_review_warn else None,
               delta_color="inverse" if n_review_warn else "off")
-    m5.metric("Rooms unstaffed",   n_unmet,
+    m6.metric("Rooms unstaffed",   n_unmet,
               delta="no staff available" if n_unmet else None,
               delta_color="inverse" if n_unmet else "off")
 
@@ -262,6 +268,17 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
 
     # ── Save buttons ──────────────────────────────────────────────────
     st.markdown("---")
+
+    # Movements table (before save section)
+    if movements:
+        st.markdown("### 🔄 Temporary Educator Movements")
+        st.caption(
+            "These movements are required to maintain room ratios during breaks. "
+            "They are suggestions only — do not change permanent shift assignments."
+        )
+        _render_movement_table(movements)
+        st.markdown("---")
+
     st.markdown("### 💾 Save Generated Data")
 
     existing_periods  = fetch_roster_periods(centre_id, limit=5)
@@ -560,3 +577,28 @@ def _render_break_table(breaks: list):
     else:
         notes.append("🔍 = manual review required")
     st.caption("  ·  ".join(notes))
+
+
+def _render_movement_table(movements: list) -> None:
+    """
+    Render a simple table of temporary educator movements required for break cover.
+    Each row: Educator | From room | To room | Date | Start | End | Reason
+    """
+    rows = []
+    for mv in sorted(movements, key=lambda m: (m.move_date, m.start_time)):
+        rows.append({
+            "Educator":    mv.educator_name,
+            "From room":   mv.from_room_name,
+            "To room":     mv.to_room_name,
+            "Date":        mv.move_date,
+            "Start":       mv.start_time[:5],
+            "End":         mv.end_time[:5],
+            "Covering for": mv.covering_for_name,
+            "Reason":      mv.reason,
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 These are temporary moves only. "
+            "Original shift room assignments are unchanged."
+        )
