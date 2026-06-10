@@ -269,18 +269,13 @@ def generate_roster(
             r_staff = room.get("required_ratio_staff",    1)
             r_child = room.get("required_ratio_children", 4)
 
-            # For combined suggestions: if ratio conflict, fall back to two separate
-            if len(suggestions) == 1 and suggestions[0].get("combined"):
-                conflict_chk, _ = _check_break_impact(
-                    suggestions[0]["planned_start"][:8],
-                    suggestions[0]["planned_end"][:8],
-                    rid, uid, room_coverage, breaks_by_room,
-                    breaks_by_user, r_staff, r_child,
-                )
-                if conflict_chk == "breach":
-                    from utils.break_engine import suggest_break_times_separate
-                    suggestions = suggest_break_times_separate(ss, se, ent)
-
+            # When the combined suggestion has a ratio conflict, do NOT fall
+            # back to two separate breaks.  Keep the combined suggestion and
+            # let the _check_break_impact path below mark it manual_review.
+            # Two separate manual_review breaks are never better than one
+            # combined manual_review break.
+            # The only reason to split is an educator-overlap conflict, which
+            # is checked per-suggestion below.
             shift_key = f"{uid}_{date_str}"
 
             for sug in suggestions:
@@ -403,6 +398,16 @@ def generate_roster(
                 breaks_by_user.setdefault(uid, []).append(
                     (b_start, b_end, False)   # False = not a fixed/pre-existing break
                 )
+
+    # ── Post-generation merge: combine separate rest+meal into one block ──
+    # When the initial combined suggestion was rejected by the ratio check,
+    # the loop falls back to two separate breaks placed far apart.
+    # This step finds those pairs and attempts to merge them into one
+    # combined SuggestedBreak, trying the preferred window first.
+    all_breaks, merge_warns = _merge_separate_rest_and_meal(
+        all_breaks, all_shifts, room_map,
+    )
+    review_warns.extend(merge_warns)
 
     # ── Final validation pass: resolve any remaining per-educator overlaps ──
     # This runs after all break generation, fixed-break, paid/unpaid, and
@@ -746,6 +751,213 @@ def _build_room_coverage(
             if shift.start_time <= slot < shift.end_time:
                 result[rid][slot] = result[rid].get(slot, 0) + 1
     return result
+
+
+def _merge_separate_rest_and_meal(
+    breaks: list[SuggestedBreak],
+    shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+) -> tuple[list[SuggestedBreak], list[str]]:
+    """
+    Post-generation merge pass.
+
+    When the initial combined suggestion was rejected by the ratio check, the
+    engine falls back to two separate SuggestedBreak objects (rest + meal)
+    placed at different times with a gap between them.  This step finds those
+    pairs and collapses them into one combined SuggestedBreak.
+
+    Algorithm per (user_id, break_date) group:
+      1. If the group has exactly one 'rest' and one 'meal' break, try to merge.
+      2. Try anchor A — meal-anchored (preferred window):
+            combined_start = meal_start − paid_component_minutes
+            combined_end   = meal_end
+         If combined_start < shift_start, clamp to shift_start and extend end.
+      3. If anchor A causes a ratio breach, try anchor B — rest-anchored:
+            combined_start = rest_start
+            combined_end   = rest_start + total_combined_minutes
+      4. If both anchors fail, keep the breaks separate and add a warning.
+      5. When a merge succeeds, remove both originals and emit one SuggestedBreak
+         with break_type="combined", combined=True, the correct label, and
+         paid_minutes / unpaid_minutes preserved separately.
+
+    Does not modify groups that already contain a combined break.
+    """
+    from collections import defaultdict
+
+    review_warns: list[str] = []
+
+    # Build per-day room coverage and shift lookup
+    shift_by_uid_date: dict[tuple, SuggestedShift] = {
+        (s.user_id, s.shift_date): s for s in shifts
+    }
+    day_coverage: dict[str, dict[str, dict[str, int]]] = {}
+    for s in shifts:
+        d = s.shift_date
+        if d not in day_coverage:
+            day_coverage[d] = _build_room_coverage(
+                [x for x in shifts if x.shift_date == d], room_map
+            )
+
+    # Group breaks
+    groups: dict[tuple, list[SuggestedBreak]] = defaultdict(list)
+    for b in breaks:
+        groups[(b.user_id, b.break_date)].append(b)
+
+    result: list[SuggestedBreak] = []
+
+    for (uid, date_str), group in groups.items():
+        # Only touch groups that have exactly one rest + one meal, no combined
+        rest_breaks = [b for b in group if b.break_type == "rest"]
+        meal_breaks = [b for b in group if b.break_type == "meal"]
+        has_combined = any(b.break_type == "combined" for b in group)
+
+        if has_combined or len(rest_breaks) != 1 or len(meal_breaks) != 1:
+            result.extend(group)
+            continue
+
+        rest = rest_breaks[0]
+        meal = meal_breaks[0]
+
+        # Don't merge if the meal was opted out (unpaid_minutes == 0 on meal)
+        if meal.unpaid_minutes == 0:
+            result.extend(group)
+            continue
+
+        paid_comp   = rest.paid_minutes   or rest.planned_duration_minutes
+        unpaid_comp = meal.unpaid_minutes or meal.planned_duration_minutes
+        total_dur   = paid_comp + unpaid_comp
+        label       = f"{total_dur} min combined break"
+
+        shift_rec   = shift_by_uid_date.get((uid, date_str))
+        shift_start = shift_rec.start_time if shift_rec else "06:00:00"
+        shift_end   = shift_rec.end_time   if shift_rec else "21:00:00"
+        rid         = shift_rec.room_id if shift_rec else None
+        room        = room_map.get(rid, {}) if rid else {}
+        r_staff     = room.get("required_ratio_staff", 1)
+        cov         = day_coverage.get(date_str, {})
+
+        merged_brk: SuggestedBreak | None = None
+
+        # ── Anchor A: meal-anchored (shift meal break left by paid_comp) ──
+        meal_start = meal.planned_start_time
+        meal_end   = meal.planned_end_time
+        cand_start = _subtract_minutes(meal_start, paid_comp)
+        cand_end   = meal_end
+
+        # Clamp to shift start if needed
+        if cand_start < shift_start:
+            cand_start = shift_start
+            cand_end   = _add_minutes(cand_start, total_dur)
+
+        if cand_end <= shift_end and _ratio_allows_window(
+            cand_start, cand_end, rid, uid, cov, r_staff
+        ):
+            merged_brk = _make_combined_break(
+                rest, cand_start, cand_end, paid_comp, unpaid_comp,
+                total_dur, label, date_str, uid,
+            )
+
+        # ── Anchor B: rest-anchored ───────────────────────────────────────
+        if merged_brk is None:
+            rest_start = rest.planned_start_time
+            cand_start = rest_start
+            cand_end   = _add_minutes(cand_start, total_dur)
+
+            if cand_end <= shift_end and _ratio_allows_window(
+                cand_start, cand_end, rid, uid, cov, r_staff
+            ):
+                merged_brk = _make_combined_break(
+                    rest, cand_start, cand_end, paid_comp, unpaid_comp,
+                    total_dur, label, date_str, uid,
+                )
+
+        if merged_brk is not None:
+            result.append(merged_brk)
+        else:
+            # Ratio or shift constraints prevent a clean combined window.
+            # Still emit ONE combined manual_review break rather than two
+            # separate ones — anchored at the meal break time.
+            fallback_start = _subtract_minutes(meal.planned_start_time, paid_comp)
+            if fallback_start < shift_start:
+                fallback_start = shift_start
+            fallback_end = _add_minutes(fallback_start, total_dur)
+            if fallback_end > shift_end:
+                fallback_end = shift_end
+                fallback_start = _subtract_minutes(fallback_end, total_dur)
+
+            fallback_brk = SuggestedBreak(
+                user_id=uid,
+                user_name=rest.user_name,
+                shift_key=rest.shift_key,
+                break_date=date_str,
+                break_type="combined",
+                planned_start_time=fallback_start,
+                planned_end_time=fallback_end,
+                planned_duration_minutes=total_dur,
+                paid_minutes=paid_comp,
+                unpaid_minutes=unpaid_comp,
+                combined=True,
+                label=label,
+                status="manual_review",
+                opt_out_source=rest.opt_out_source,
+                warnings=["Could not combine breaks due to ratio/shift constraints."],
+            )
+            result.append(fallback_brk)
+            review_warns.append(
+                f"{rest.user_name} on {date_str}: "
+                "Could not combine breaks due to ratio/shift constraints. "
+                "Combined break requires manual review."
+            )
+
+    return result, review_warns
+
+
+def _subtract_minutes(t: str, mins: int) -> str:
+    """Subtract mins from an HH:MM:SS string, return HH:MM:SS."""
+    try:
+        dt = datetime.strptime(t[:8], "%H:%M:%S") - timedelta(minutes=mins)
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return t
+
+
+def _add_minutes(t: str, mins: int) -> str:
+    """Add mins to an HH:MM:SS string, return HH:MM:SS."""
+    try:
+        dt = datetime.strptime(t[:8], "%H:%M:%S") + timedelta(minutes=mins)
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return t
+
+
+def _make_combined_break(
+    rest: "SuggestedBreak",
+    start: str,
+    end: str,
+    paid_comp: int,
+    unpaid_comp: int,
+    total_dur: int,
+    label: str,
+    date_str: str,
+    uid: str,
+) -> "SuggestedBreak":
+    """Construct one combined SuggestedBreak from a rest+meal pair."""
+    return SuggestedBreak(
+        user_id=uid,
+        user_name=rest.user_name,
+        shift_key=rest.shift_key,
+        break_date=date_str,
+        break_type="combined",
+        planned_start_time=start,
+        planned_end_time=end,
+        planned_duration_minutes=total_dur,
+        paid_minutes=paid_comp,
+        unpaid_minutes=unpaid_comp,
+        combined=True,
+        label=label,
+        status="scheduled",
+        opt_out_source=rest.opt_out_source,
+    )
 
 
 def _validate_and_resolve_break_overlaps(
