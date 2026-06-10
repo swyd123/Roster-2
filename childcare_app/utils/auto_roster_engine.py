@@ -71,12 +71,35 @@ class SuggestedBreak:
 
 
 @dataclass
+class SuggestedMovement:
+    """
+    A temporary room movement created to provide break cover.
+    The educator moves from their rostered room to a receiving room
+    for the duration of the break being covered.
+    Does NOT change the educator's permanent shift room assignment.
+    """
+    educator_id:         str
+    educator_name:       str
+    from_room_id:        str
+    from_room_name:      str
+    to_room_id:          str
+    to_room_name:        str
+    start_time:          str   # HH:MM:SS
+    end_time:            str   # HH:MM:SS
+    move_date:           str   # YYYY-MM-DD
+    covering_for_uid:    str   # user_id of the educator on break
+    covering_for_name:   str
+    reason:              str   # human-readable explanation
+
+
+@dataclass
 class RosterResult:
-    shifts:         list[SuggestedShift]
-    breaks:         list[SuggestedBreak]
-    ratio_warnings: list[str]           # rooms/slots still under-staffed
-    review_warnings: list[str]          # break scheduling failures
-    unmet_rooms:    list[str]           # room names with no staff available
+    shifts:          list[SuggestedShift]
+    breaks:          list[SuggestedBreak]
+    movements:       list[SuggestedMovement]   # temporary break-cover movements
+    ratio_warnings:  list[str]
+    review_warnings: list[str]
+    unmet_rooms:     list[str]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,12 +145,13 @@ def generate_roster(
     active_rules = break_rules or BREAK_RULES_DEFAULT
 
     # ── Flatten staff to this centre, build lookup tables ─────────────
-    centre_staff  = _build_centre_staff(staff, centre_id)
-    all_shifts:    list[SuggestedShift] = []
-    all_breaks:    list[SuggestedBreak] = []
-    ratio_warns:   list[str]            = []
-    review_warns:  list[str]            = []
-    unmet_rooms:   list[str]            = []
+    centre_staff    = _build_centre_staff(staff, centre_id)
+    all_shifts:     list[SuggestedShift]    = []
+    all_breaks:     list[SuggestedBreak]    = []
+    all_movements:  list[SuggestedMovement] = []
+    ratio_warns:    list[str]               = []
+    review_warns:   list[str]               = []
+    unmet_rooms:    list[str]               = []
 
     room_map = {r["id"]: r for r in rooms}
 
@@ -239,9 +263,11 @@ def generate_roster(
 
         # breaks_by_room: {room_id:  [(start, end), ...]}   — room-level stagger
         # breaks_by_user: {user_id:  [(start, end, fixed)]} — per-educator overlap guard
-        # "fixed" = True means this break must not be moved (e.g. a pre-existing record)
+        # cover_delta:    {room_id: {slot: int}}             — temporary cover additions
         breaks_by_room: dict[str, list[tuple[str, str]]]        = {}
         breaks_by_user: dict[str, list[tuple[str, str, bool]]]  = {}
+        cover_delta:    dict[str, dict[str, int]]               = {}
+        day_movements:  list[SuggestedMovement]                  = []
 
         for shift in day_shifts:
             uid  = shift.user_id
@@ -269,13 +295,6 @@ def generate_roster(
             r_staff = room.get("required_ratio_staff",    1)
             r_child = room.get("required_ratio_children", 4)
 
-            # When the combined suggestion has a ratio conflict, do NOT fall
-            # back to two separate breaks.  Keep the combined suggestion and
-            # let the _check_break_impact path below mark it manual_review.
-            # Two separate manual_review breaks are never better than one
-            # combined manual_review break.
-            # The only reason to split is an educator-overlap conflict, which
-            # is checked per-suggestion below.
             shift_key = f"{uid}_{date_str}"
 
             for sug in suggestions:
@@ -284,79 +303,80 @@ def generate_roster(
                 b_start  = sug["planned_start"][:8]
                 b_end    = sug["planned_end"][:8]
 
-                # Prefer unpaid (meal) or combined breaks 11:00–15:00
+                # Prefer combined/meal breaks 11:00–15:00
                 if btype in ("meal", "combined"):
                     b_start, b_end = _shift_break_to_window(
                         b_start, b_end, b_dur, ss, se, "11:00:00", "15:00:00"
                     )
 
-                # Hard clamp: if the shifted break now overlaps a break this
-                # educator already has today, push it forward to start at the
-                # latest already-placed break end (still within the shift).
-                # This prevents _shift_break_to_window from moving a meal break
-                # backwards into a rest break that was already placed.
+                # Hard clamp against existing educator breaks
                 for ex_s, ex_e, _ in breaks_by_user.get(uid, []):
                     if _overlaps(b_start, b_end, ex_s, ex_e):
-                        # Push forward: new start = ex_e, recalculate end
                         if ex_e < se:
                             b_start = ex_e
-                            b_end_dt = datetime.strptime(b_start[:8], "%H:%M:%S") + timedelta(minutes=b_dur)
-                            b_end = b_end_dt.strftime("%H:%M:%S")
-                            # If pushed end exceeds shift end, let _check_break_impact handle it
+                            b_end   = (datetime.strptime(b_start[:8], "%H:%M:%S")
+                                       + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
                         break
 
-                # Check educator-level overlap AND room ratio impact
+                # Check ratio impact (including any cover already arranged)
                 conflict, reason = _check_break_impact(
                     b_start, b_end, rid, uid,
-                    room_coverage, breaks_by_room,
-                    breaks_by_user, r_staff, r_child,
+                    room_coverage, breaks_by_room, breaks_by_user,
+                    r_staff, r_child, cover_delta,
                 )
 
+                cover_used: SuggestedMovement | None = None
+
                 if conflict == "breach":
-                    # Try to find an alternate window that avoids both conflicts
-                    alt_start, alt_end, alt_conflict = _find_alt_break_window(
+                    # Try to find an alternate window before seeking cover
+                    alt_s, alt_e, alt_conflict = _find_alt_break_window(
                         ss, se, b_dur, rid, uid,
-                        room_coverage, breaks_by_room,
-                        breaks_by_user, r_staff, r_child,
+                        room_coverage, breaks_by_room, breaks_by_user,
+                        r_staff, r_child, cover_delta,
                     )
-                    if alt_conflict:
-                        brk = SuggestedBreak(
-                            user_id=uid, user_name=shift.user_name,
-                            shift_key=shift_key, break_date=date_str,
-                            break_type=btype,
-                            planned_start_time=b_start,
-                            planned_end_time=b_end,
-                            planned_duration_minutes=b_dur,
-                            paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
-                            unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
-                            combined=sug.get("combined", False),
-                            label=sug.get("label", btype.title()),
-                            status="manual_review",
-                            opt_out_source=opt_src,
-                            warnings=[f"No compliant break window found. {reason}"],
-                        )
-                        review_warns.append(
-                            f"{shift.user_name} ({shift.room_name}) on {date_str}: "
-                            f"no compliant {btype} break window — manual review required."
-                        )
+                    if not alt_conflict:
+                        b_start, b_end = alt_s, alt_e
+                        conflict = "ok"
                     else:
-                        b_start, b_end = alt_start, alt_end
-                        brk = SuggestedBreak(
-                            user_id=uid, user_name=shift.user_name,
-                            shift_key=shift_key, break_date=date_str,
-                            break_type=btype,
-                            planned_start_time=b_start,
-                            planned_end_time=b_end,
-                            planned_duration_minutes=b_dur,
-                            paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
-                            unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
-                            combined=sug.get("combined", False),
-                            label=sug.get("label", btype.title()),
-                            status="scheduled",
-                            opt_out_source=opt_src,
+                        # Try temporary cover from another room
+                        cover_mv = _find_break_cover(
+                            break_start=b_start,
+                            break_end=b_end,
+                            break_room_id=rid,
+                            break_room=room,
+                            break_uid=uid,
+                            break_uname=shift.user_name,
+                            date_str=date_str,
+                            day_shifts=day_shifts,
+                            room_map=room_map,
+                            room_coverage=room_coverage,
+                            breaks_by_user=breaks_by_user,
+                            cover_delta=cover_delta,
                         )
+                        if cover_mv is not None:
+                            conflict   = "ok"
+                            cover_used = cover_mv
+
+                if conflict in ("ok",):
+                    brk = SuggestedBreak(
+                        user_id=uid, user_name=shift.user_name,
+                        shift_key=shift_key, break_date=date_str,
+                        break_type=btype,
+                        planned_start_time=b_start,
+                        planned_end_time=b_end,
+                        planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
+                        status="scheduled",
+                        opt_out_source=opt_src,
+                    )
+                    if cover_used is not None:
+                        # Apply the cover to the delta so later breaks see it
+                        _apply_cover_delta(cover_delta, cover_used)
+                        day_movements.append(cover_used)
                 elif conflict == "fixed_conflict":
-                    # Both breaks are fixed — flag, do not move either one
                     brk = SuggestedBreak(
                         user_id=uid, user_name=shift.user_name,
                         shift_key=shift_key, break_date=date_str,
@@ -373,10 +393,10 @@ def generate_roster(
                         warnings=[f"Fixed break conflict: {reason}"],
                     )
                     review_warns.append(
-                        f"{shift.user_name} on {date_str}: "
-                        f"fixed break conflict — {reason}"
+                        f"{shift.user_name} on {date_str}: fixed break conflict — {reason}"
                     )
                 else:
+                    # breach with no alt window and no cover available
                     brk = SuggestedBreak(
                         user_id=uid, user_name=shift.user_name,
                         shift_key=shift_key, break_date=date_str,
@@ -388,16 +408,20 @@ def generate_roster(
                         unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
                         combined=sug.get("combined", False),
                         label=sug.get("label", btype.title()),
-                        status="scheduled",
+                        status="manual_review",
                         opt_out_source=opt_src,
+                        warnings=["No ratio-safe break window found. No cover available."],
+                    )
+                    review_warns.append(
+                        f"{shift.user_name} ({shift.room_name}) on {date_str}: "
+                        f"no ratio-safe {btype} break window — manual review required."
                     )
 
                 all_breaks.append(brk)
-                # Register in both trackers so subsequent breaks avoid this window
                 breaks_by_room.setdefault(rid, []).append((b_start, b_end))
-                breaks_by_user.setdefault(uid, []).append(
-                    (b_start, b_end, False)   # False = not a fixed/pre-existing break
-                )
+                breaks_by_user.setdefault(uid, []).append((b_start, b_end, False))
+
+        all_movements.extend(day_movements)
 
     # ── Post-generation merge: combine separate rest+meal into one block ──
     # When the initial combined suggestion was rejected by the ratio check,
@@ -421,6 +445,7 @@ def generate_roster(
     return RosterResult(
         shifts=all_shifts,
         breaks=all_breaks,
+        movements=all_movements,
         ratio_warnings=ratio_warns,
         review_warnings=review_warns,
         unmet_rooms=unmet_rooms,
@@ -960,6 +985,160 @@ def _make_combined_break(
     )
 
 
+def _find_break_cover(
+    break_start: str,
+    break_end: str,
+    break_room_id: str,
+    break_room: dict,
+    break_uid: str,
+    break_uname: str,
+    date_str: str,
+    day_shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+    room_coverage: dict[str, dict[str, int]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
+    cover_delta: dict[str, dict[str, int]],
+) -> "SuggestedMovement | None":
+    """
+    Try to find an educator from another room who can temporarily move to
+    break_room for [break_start, break_end] to maintain ratio coverage.
+
+    Eligibility criteria for a covering educator (cover_uid):
+      1. Is working at break_room during the entire break window.
+         (Their shift start ≤ break_start and shift end ≥ break_end.)
+      2. Is NOT the educator on break.
+      3. Is NOT already on break during this window.
+      4. Moving them away from their own room does NOT breach their own
+         room's required ratio.
+
+    Preference order:
+      1. Educators in rooms with the most spare capacity (staff above ratio).
+      2. Earlier alphabetical name as tie-break.
+
+    Returns a SuggestedMovement if cover is found, None otherwise.
+    Does NOT mutate cover_delta — caller applies the delta after confirming.
+    """
+    r_staff_needed = break_room.get("required_ratio_staff", 1)
+    r_room_name    = break_room.get("name", break_room_id)
+
+    # Slots in the break window
+    break_slots = [
+        s for room_cov in room_coverage.values()
+        for s in room_cov
+        if break_start <= s < break_end
+    ]
+    break_slots = sorted(set(break_slots))
+
+    # Collect already-on-break uids during this window
+    on_break_uids: set[str] = set()
+    for uid2, user_breaks in breaks_by_user.items():
+        for bs, be, _ in user_breaks:
+            if _overlaps(break_start, break_end, bs, be):
+                on_break_uids.add(uid2)
+
+    candidates = []
+
+    for shift in day_shifts:
+        cuid  = shift.user_id
+        crid  = shift.room_id
+
+        # Must be a different educator, in a different room, not on break
+        if cuid == break_uid:
+            continue
+        if crid == break_room_id:
+            continue
+        if cuid in on_break_uids:
+            continue
+
+        # Must be working during the entire break window
+        if shift.start_time > break_start or shift.end_time < break_end:
+            continue
+
+        # Moving them away must not breach their own room's ratio
+        own_room   = room_map.get(crid, {})
+        own_r_staff = own_room.get("required_ratio_staff", 1)
+        own_cov    = room_coverage.get(crid, {})
+        own_deltas = (cover_delta or {}).get(crid, {})
+        feasible   = True
+        surplus_min = 999  # minimum surplus across break slots
+
+        for slot in break_slots:
+            base   = own_cov.get(slot, 0)
+            extra  = own_deltas.get(slot, 0)
+            after  = base + extra - 1   # if this educator leaves
+            if after < own_r_staff:
+                feasible = False
+                break
+            surplus_min = min(surplus_min, after - own_r_staff)
+
+        if not feasible:
+            continue
+
+        candidates.append({
+            "uid":         cuid,
+            "name":        shift.user_name,
+            "from_room_id":   crid,
+            "from_room_name": own_room.get("name", crid),
+            "surplus":     surplus_min,
+        })
+
+    if not candidates:
+        return None
+
+    # Sort: most surplus first (least disruption), then name for stability
+    candidates.sort(key=lambda c: (-c["surplus"], c["name"]))
+    best = candidates[0]
+
+    return SuggestedMovement(
+        educator_id=best["uid"],
+        educator_name=best["name"],
+        from_room_id=best["from_room_id"],
+        from_room_name=best["from_room_name"],
+        to_room_id=break_room_id,
+        to_room_name=r_room_name,
+        start_time=break_start,
+        end_time=break_end,
+        move_date=date_str,
+        covering_for_uid=break_uid,
+        covering_for_name=break_uname,
+        reason=(
+            f"{best['name']} covers {r_room_name} {break_start[:5]}–{break_end[:5]} "
+            f"while {break_uname} is on break."
+        ),
+    )
+
+
+def _apply_cover_delta(
+    cover_delta: dict[str, dict[str, int]],
+    movement: "SuggestedMovement",
+) -> None:
+    """
+    Update cover_delta in-place to reflect a temporary movement:
+      - The receiving room gains +1 per slot during the movement window.
+      - The sending room loses -1 per slot during the movement window.
+    This is used by subsequent _check_break_impact calls.
+    """
+    slots = [
+        f"{h:02d}:{m:02d}:00"
+        for h in range(6, 21) for m in (0, 15, 30, 45)
+        if movement.start_time <= f"{h:02d}:{m:02d}:00" < movement.end_time
+    ]
+
+    # Receiving room: +1 (cover educator is present)
+    to_rid = movement.to_room_id
+    if to_rid not in cover_delta:
+        cover_delta[to_rid] = {}
+    for slot in slots:
+        cover_delta[to_rid][slot] = cover_delta[to_rid].get(slot, 0) + 1
+
+    # Sending room: -1 (cover educator has left)
+    from_rid = movement.from_room_id
+    if from_rid not in cover_delta:
+        cover_delta[from_rid] = {}
+    for slot in slots:
+        cover_delta[from_rid][slot] = cover_delta[from_rid].get(slot, 0) - 1
+
+
 def _validate_and_resolve_break_overlaps(
     breaks: list[SuggestedBreak],
     shifts: list[SuggestedShift],
@@ -1245,29 +1424,24 @@ def _check_break_impact(
     breaks_by_user: dict[str, list[tuple[str, str, bool]]],
     r_staff: int,
     r_child: int,
+    cover_delta: dict[str, dict[str, int]] | None = None,
 ) -> tuple[str, str]:
     """
     Return ("ok" | "breach" | "fixed_conflict", reason).
 
     Checks in priority order:
-    1. Educator-level overlap — does this educator already have a break
-       covering any part of [b_start, b_end]?
-       - If the existing break is NOT fixed  → "breach"  (can be moved)
-       - If the existing break IS fixed      → "fixed_conflict" (both breaks
-         are immovable; caller must flag the conflict, not silently reschedule)
-    2. Room-level stagger — is another staff member from the same room
-       already on break in this window?
-    3. Ratio coverage — does removing this staff member during the window
-       drop the room below the minimum ratio?
+    1. Educator-level overlap.
+    2. Room-level stagger (no two educators from same room on break simultaneously).
+    3. Ratio coverage — removing this educator, accounting for any temporary
+       cover already arranged (cover_delta).
     """
-    # 1. Educator overlap — checked first and hardest
+    # 1. Educator overlap
     for ex_start, ex_end, ex_fixed in breaks_by_user.get(user_id, []):
         if _overlaps(b_start, b_end, ex_start, ex_end):
             if ex_fixed:
                 return (
                     "fixed_conflict",
-                    f"Overlaps a fixed break {ex_start[:5]}–{ex_end[:5]} "
-                    f"that cannot be moved.",
+                    f"Overlaps a fixed break {ex_start[:5]}–{ex_end[:5]} that cannot be moved.",
                 )
             return (
                 "breach",
@@ -1279,12 +1453,14 @@ def _check_break_impact(
         if _overlaps(b_start, b_end, existing_start, existing_end):
             return "breach", "Another staff member is already on break in this window."
 
-    # 3. Ratio coverage
-    cov = room_coverage.get(room_id, {})
+    # 3. Ratio coverage (with cover_delta applied)
+    cov    = room_coverage.get(room_id, {})
+    deltas = (cover_delta or {}).get(room_id, {})
     slots_in_break = [s for s in cov if b_start <= s < b_end]
     for slot in slots_in_break:
-        staff_at_slot  = cov.get(slot, 0)
-        staff_if_break = max(0, staff_at_slot - 1)
+        base_staff     = cov.get(slot, 0)
+        extra_cover    = deltas.get(slot, 0)
+        staff_if_break = max(0, base_staff + extra_cover - 1)
         if staff_if_break < r_staff:
             return "breach", f"Coverage at {slot[:5]} drops to {staff_if_break} (need {r_staff})."
 
@@ -1302,6 +1478,7 @@ def _find_alt_break_window(
     breaks_by_user: dict[str, list[tuple[str, str, bool]]],
     r_staff: int,
     r_child: int,
+    cover_delta: dict[str, dict[str, int]] | None = None,
 ) -> tuple[str, str, bool]:
     """
     Scan the shift in 15-minute steps for a window that satisfies all
@@ -1322,6 +1499,7 @@ def _find_alt_break_window(
         conflict, _ = _check_break_impact(
             b_s, b_e, room_id, user_id,
             room_coverage, breaks_by_room, breaks_by_user, r_staff, r_child,
+            cover_delta,
         )
         if conflict == "ok":
             return b_s, b_e, False
