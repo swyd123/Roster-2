@@ -944,6 +944,151 @@ class TestPreferredBreakWindow:
                     )
 
 
+
+def _load_collapse_breaks():
+    """
+    Import _collapse_breaks from pages/auto_roster.py without triggering
+    real Streamlit calls.  Returns the function or raises clearly.
+    """
+    import importlib.util, types, os as _os
+
+    # Minimal pandas stub
+    if "pandas" not in sys.modules or not hasattr(sys.modules["pandas"], "DataFrame"):
+        _pd = types.ModuleType("pandas")
+        _pd.DataFrame = list
+        sys.modules["pandas"] = _pd
+
+    # Minimal streamlit stub (may already be set from top of file)
+    _st = sys.modules.get("streamlit") or types.ModuleType("streamlit")
+    for _attr in ("title","markdown","caption","dataframe","info","warning",
+                  "error","button","expander","rerun","progress","selectbox",
+                  "date_input","columns","spinner","session_state"):
+        if not hasattr(_st, _attr):
+            setattr(_st, _attr,
+                    {} if _attr == "session_state"
+                    else (lambda *a, **k: None))
+    sys.modules["streamlit"] = _st
+
+    page_path = _os.path.join(
+        _os.path.dirname(__file__), "..", "pages", "auto_roster.py"
+    )
+    spec = importlib.util.spec_from_file_location("auto_roster_page", page_path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._collapse_breaks
+
+
+try:
+    _collapse_breaks = _load_collapse_breaks()
+except Exception as _ce:
+    def _collapse_breaks(breaks):
+        raise RuntimeError(f"Could not load _collapse_breaks: {_ce}")
+
+
+class TestCollapseBreaks:
+    """Tests for the display-layer _collapse_breaks deduplication."""
+
+    def _sb(self, uid, date, start, end, btype, paid, unpaid, status="scheduled"):
+        from datetime import datetime as _dt
+        dur = max(0, int(
+            (_dt.strptime(end[:5], "%H:%M") - _dt.strptime(start[:5], "%H:%M"))
+            .total_seconds() / 60
+        ))
+        return SuggestedBreak(
+            user_id=uid, user_name=uid,
+            shift_key=f"{uid}_{date}", break_date=date,
+            break_type=btype,
+            planned_start_time=start, planned_end_time=end,
+            planned_duration_minutes=dur,
+            paid_minutes=paid, unpaid_minutes=unpaid,
+            combined=(btype == "combined"),
+            label=btype.title(),
+            status=status, opt_out_source="No opt-out",
+        )
+
+    # ── Regression: Bonnie Cheng ──────────────────────────────────────────────
+
+    def test_overlapping_breaks_collapse_to_one_row(self):
+        """Rest 12:27–12:47 and meal 12:30–13:00 overlap → one display row."""
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        rows = _collapse_breaks([rest, meal])
+        assert len(rows) == 1, f"Expected 1 row, got {len(rows)}: {rows}"
+
+    def test_collapsed_row_start_end(self):
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        row = _collapse_breaks([rest, meal])[0]
+        assert row["Start"] == "12:27", f"Start={row['Start']}"
+        assert row["End"]   == "13:00", f"End={row['End']}"
+
+    def test_collapsed_row_paid_unpaid_summed(self):
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        row = _collapse_breaks([rest, meal])[0]
+        assert row["Paid min"]   == 20, f"Paid={row['Paid min']}"
+        assert row["Unpaid min"] == 30, f"Unpaid={row['Unpaid min']}"
+
+    def test_collapsed_row_type_is_combined_break(self):
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        row = _collapse_breaks([rest, meal])[0]
+        assert row["Break"] == "Combined break", f"Break={row['Break']}"
+
+    def test_collapsed_row_duration_start_to_end(self):
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        row = _collapse_breaks([rest, meal])[0]
+        assert row["Duration"] == "33 min", f"Duration={row['Duration']}"
+
+    def test_manual_review_preserved(self):
+        rest = self._sb("Bonnie","2026-05-18","12:27:00","12:47:00",
+                         "rest",20,0,status="scheduled")
+        meal = self._sb("Bonnie","2026-05-18","12:30:00","13:00:00",
+                         "meal",0,30,status="manual_review")
+        row = _collapse_breaks([rest, meal])[0]
+        assert "Manual Review" in row["Status"], f"Status={row['Status']}"
+
+    # ── Non-overlapping stays separate ───────────────────────────────────────
+
+    def test_non_overlapping_stays_separate(self):
+        rest = self._sb("Alice","2026-05-18","10:00:00","10:10:00","rest",10,0)
+        meal = self._sb("Alice","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        rows = _collapse_breaks([rest, meal])
+        assert len(rows) == 2, f"Expected 2 rows, got {len(rows)}"
+
+    def test_adjacent_stays_separate(self):
+        rest = self._sb("Alice","2026-05-18","10:00:00","10:10:00","rest",10,0)
+        meal = self._sb("Alice","2026-05-18","10:10:00","10:40:00","meal",0,30)
+        rows = _collapse_breaks([rest, meal])
+        assert len(rows) == 2, f"Adjacent breaks should stay separate, got {len(rows)}"
+
+    # ── Isolation ────────────────────────────────────────────────────────────
+
+    def test_different_educators_not_collapsed(self):
+        b1 = self._sb("Alice","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        b2 = self._sb("Bob",  "2026-05-18","12:30:00","13:00:00","meal",0,30)
+        rows = _collapse_breaks([b1, b2])
+        assert len(rows) == 2
+        assert {r["Educator"] for r in rows} == {"Alice","Bob"}
+
+    def test_different_dates_not_collapsed(self):
+        b1 = self._sb("Alice","2026-05-18","12:27:00","12:47:00","rest",20,0)
+        b2 = self._sb("Alice","2026-05-19","12:30:00","13:00:00","meal",0,30)
+        rows = _collapse_breaks([b1, b2])
+        assert len(rows) == 2
+
+    # ── Labels for single-type breaks ────────────────────────────────────────
+
+    def test_only_paid_label(self):
+        b = self._sb("Alice","2026-05-18","10:00:00","10:20:00","rest",20,0)
+        assert _collapse_breaks([b])[0]["Break"] == "Rest (paid)"
+
+    def test_only_unpaid_label(self):
+        b = self._sb("Alice","2026-05-18","12:30:00","13:00:00","meal",0,30)
+        assert _collapse_breaks([b])[0]["Break"] == "Meal (unpaid)"
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -957,6 +1102,7 @@ if __name__ == "__main__":
         TestBreakOverlapRegression(),
         TestValidateBreakOverlaps(),
         TestPreferredBreakWindow(),
+        TestCollapseBreaks(),
     ]
     passed = failed = 0
     for obj in classes:
