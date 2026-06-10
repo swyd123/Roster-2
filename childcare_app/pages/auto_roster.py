@@ -157,6 +157,7 @@ def render():
             st.session_state["ar_centre_id"]    = centre_id
             st.session_state["ar_result_start"] = start_d.isoformat()
             st.session_state["ar_result_end"]   = end_d.isoformat()
+            st.session_state["ar_intervals"]    = all_intervals
         else:
             result = st.session_state["ar_result"]
 
@@ -169,113 +170,156 @@ def render():
 
 def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     from utils.break_engine import BREAK_RULES_DEFAULT
-    room_map = {r["id"]: r["name"] for r in rooms}
+    from utils.roster_timeline import (
+        build_timeline_html, build_movement_notes_html, get_day_summary,
+    )
 
-    movements = getattr(result, "movements", [])
-    n_movements = len(movements)
+    room_map   = {r["id"]: r["name"] for r in rooms}
+    movements  = getattr(result, "movements", [])
+    shifts     = result.shifts
+    breaks     = result.breaks
 
-    shifts = result.shifts
-    breaks = result.breaks
-
-    # ── Summary banner ────────────────────────────────────────────────
     n_shifts      = len(shifts)
     n_breaks      = len(breaks)
+    n_movements   = len(movements)
     n_ratio_warn  = len(result.ratio_warnings)
     n_review_warn = len(result.review_warnings)
     n_unmet       = len(result.unmet_rooms)
 
+    # ── Summary metrics ───────────────────────────────────────────────
     st.markdown("### 📊 Generation Summary")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Shifts suggested",  n_shifts)
-    m2.metric("Breaks suggested",  n_breaks)
-    m3.metric("Movements needed",  n_movements,
-              delta="cover required" if n_movements else None,
-              delta_color="normal" if n_movements else "off")
-    m4.metric("Ratio warnings",    n_ratio_warn,
-              delta="review needed" if n_ratio_warn else None,
-              delta_color="inverse" if n_ratio_warn else "off")
-    m5.metric("Break conflicts",   n_review_warn,
-              delta="manual review" if n_review_warn else None,
-              delta_color="inverse" if n_review_warn else "off")
-    m6.metric("Rooms unstaffed",   n_unmet,
-              delta="no staff available" if n_unmet else None,
-              delta_color="inverse" if n_unmet else "off")
+    mc = st.columns(6)
+    mc[0].metric("Shifts",          n_shifts)
+    mc[1].metric("Breaks",          n_breaks)
+    mc[2].metric("Movements",       n_movements,
+                 delta="cover required" if n_movements else None,
+                 delta_color="normal" if n_movements else "off")
+    mc[3].metric("Ratio warnings",  n_ratio_warn,
+                 delta="review needed" if n_ratio_warn else None,
+                 delta_color="inverse" if n_ratio_warn else "off")
+    mc[4].metric("Break conflicts", n_review_warn,
+                 delta="manual review" if n_review_warn else None,
+                 delta_color="inverse" if n_review_warn else "off")
+    mc[5].metric("Rooms unstaffed", n_unmet,
+                 delta="no staff available" if n_unmet else None,
+                 delta_color="inverse" if n_unmet else "off")
 
     if result.unmet_rooms:
-        st.error(
-            f"❌ **No available staff found for: {', '.join(result.unmet_rooms)}** — "
-            "check staff availability settings."
-        )
+        st.error(f"❌ No available staff for: {', '.join(result.unmet_rooms)}")
     if result.ratio_warnings:
-        with st.expander(f"⚠️ {n_ratio_warn} ratio warning(s)", expanded=False):
+        with st.expander(f"⚠️ {n_ratio_warn} ratio warning(s)"):
             for w in result.ratio_warnings:
                 st.warning(w)
     if result.review_warnings:
-        with st.expander(f"🔍 {n_review_warn} break conflict(s) — manual review required",
-                         expanded=False):
+        with st.expander(f"🔍 {n_review_warn} break conflict(s) — manual review"):
             for w in result.review_warnings:
                 st.warning(w)
 
-    st.markdown("---")
-
-    # ── Roster table ──────────────────────────────────────────────────
-    st.markdown("### 🗓️ Generated Roster")
-    st.caption(
-        "Review the suggested shifts. "
-        "Save creates a new **draft** roster period."
-    )
     if not shifts:
-        st.info("No shifts could be generated. Check attendance data and staff availability.")
-    else:
-        _render_shift_table(shifts, room_map)
+        st.info("No shifts generated. Check attendance data and staff availability.")
+        return
 
-    # ── Break schedule table ──────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### ☕ Generated Break Schedule")
-    st.caption(
-        "Break times are placed to maintain ratio compliance. "
-        "5–7 hr shifts get a combined 40-min block (10 paid + 30 unpaid). "
-        "7+ hr shifts get a combined 50-min block (20 paid + 30 unpaid). "
-        "Conflicts are flagged for manual review."
-    )
-    if not breaks:
-        st.info("No breaks generated (no shifts with break entitlement, or no eligible windows).")
-    else:
-        _render_break_table(breaks)
 
-    # ── Debug expander — raw break object fields ──────────────────────
-    if breaks:
-        with st.expander("🔍 Break generation debug", expanded=False):
-            st.caption(
-                "Raw break object fields from the engine. "
-                "Use this to verify combined breaks are being generated correctly."
-            )
+    # ── Collect attendance intervals (if already loaded in session_state) ─
+    # The page may have loaded intervals per-day into session_state when
+    # generating; fall back to empty list if not available.
+    session_intervals = st.session_state.get("ar_intervals", {})
+
+    # ── Per-day timeline grids ────────────────────────────────────────
+    # Group by date
+    from collections import defaultdict
+    shifts_by_day:    defaultdict = defaultdict(list)
+    breaks_by_day:    defaultdict = defaultdict(list)
+    movements_by_day: defaultdict = defaultdict(list)
+
+    for s in shifts:
+        shifts_by_day[s.shift_date].append(s)
+    for b in breaks:
+        breaks_by_day[b.break_date].append(b)
+    for mv in movements:
+        movements_by_day[mv.move_date].append(mv)
+
+    all_dates = sorted(shifts_by_day.keys())
+
+    st.markdown("### 🗓️ Roster Timeline")
+    st.caption(
+        "Colour-coded by room · **B40** = 40-min combined break · "
+        "**B##** in amber = manual review · **CODE†** = temporary cover · "
+        "Footer rows show staff count per 15-min slot (🟢 ok / 🔴 under ratio)."
+    )
+
+    for date_str in all_dates:
+        day_shifts    = shifts_by_day[date_str]
+        day_breaks    = breaks_by_day.get(date_str, [])
+        day_movements = movements_by_day.get(date_str, [])
+        day_intervals = session_intervals.get(date_str, [])
+        summary       = get_day_summary(date_str, day_shifts, day_breaks, day_movements)
+
+        # Day header
+        try:
+            from datetime import date as _date
+            wd = _date.fromisoformat(date_str).strftime("%A %-d %B %Y")
+        except Exception:
+            wd = date_str
+
+        header_extra = []
+        if summary["manual_review"]:
+            header_extra.append(f"🔍 {summary['manual_review']} manual review")
+        if summary["movements"]:
+            header_extra.append(f"🔄 {summary['movements']} movement(s)")
+        header_suffix = "  ·  " + "  ·  ".join(header_extra) if header_extra else ""
+
+        st.markdown(
+            f"<h4 style='margin:16px 0 6px;color:#0d1f35;'>"
+            f"📅 {wd}{header_suffix}</h4>",
+            unsafe_allow_html=True,
+        )
+
+        grid_html = build_timeline_html(
+            date_str=date_str,
+            shifts=day_shifts,
+            breaks=day_breaks,
+            movements=day_movements,
+            rooms=rooms,
+            intervals=day_intervals,
+        )
+        st.markdown(grid_html, unsafe_allow_html=True)
+
+        # Movement notes below each day's grid
+        notes_html = build_movement_notes_html(day_movements)
+        if notes_html:
+            st.markdown(notes_html, unsafe_allow_html=True)
+
+    # ── Debug expander (replaces old shift/break tables) ─────────────
+    st.markdown("---")
+    with st.expander("🔍 Raw data (debug)", expanded=False):
+        st.markdown("**Shifts**")
+        _render_shift_table(shifts, room_map)
+        if breaks:
+            st.markdown("**Breaks**")
+            _render_break_table(breaks)
+        if breaks:
+            st.markdown("**Break objects**")
             debug_rows = []
             for b in sorted(breaks, key=lambda x: (x.break_date, x.user_name, x.planned_start_time)):
                 debug_rows.append({
-                    "Educator":              b.user_name,
-                    "Date":                  b.break_date,
-                    "break_type":            b.break_type,
-                    "planned_duration_min":  b.planned_duration_minutes,
-                    "combined":              getattr(b, "combined", "—"),
-                    "label":                 getattr(b, "label",    "—"),
-                    "paid_component_min":    getattr(b, "paid_minutes",   "—"),
-                    "unpaid_component_min":  getattr(b, "unpaid_minutes", "—"),
-                    "status":                b.status,
-                    "opt_out_source":        b.opt_out_source,
+                    "Educator":     b.user_name,
+                    "Date":         b.break_date,
+                    "break_type":   b.break_type,
+                    "dur_min":      b.planned_duration_minutes,
+                    "combined":     getattr(b, "combined",      "—"),
+                    "label":        getattr(b, "label",         "—"),
+                    "paid_min":     getattr(b, "paid_minutes",  "—"),
+                    "unpaid_min":   getattr(b, "unpaid_minutes","—"),
+                    "status":       b.status,
                 })
             st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
 
-    # ── Save buttons ──────────────────────────────────────────────────
+    # ── Save section ──────────────────────────────────────────────────
     st.markdown("---")
-
-    # Movements table (before save section)
     if movements:
-        st.markdown("### 🔄 Temporary Educator Movements")
-        st.caption(
-            "These movements are required to maintain room ratios during breaks. "
-            "They are suggestions only — do not change permanent shift assignments."
-        )
+        st.markdown("### 🔄 Educator Movements")
         _render_movement_table(movements)
         st.markdown("---")
 
@@ -292,19 +336,16 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     if published_overlap:
         st.error(
             "❌ A **published** roster overlaps this period. "
-            "Archive the existing roster first if you want to regenerate."
+            "Archive it first if you want to regenerate."
         )
         return
 
     draft_overlap = [p for p in overlap if p.get("status") == "draft"]
 
     sa1, sa2, _ = st.columns([2, 2, 3])
-
     save_roster = sa1.button(
         f"💾 Save Roster ({n_shifts} shifts)",
-        type="primary",
-        use_container_width=True,
-        disabled=n_shifts == 0,
+        type="primary", use_container_width=True, disabled=n_shifts == 0,
     )
     save_breaks = sa2.button(
         f"💾 Save Breaks ({n_breaks} breaks)",
@@ -313,13 +354,13 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     )
 
     if save_breaks and not st.session_state.get("ar_period_id"):
-        st.info("Save the roster first to get a period ID for the breaks.")
+        st.info("Save the roster first.")
 
     if draft_overlap:
         st.warning(
-            f"⚠️ A draft roster already exists for this period "
+            f"⚠️ A draft roster already exists "
             f"({draft_overlap[0]['start_date']} – {draft_overlap[0]['end_date']}). "
-            "Saving will **replace** all draft shifts with the new suggestions."
+            "Saving will replace all draft shifts."
         )
         confirm = st.checkbox("Yes, replace the existing draft shifts", key="ar_confirm_replace")
     else:
@@ -339,18 +380,17 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                         notes="Auto-generated by roster engine",
                     )
                     period_id = new_period["id"]
-
                 shift_rows = [
                     {
-                        "user_id":                      s.user_id,
-                        "room_id":                      s.room_id,
-                        "shift_date":                   s.shift_date,
-                        "start_time":                   s.start_time,
-                        "end_time":                     s.end_time,
-                        "shift_type":                   s.shift_type,
-                        "break_duration_minutes":       0,
+                        "user_id":                       s.user_id,
+                        "room_id":                       s.room_id,
+                        "shift_date":                    s.shift_date,
+                        "start_time":                    s.start_time,
+                        "end_time":                      s.end_time,
+                        "shift_type":                    s.shift_type,
+                        "break_duration_minutes":        0,
                         "unpaid_break_opt_out_override": s.break_opt_out_override,
-                        "notes":                        f"Auto-generated ({s.source})",
+                        "notes":                         f"Auto-generated ({s.source})",
                     }
                     for s in shifts
                 ]
@@ -366,7 +406,6 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         if not period_id:
             toast_error("Save the roster first.")
             return
-
         with st.spinner("Saving breaks…"):
             try:
                 break_rows = [
