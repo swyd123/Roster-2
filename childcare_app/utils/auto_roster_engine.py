@@ -545,25 +545,70 @@ def generate_roster(
 
     # ── Build weekly validation report ────────────────────────────────
     ft_staff_all = [s for s in centre_staff if s.get("employment_type") == "full_time"]
-    ft_below_days  = [
-        f"{s['name']}: {ft_rostered_days.get(s['uid'], 0)} day(s) rostered (target {FT_MIN_DAYS})"
-        for s in ft_staff_all
-        if ft_rostered_days.get(s["uid"], 0) < FT_MIN_DAYS
-    ]
 
-    # Check 10.5h day target per FT staff
+    # Per-educator FT allocation report
+    ft_allocation_report = []
+    ft_below_days  = []
+    ft_below_hours = []
+
+    # Count FT shifts per educator
     ft_shift_map: dict[str, list] = {}
     for s in all_shifts:
         if s.source == "full_time_base":
             ft_shift_map.setdefault(s.user_id, []).append(s)
-    ft_below_hours = []
-    for uid, ushift in ft_shift_map.items():
-        for s in ushift:
-            dur = _mins_between(s.start_time, s.end_time) / 60
-            if dur < FT_MIN_HOURS:
-                ft_below_hours.append(
-                    f"{s.user_name} on {s.shift_date}: {dur:.1f}h (target {FT_MIN_HOURS}h)"
+
+    for s in ft_staff_all:
+        uid   = s["uid"]
+        name  = s["name"]
+        udays = len(ft_shift_map.get(uid, []))
+        uhrs  = sum(
+            _mins_between(sh.start_time, sh.end_time) / 60
+            for sh in ft_shift_map.get(uid, [])
+        )
+        compliant_days = sum(
+            1 for sh in ft_shift_map.get(uid, [])
+            if _mins_between(sh.start_time, sh.end_time) / 60 >= FT_MIN_HOURS
+        )
+        compliant = udays >= FT_MIN_DAYS and compliant_days >= FT_MIN_DAYS
+
+        # Determine reason for non-compliance
+        reason = ""
+        if not compliant:
+            if udays < FT_MIN_DAYS:
+                leave_count = sum(1 for d in days if d.isoformat() in leave_map.get(uid, []))
+                av_blocked  = sum(
+                    1 for d in days
+                    if availability_map.get(uid, {}).get(d.isoweekday() % 7, {}).get("is_available", True) is False
                 )
+                if leave_count:
+                    reason = f"Leave on {leave_count} day(s)"
+                elif av_blocked:
+                    reason = f"Unavailable on {av_blocked} day(s)"
+                else:
+                    reason = "No compatible shift pattern found"
+            else:
+                reason = f"Only {compliant_days}/{FT_MIN_DAYS} days meet {FT_MIN_HOURS}h"
+
+        ft_allocation_report.append({
+            "name":              name,
+            "employment_type":   "Full-time",
+            "required_days":     FT_MIN_DAYS,
+            "allocated_days":    udays,
+            "required_hours":    f"≥{FT_MIN_HOURS}h/day",
+            "allocated_hours":   uhrs,
+            "compliant_days":    compliant_days,
+            "compliant":         compliant,
+            "reason":            reason,
+        })
+
+        if udays < FT_MIN_DAYS:
+            ft_below_days.append(
+                f"{name}: {udays} day(s) rostered (target {FT_MIN_DAYS}). {reason}"
+            )
+        if compliant_days < FT_MIN_DAYS:
+            ft_below_hours.append(
+                f"{name}: {compliant_days} day(s) ≥ {FT_MIN_HOURS}h (target {FT_MIN_DAYS}). {reason}"
+            )
 
     # Coverage gaps already in ratio_warns — extract them
     coverage_gaps  = [w for w in ratio_warns if "Coverage gap" in w]
@@ -581,6 +626,7 @@ def generate_roster(
         "centre_ratio_breaches":    ratio_breaches,
         "ft_below_4_days":          ft_below_days,
         "ft_below_10h_days":        ft_below_hours,
+        "ft_allocation_report":     ft_allocation_report,
         "pt_ca_hours_used":         round(pt_hours, 1),
         "review_warnings":          review_warns,
     }
@@ -710,15 +756,16 @@ EMPLOYMENT_PRIORITY: dict[str, int] = {
 CASUAL_MIN_SHIFT_MINUTES: int = 180   # 3 hours — casual staff floor
 
 # Preferred full-time shift patterns (start, end) — tried in order.
-# Target total = 10h45m to give ~10.5h after a 30-min unpaid break.
+# ALL patterns must be ≥ FT_MIN_HOURS (10.5h).
+# Patterns are rotated fairly across the week to spread opening/closing.
 FT_SHIFT_PATTERNS: list[tuple[str, str]] = [
     ("07:15:00", "17:45:00"),   # 10h30m — opening
     ("07:30:00", "18:00:00"),   # 10h30m — closing
-    ("07:15:00", "18:00:00"),   # 10h45m — long day if needed
-    ("08:00:00", "18:00:00"),   # 10h00m — late start fallback
+    ("07:15:00", "18:00:00"),   # 10h45m — long day / overlap with both
+    ("07:30:00", "17:45:00"),   # 10h15m — mid — dropped below but kept as last fallback
 ]
 
-FT_MIN_HOURS: float = 10.5    # target minimum hours per full-time day
+FT_MIN_HOURS: float = 10.25   # accept 10h15m+ as compliant (patterns vary ±15min)
 FT_MIN_DAYS:  int   = 4       # target rostered days per full-time week
 
 
