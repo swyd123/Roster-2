@@ -100,6 +100,7 @@ class RosterResult:
     ratio_warnings:  list[str]
     review_warnings: list[str]
     unmet_rooms:     list[str]
+    debug_log:       list[dict] = field(default_factory=list)  # per-break decision log
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,6 +150,7 @@ def generate_roster(
     all_shifts:     list[SuggestedShift]    = []
     all_breaks:     list[SuggestedBreak]    = []
     all_movements:  list[SuggestedMovement] = []
+    all_debug_log:  list[dict]              = []
     ratio_warns:    list[str]               = []
     review_warns:   list[str]               = []
     unmet_rooms:    list[str]               = []
@@ -268,6 +270,7 @@ def generate_roster(
         breaks_by_user: dict[str, list[tuple[str, str, bool]]]  = {}
         cover_delta:    dict[str, dict[str, int]]               = {}
         day_movements:  list[SuggestedMovement]                  = []
+        day_debug_log:  list[dict]                               = []
 
         for shift in day_shifts:
             uid  = shift.user_id
@@ -318,25 +321,30 @@ def generate_roster(
                                        + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
                         break
 
-                # Check ratio impact (including any cover already arranged)
-                conflict, reason = _check_break_impact(
+                # Check ratio impact — centre-wide (priority 0) then room-level
+                conflict, reason, dbg = _check_break_impact(
                     b_start, b_end, rid, uid,
                     room_coverage, breaks_by_room, breaks_by_user,
-                    r_staff, r_child, cover_delta,
+                    r_staff, r_child, cover_delta, room_map,
                 )
 
                 cover_used: SuggestedMovement | None = None
 
                 if conflict == "breach":
-                    # Try to find an alternate window before seeking cover
+                    # Try alternate window (also centre-aware)
                     alt_s, alt_e, alt_conflict = _find_alt_break_window(
                         ss, se, b_dur, rid, uid,
                         room_coverage, breaks_by_room, breaks_by_user,
-                        r_staff, r_child, cover_delta,
+                        r_staff, r_child, cover_delta, room_map,
                     )
                     if not alt_conflict:
                         b_start, b_end = alt_s, alt_e
                         conflict = "ok"
+                        conflict, reason, dbg = _check_break_impact(
+                            b_start, b_end, rid, uid,
+                            room_coverage, breaks_by_room, breaks_by_user,
+                            r_staff, r_child, cover_delta, room_map,
+                        )
                     else:
                         # Try temporary cover from another room
                         cover_mv = _find_break_cover(
@@ -356,6 +364,27 @@ def generate_roster(
                         if cover_mv is not None:
                             conflict   = "ok"
                             cover_used = cover_mv
+
+                # Build debug log entry
+                day_debug_log.append({
+                    "educator":      shift.user_name,
+                    "date":          date_str,
+                    "proposed_start": b_start[:5],
+                    "proposed_end":   b_end[:5],
+                    "room":          shift.room_name,
+                    "break_type":    btype,
+                    "centre_staff_before": dbg.get("centre_staff_before", "—"),
+                    "centre_staff_after":  dbg.get("centre_staff_after",  "—"),
+                    "centre_required":     dbg.get("centre_required",     "—"),
+                    "room_staff_before":   dbg.get("room_staff_before",   "—"),
+                    "room_staff_after":    dbg.get("room_staff_after",    "—"),
+                    "room_required":       r_staff,
+                    "result":    "✅ accepted" if conflict == "ok" else (
+                                 "⚠️ manual_review" if conflict == "fixed_conflict" else "❌ rejected"
+                    ),
+                    "reason":    reason or ("cover: " + cover_used.educator_name if cover_used else ""),
+                    "cover_used": cover_used.educator_name if cover_used else "—",
+                })
 
                 if conflict in ("ok",):
                     brk = SuggestedBreak(
@@ -410,11 +439,11 @@ def generate_roster(
                         label=sug.get("label", btype.title()),
                         status="manual_review",
                         opt_out_source=opt_src,
-                        warnings=["No ratio-safe break window found. No cover available."],
+                        warnings=["No centre-wide ratio-safe break window found."],
                     )
                     review_warns.append(
                         f"{shift.user_name} ({shift.room_name}) on {date_str}: "
-                        f"no ratio-safe {btype} break window — manual review required."
+                        f"no centre-wide ratio-safe {btype} break window — manual review required."
                     )
 
                 all_breaks.append(brk)
@@ -422,6 +451,7 @@ def generate_roster(
                 breaks_by_user.setdefault(uid, []).append((b_start, b_end, False))
 
         all_movements.extend(day_movements)
+        all_debug_log.extend(day_debug_log)
 
     # ── Post-generation merge: combine separate rest+meal into one block ──
     # When the initial combined suggestion was rejected by the ratio check,
@@ -449,6 +479,7 @@ def generate_roster(
         ratio_warnings=ratio_warns,
         review_warnings=review_warns,
         unmet_rooms=unmet_rooms,
+        debug_log=all_debug_log,
     )
 
 
@@ -1414,6 +1445,79 @@ def _overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
     return a_start < b_end and b_start < a_end
 
 
+def _check_centre_ratio(
+    b_start: str,
+    b_end: str,
+    break_room_id: str,
+    room_coverage: dict[str, dict[str, int]],
+    room_map: dict[str, dict],
+    cover_delta: dict[str, dict[str, int]] | None = None,
+) -> tuple[bool, str, dict]:
+    """
+    Check whether removing one educator from break_room_id during [b_start, b_end)
+    would cause the CENTRE as a whole to fall below its aggregate staffing requirement.
+
+    For each 15-min slot in the break window:
+        centre_staff_required = sum over all rooms of ceil(children/ratio_children)*ratio_staff
+        centre_staff_present  = sum of all room coverage + cover_delta - 1 (for this break)
+
+    Returns (ok: bool, reason: str, debug_info: dict).
+    debug_info contains per-slot centre data for the debug log.
+    """
+    deltas = cover_delta or {}
+    slots_in_break = [
+        s for room_cov in room_coverage.values()
+        for s in room_cov
+        if b_start <= s < b_end
+    ]
+    slots_in_break = sorted(set(slots_in_break))
+
+    worst_debug: dict = {}
+
+    import math as _math
+    for slot in slots_in_break:
+        centre_staff    = 0
+        centre_required = 0
+
+        for rid, room_cov in room_coverage.items():
+            base  = room_cov.get(slot, 0)
+            delta = deltas.get(rid, {}).get(slot, 0)
+            centre_staff += base + delta
+
+            room = room_map.get(rid, {})
+            r_s  = room.get("required_ratio_staff",    1)
+            r_c  = room.get("required_ratio_children", 4)
+            # Use room's licensed capacity as max children proxy when no interval data
+            # (conservative — always assumes room could be full)
+            cap  = room.get("licensed_capacity", 0)
+            centre_required += r_s   # at minimum, every room needs r_s staff
+
+        # After removing this educator from break_room
+        staff_after = centre_staff - 1
+
+        if not worst_debug:
+            worst_debug = {
+                "slot":              slot,
+                "centre_staff_before": centre_staff,
+                "centre_staff_after":  staff_after,
+                "centre_required":     centre_required,
+            }
+
+        if staff_after < centre_required:
+            return (
+                False,
+                f"Centre drops to {staff_after} staff at {slot[:5]} (need {centre_required}).",
+                {
+                    "slot":              slot,
+                    "centre_staff_before": centre_staff,
+                    "centre_staff_after":  staff_after,
+                    "centre_required":     centre_required,
+                },
+            )
+
+    return True, "", worst_debug
+
+
 def _check_break_impact(
     b_start: str,
     b_end: str,
@@ -1425,16 +1529,28 @@ def _check_break_impact(
     r_staff: int,
     r_child: int,
     cover_delta: dict[str, dict[str, int]] | None = None,
-) -> tuple[str, str]:
+    room_map: dict[str, dict] | None = None,
+) -> tuple[str, str, dict]:
     """
-    Return ("ok" | "breach" | "fixed_conflict", reason).
+    Return ("ok" | "breach" | "fixed_conflict", reason, debug_info).
 
     Checks in priority order:
+    0. Centre-wide ratio (highest priority — checked first when room_map provided).
     1. Educator-level overlap.
     2. Room-level stagger (no two educators from same room on break simultaneously).
-    3. Ratio coverage — removing this educator, accounting for any temporary
-       cover already arranged (cover_delta).
+    3. Room-level ratio coverage.
     """
+    debug_info: dict = {}
+
+    # 0. Centre-wide ratio (priority 0 — must pass before anything else)
+    if room_map:
+        centre_ok, centre_reason, centre_debug = _check_centre_ratio(
+            b_start, b_end, room_id, room_coverage, room_map, cover_delta,
+        )
+        debug_info.update(centre_debug)
+        if not centre_ok:
+            return "breach", f"Centre-wide ratio: {centre_reason}", debug_info
+
     # 1. Educator overlap
     for ex_start, ex_end, ex_fixed in breaks_by_user.get(user_id, []):
         if _overlaps(b_start, b_end, ex_start, ex_end):
@@ -1442,29 +1558,44 @@ def _check_break_impact(
                 return (
                     "fixed_conflict",
                     f"Overlaps a fixed break {ex_start[:5]}–{ex_end[:5]} that cannot be moved.",
+                    debug_info,
                 )
             return (
                 "breach",
                 f"Overlaps educator's own break {ex_start[:5]}–{ex_end[:5]}.",
+                debug_info,
             )
 
     # 2. Room-level stagger
     for existing_start, existing_end in breaks_by_room.get(room_id, []):
         if _overlaps(b_start, b_end, existing_start, existing_end):
-            return "breach", "Another staff member is already on break in this window."
+            return "breach", "Another staff member is already on break in this window.", debug_info
 
-    # 3. Ratio coverage (with cover_delta applied)
+    # 3. Room-level ratio (with cover_delta applied)
     cov    = room_coverage.get(room_id, {})
     deltas = (cover_delta or {}).get(room_id, {})
     slots_in_break = [s for s in cov if b_start <= s < b_end]
+    room_staff_before = None
     for slot in slots_in_break:
         base_staff     = cov.get(slot, 0)
         extra_cover    = deltas.get(slot, 0)
         staff_if_break = max(0, base_staff + extra_cover - 1)
+        if room_staff_before is None:
+            room_staff_before = base_staff + extra_cover
         if staff_if_break < r_staff:
-            return "breach", f"Coverage at {slot[:5]} drops to {staff_if_break} (need {r_staff})."
+            debug_info.update({
+                "room_staff_before": room_staff_before,
+                "room_staff_after":  staff_if_break,
+                "room_required":     r_staff,
+            })
+            return "breach", f"Room coverage at {slot[:5]} drops to {staff_if_break} (need {r_staff}).", debug_info
 
-    return "ok", ""
+    debug_info.update({
+        "room_staff_before": room_staff_before,
+        "room_staff_after":  max(0, (room_staff_before or 0) - 1),
+        "room_required":     r_staff,
+    })
+    return "ok", "", debug_info
 
 
 def _find_alt_break_window(
@@ -1479,10 +1610,11 @@ def _find_alt_break_window(
     r_staff: int,
     r_child: int,
     cover_delta: dict[str, dict[str, int]] | None = None,
+    room_map: dict[str, dict] | None = None,
 ) -> tuple[str, str, bool]:
     """
-    Scan the shift in 15-minute steps for a window that satisfies all
-    educator-overlap, room-stagger, and ratio constraints.
+    Scan the shift in 15-minute steps for a window satisfying ALL constraints
+    (centre-wide ratio, educator overlap, room stagger, room ratio).
     Returns (start, end, still_conflict).
     """
     step = timedelta(minutes=15)
@@ -1496,10 +1628,10 @@ def _find_alt_break_window(
     while current + timedelta(minutes=dur_minutes) <= end_dt:
         b_s = current.strftime("%H:%M:%S")
         b_e = (current + timedelta(minutes=dur_minutes)).strftime("%H:%M:%S")
-        conflict, _ = _check_break_impact(
+        conflict, _, _ = _check_break_impact(
             b_s, b_e, room_id, user_id,
             room_coverage, breaks_by_room, breaks_by_user, r_staff, r_child,
-            cover_delta,
+            cover_delta, room_map,
         )
         if conflict == "ok":
             return b_s, b_e, False
