@@ -105,6 +105,26 @@ def staff_form(
             placeholder="e.g. EMP-001",
         )
 
+        # Contracted hours — shown for all types; most relevant for FT/PT
+        c7, c8 = st.columns(2)
+        contracted_default = {
+            "full_time": 38.0, "part_time": 0.0, "casual": 0.0,
+        }.get(employment_type, 0.0)
+        contracted_hours_per_week = c7.number_input(
+            "Contracted hours / week",
+            min_value=0.0,
+            max_value=80.0,
+            value=float(d.get("contracted_hours_per_week")
+                         or d.get("full_time_contracted_hours_per_week")
+                         or contracted_default),
+            step=0.5,
+            format="%.1f",
+            key=f"{key_prefix}_contracted_hrs",
+            help="Weekly contracted hours. Used to validate roster allocation. "
+                 "Full-time default: 38h. Leave as 0 for casual staff.",
+        )
+        c8.markdown("")  # spacer
+
         raw_start = d.get("employment_start_date")
         start_def = date.fromisoformat(raw_start[:10]) if raw_start else date.today()
         employment_start_date = st.date_input(
@@ -274,6 +294,7 @@ def staff_form(
         "employment_type":                  employment_type,
         "employment_start_date":            employment_start_date.isoformat(),
         "employee_number":                  employee_number.strip(),
+        "contracted_hours_per_week":        contracted_hours_per_week,
         "centre_id":                        centre_id,
         "role":                             role,
         "primary_room_id":                  primary_room_id,
