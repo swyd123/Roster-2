@@ -101,6 +101,7 @@ class RosterResult:
     review_warnings: list[str]
     unmet_rooms:     list[str]
     debug_log:       list[dict] = field(default_factory=list)  # per-break decision log
+    validation:      dict       = field(default_factory=dict)  # weekly constraint validation
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,28 +158,100 @@ def generate_roster(
 
     room_map = {r["id"]: r for r in rooms}
 
+    # Track full-time rostered days across the week for validation
+    ft_rostered_days: dict[str, int] = {}   # uid → count of rostered days
+    ft_pattern_idx:   dict[str, int] = {}   # uid → next pattern to use (rotation)
+
     for day in days:
         date_str = day.isoformat()
         dow      = day.isoweekday() % 7   # 0=Sun, 1=Mon … 6=Sat
 
         # Intervals for this day keyed by room_id
-        day_ivs   = all_intervals.get(date_str, [])
-        room_ivs  = _group_intervals_by_room(day_ivs)
+        day_ivs  = all_intervals.get(date_str, [])
+        room_ivs = _group_intervals_by_room(day_ivs)
 
-        # ── Step 1: compute required staff per room per slot ──────────
-        room_windows = {}     # {room_id: [CoverageWindow]}
+        day_shifts: list[SuggestedShift] = []
+
+        # ── Step 1A: Full-time base shifts ────────────────────────────
+        # Give every available full-time educator a full-day shift first,
+        # regardless of demand, using preferred patterns. This satisfies
+        # centre operating coverage before we ever look at intervals.
+        ft_staff = [s for s in centre_staff if s.get("employment_type") == "full_time"]
+
+        for s in sorted(ft_staff, key=lambda x: (_employment_rank(x), x.get("name", ""))):
+            uid  = s["uid"]
+            name = s["name"]
+
+            # Leave check
+            if date_str in leave_map.get(uid, []):
+                continue
+
+            # Availability check
+            av = availability_map.get(uid, {}).get(dow)
+            if av is not None and not av.get("is_available", True):
+                continue
+
+            # Pick pattern — rotate fairly across the week
+            patterns = FT_SHIFT_PATTERNS
+            pat_idx  = ft_pattern_idx.get(uid, 0)
+
+            # Try patterns in rotation order; skip if outside availability window
+            assigned_ft = False
+            for attempt in range(len(patterns)):
+                idx  = (pat_idx + attempt) % len(patterns)
+                ss, se = patterns[idx]
+
+                # Check availability window compatibility
+                if av:
+                    av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
+                    av_until = (av.get("available_until") or "23:59")[:5] + ":00"
+                    if ss < av_from or se > av_until:
+                        continue
+
+                # Assign this pattern
+                pref_day = break_prefs.get(uid, {}).get(dow, False)
+                override = "opted_out" if pref_day else "use_staff_default"
+                rid      = s.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
+                rname    = room_map.get(rid, {}).get("name", "")
+
+                shift = SuggestedShift(
+                    user_id=uid,
+                    user_name=name,
+                    room_id=rid,
+                    room_name=rname,
+                    shift_date=date_str,
+                    start_time=ss,
+                    end_time=se,
+                    shift_type=_shift_type(ss, se),
+                    break_opt_out_override=override,
+                    source="full_time_base",
+                )
+                day_shifts.append(shift)
+                ft_rostered_days[uid] = ft_rostered_days.get(uid, 0) + 1
+                ft_pattern_idx[uid]   = (pat_idx + attempt + 1) % len(patterns)
+                assigned_ft = True
+                break
+
+            if not assigned_ft:
+                ratio_warns.append(
+                    f"Full-time {name}: could not assign a shift on {date_str} "
+                    "— availability conflicts with all preferred patterns."
+                )
+
+        # ── Step 1B: Compute room ratio requirements from intervals ───
+        # Build demand windows as before, then check what additional staff
+        # are needed beyond the full-time base coverage already placed.
+        room_windows: dict[str, list[CoverageWindow]] = {}
         for room in rooms:
             rid     = room["id"]
             r_staff = room.get("required_ratio_staff",    1)
             r_child = room.get("required_ratio_children", 4)
-            cap     = room.get("licensed_capacity", 0)
 
             ivs = room_ivs.get(rid, [])
             if not ivs:
                 continue
 
-            # Required staff at each interval
-            req_by_slot = {}
+            req_by_slot: dict[str, int] = {}
             for iv in ivs:
                 act = iv.get("actual_children")
                 exp = iv.get("expected_children")
@@ -190,66 +263,64 @@ def generate_roster(
             if not req_by_slot:
                 continue
 
-            windows = _merge_slots_to_windows(req_by_slot, ivs)
-            room_windows[rid] = windows
+            room_windows[rid] = _merge_slots_to_windows(req_by_slot, ivs)
 
-        # ── Step 2: assign staff to windows ──────────────────────────
-        # Track who has been assigned and for how long each day
-        assigned_minutes: dict[str, int] = {}   # uid → total minutes assigned today
-        day_shifts: list[SuggestedShift]  = []
+        # ── Step 2: Part-time/casual gap fill ─────────────────────────
+        # For each room/window, count how many full-time staff already cover
+        # each slot. Only add part-time/casual for uncovered gaps.
+        pt_ca_staff = [s for s in centre_staff if s.get("employment_type") != "full_time"]
+        assigned_gap_minutes: dict[str, int] = {}
 
         for rid, windows in room_windows.items():
-            room   = room_map.get(rid, {})
-            rname  = room.get("name", rid)
-
-            # Find eligible staff for this room
-            eligible = _eligible_staff(
-                centre_staff, rid, date_str, dow,
-                availability_map, leave_map,
-            )
+            room  = room_map.get(rid, {})
+            rname = room.get("name", rid)
 
             for window in windows:
-                staffed = 0
-                for _ in range(window.required_staff):
+                # Count how many already-placed shifts cover this window slot-by-slot
+                ft_coverage_min = _count_coverage_in_window(day_shifts, rid, window)
+                gap = window.required_staff - ft_coverage_min
+                if gap <= 0:
+                    continue   # full-time base already satisfies ratio
+
+                # Find eligible part-time/casual for this room
+                eligible = _eligible_staff(
+                    pt_ca_staff, rid, date_str, dow,
+                    availability_map, leave_map,
+                )
+
+                for _ in range(gap):
                     best = _pick_staff(
                         eligible, rid, date_str, window,
-                        assigned_minutes, day_shifts,
+                        assigned_gap_minutes, day_shifts,
                     )
                     if best is None:
                         ratio_warns.append(
                             f"{rname} {window.start[:5]}–{window.end[:5]} on {date_str}: "
-                            f"could not fill staff slot {staffed + 1}/{window.required_staff}."
+                            f"gap of {gap} staff not filled — no part-time/casual available."
                         )
+                        if rname not in unmet_rooms:
+                            unmet_rooms.append(rname)
                         break
 
                     uid      = best["uid"]
-                    uname    = best["name"]
-                    stype    = _shift_type(window.start, window.end)
                     dur_mins = shift_duration_minutes(window.start, window.end)
-
-                    # Apply break opt-out preference for this weekday
                     pref_day = break_prefs.get(uid, {}).get(dow, False)
                     override = "opted_out" if pref_day else "use_staff_default"
 
                     shift = SuggestedShift(
                         user_id=uid,
-                        user_name=uname,
+                        user_name=best["name"],
                         room_id=rid,
                         room_name=rname,
                         shift_date=date_str,
                         start_time=window.start,
                         end_time=window.end,
-                        shift_type=stype,
+                        shift_type=_shift_type(window.start, window.end),
                         break_opt_out_override=override,
                         source=best["source"],
                     )
                     day_shifts.append(shift)
-                    assigned_minutes[uid] = assigned_minutes.get(uid, 0) + dur_mins
-                    staffed += 1
-
-            if not eligible:
-                if rname not in unmet_rooms:
-                    unmet_rooms.append(rname)
+                    assigned_gap_minutes[uid] = assigned_gap_minutes.get(uid, 0) + dur_mins
 
         all_shifts.extend(day_shifts)
 
@@ -472,6 +543,48 @@ def generate_roster(
     )
     review_warns.extend(extra_review_warns)
 
+    # ── Build weekly validation report ────────────────────────────────
+    ft_staff_all = [s for s in centre_staff if s.get("employment_type") == "full_time"]
+    ft_below_days  = [
+        f"{s['name']}: {ft_rostered_days.get(s['uid'], 0)} day(s) rostered (target {FT_MIN_DAYS})"
+        for s in ft_staff_all
+        if ft_rostered_days.get(s["uid"], 0) < FT_MIN_DAYS
+    ]
+
+    # Check 10.5h day target per FT staff
+    ft_shift_map: dict[str, list] = {}
+    for s in all_shifts:
+        if s.source == "full_time_base":
+            ft_shift_map.setdefault(s.user_id, []).append(s)
+    ft_below_hours = []
+    for uid, ushift in ft_shift_map.items():
+        for s in ushift:
+            dur = _mins_between(s.start_time, s.end_time) / 60
+            if dur < FT_MIN_HOURS:
+                ft_below_hours.append(
+                    f"{s.user_name} on {s.shift_date}: {dur:.1f}h (target {FT_MIN_HOURS}h)"
+                )
+
+    # Coverage gaps already in ratio_warns — extract them
+    coverage_gaps  = [w for w in ratio_warns if "Coverage gap" in w]
+    ratio_breaches = [w for w in ratio_warns if "Coverage gap" not in w]
+
+    pt_hours = sum(
+        _mins_between(s.start_time, s.end_time) / 60
+        for s in all_shifts
+        if s.source != "full_time_base"
+    )
+
+    validation = {
+        "centre_coverage_achieved": len(coverage_gaps) == 0,
+        "uncovered_intervals":      coverage_gaps,
+        "centre_ratio_breaches":    ratio_breaches,
+        "ft_below_4_days":          ft_below_days,
+        "ft_below_10h_days":        ft_below_hours,
+        "pt_ca_hours_used":         round(pt_hours, 1),
+        "review_warnings":          review_warns,
+    }
+
     return RosterResult(
         shifts=all_shifts,
         breaks=all_breaks,
@@ -480,6 +593,7 @@ def generate_roster(
         review_warnings=review_warns,
         unmet_rooms=unmet_rooms,
         debug_log=all_debug_log,
+        validation=validation,
     )
 
 
@@ -594,6 +708,18 @@ EMPLOYMENT_PRIORITY: dict[str, int] = {
     "casual":     2,
 }
 CASUAL_MIN_SHIFT_MINUTES: int = 180   # 3 hours — casual staff floor
+
+# Preferred full-time shift patterns (start, end) — tried in order.
+# Target total = 10h45m to give ~10.5h after a 30-min unpaid break.
+FT_SHIFT_PATTERNS: list[tuple[str, str]] = [
+    ("07:15:00", "17:45:00"),   # 10h30m — opening
+    ("07:30:00", "18:00:00"),   # 10h30m — closing
+    ("07:15:00", "18:00:00"),   # 10h45m — long day if needed
+    ("08:00:00", "18:00:00"),   # 10h00m — late start fallback
+]
+
+FT_MIN_HOURS: float = 10.5    # target minimum hours per full-time day
+FT_MIN_DAYS:  int   = 4       # target rostered days per full-time week
 
 
 def _employment_rank(s: dict) -> int:
@@ -807,6 +933,44 @@ def _build_room_coverage(
             if shift.start_time <= slot < shift.end_time:
                 result[rid][slot] = result[rid].get(slot, 0) + 1
     return result
+
+
+def _count_coverage_in_window(
+    day_shifts: list[SuggestedShift],
+    room_id: str,
+    window: "CoverageWindow",
+) -> int:
+    """
+    Return the MINIMUM number of already-placed shifts that cover every
+    15-minute slot inside [window.start, window.end) for room_id.
+
+    "Minimum" means the worst-covered slot in the window — used to
+    calculate how many additional staff are still needed to meet ratio.
+    """
+    # Build 15-min slots inside this window
+    slots: list[str] = []
+    try:
+        cur = datetime.strptime(window.start[:8], "%H:%M:%S")
+        end = datetime.strptime(window.end[:8],   "%H:%M:%S")
+        while cur < end:
+            slots.append(cur.strftime("%H:%M:%S"))
+            cur += timedelta(minutes=15)
+    except Exception:
+        return 0
+
+    if not slots:
+        return 0
+
+    min_cover = 9999
+    for slot in slots:
+        count = sum(
+            1 for s in day_shifts
+            if s.room_id == room_id
+            and s.start_time <= slot < s.end_time
+        )
+        min_cover = min(min_cover, count)
+
+    return min_cover if min_cover < 9999 else 0
 
 
 def _merge_separate_rest_and_meal(
