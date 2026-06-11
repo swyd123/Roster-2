@@ -303,6 +303,42 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
             st.markdown("---")
             st.markdown(weekly_html, unsafe_allow_html=True)
 
+    # ── Validation panel ──────────────────────────────────────────────
+    validation = getattr(result, "validation", {})
+    if validation:
+        st.markdown("---")
+        st.markdown("### ✅ Roster Validation")
+        coverage_ok = validation.get("centre_coverage_achieved", True)
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric(
+            "Centre coverage 7:15–18:00",
+            "✅ Met" if coverage_ok else "❌ Gaps found",
+            delta=None,
+        )
+        col_b.metric("Uncovered intervals", len(validation.get("uncovered_intervals", [])))
+        col_c.metric("FT staff below 4 days", len(validation.get("ft_below_4_days", [])))
+        col_d.metric("PT/casual hours used", f"{validation.get('pt_ca_hours_used', 0):.1f}h")
+
+        if validation.get("uncovered_intervals"):
+            with st.expander("❌ Uncovered intervals", expanded=True):
+                for w in validation["uncovered_intervals"]:
+                    st.error(w)
+
+        if validation.get("centre_ratio_breaches"):
+            with st.expander(f"⚠️ {len(validation['centre_ratio_breaches'])} ratio breach(es)"):
+                for w in validation["centre_ratio_breaches"]:
+                    st.warning(w)
+
+        if validation.get("ft_below_4_days"):
+            with st.expander("⚠️ Full-time staff below 4 rostered days"):
+                for w in validation["ft_below_4_days"]:
+                    st.warning(w)
+
+        if validation.get("ft_below_10h_days"):
+            with st.expander("⚠️ Full-time days below 10.5 hours"):
+                for w in validation["ft_below_10h_days"]:
+                    st.warning(w)
+
     # ── Debug expander (replaces old shift/break tables) ─────────────
     st.markdown("---")
     with st.expander("🔍 Raw data (debug)", expanded=False):
