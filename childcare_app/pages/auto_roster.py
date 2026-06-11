@@ -13,7 +13,10 @@ import streamlit as st
 from datetime import date, timedelta
 import pandas as pd
 
-from utils.auto_roster_engine import generate_roster, SuggestedShift, SuggestedBreak
+from utils.auto_roster_engine import (
+    generate_roster, SuggestedShift, SuggestedBreak,
+    FT_MIN_DAYS, FT_MIN_HOURS,
+)
 from utils.roster_queries import (
     fetch_roster_periods, create_roster_period,
     fetch_approved_leave_for_period, fetch_availability_map,
@@ -308,35 +311,75 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     if validation:
         st.markdown("---")
         st.markdown("### ✅ Roster Validation")
-        coverage_ok = validation.get("centre_coverage_achieved", True)
-        col_a, col_b, col_c, col_d = st.columns(4)
-        col_a.metric(
-            "Centre coverage 7:15–18:00",
-            "✅ Met" if coverage_ok else "❌ Gaps found",
-            delta=None,
-        )
-        col_b.metric("Uncovered intervals", len(validation.get("uncovered_intervals", [])))
-        col_c.metric("FT staff below 4 days", len(validation.get("ft_below_4_days", [])))
-        col_d.metric("PT/casual hours used", f"{validation.get('pt_ca_hours_used', 0):.1f}h")
 
-        if validation.get("uncovered_intervals"):
-            with st.expander("❌ Uncovered intervals", expanded=True):
-                for w in validation["uncovered_intervals"]:
+        coverage_ok  = validation.get("centre_coverage_achieved", True)
+        uncovered    = validation.get("uncovered_intervals", [])
+        ratio_breach = validation.get("centre_ratio_breaches", [])
+        ft_low_days  = validation.get("ft_below_4_days", [])
+        ft_low_hrs   = validation.get("ft_below_10h_days", [])
+        pt_hrs       = validation.get("pt_ca_hours_used", 0)
+
+        # Critical banner if hard constraints are breached
+        critical_items = ft_low_days + ft_low_hrs + uncovered
+        if critical_items:
+            st.error(
+                f"⛔ **CRITICAL: {len(critical_items)} hard constraint violation(s).** "
+                "Full-time minimum allocation or centre coverage not achieved. "
+                "Review the FT Allocation Report below before saving."
+            )
+
+        # Summary metrics
+        mc = st.columns(5)
+        mc[0].metric("Centre coverage 7:15–18:00",
+                     "✅ Met" if coverage_ok else "❌ Gaps",
+                     delta=f"{len(uncovered)} gap(s)" if uncovered else None,
+                     delta_color="inverse" if uncovered else "off")
+        mc[1].metric("FT below 4 days",  len(ft_low_days),
+                     delta="CRITICAL" if ft_low_days else None,
+                     delta_color="inverse" if ft_low_days else "off")
+        mc[2].metric("FT below 10.25h", len(ft_low_hrs),
+                     delta="CRITICAL" if ft_low_hrs else None,
+                     delta_color="inverse" if ft_low_hrs else "off")
+        mc[3].metric("Ratio breaches",  len(ratio_breach),
+                     delta_color="inverse" if ratio_breach else "off")
+        mc[4].metric("PT/casual hours", f"{pt_hrs:.1f}h")
+
+        # FT Allocation Report — always shown when FT staff exist
+        ft_report = validation.get("ft_allocation_report", [])
+        if ft_report:
+            st.markdown("#### 👷 Full-Time Allocation Report")
+            st.caption(
+                "Hard constraint: every full-time educator must receive "
+                f"≥ {FT_MIN_DAYS} rostered days and ≥ {FT_MIN_HOURS}h per day. "
+                "Exceptions: leave, unavailability, public holiday."
+            )
+            report_rows = []
+            for row in ft_report:
+                compliant = row.get("compliant", True)
+                report_rows.append({
+                    "Educator":      row["name"],
+                    "Type":          row["employment_type"],
+                    "Req days":      row["required_days"],
+                    "Got days":      row["allocated_days"],
+                    "Req hrs/day":   row["required_hours"],
+                    "Got hrs total": f"{row['allocated_hours']:.1f}h",
+                    "10.5h days":    row["compliant_days"],
+                    "✓ Compliant":  "✅ Yes" if compliant else "❌ No",
+                    "Reason":        row.get("reason", ""),
+                })
+            st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
+
+        # Uncovered intervals
+        if uncovered:
+            with st.expander(f"❌ {len(uncovered)} uncovered interval(s) — centre not staffed",
+                             expanded=True):
+                for w in uncovered:
                     st.error(w)
 
-        if validation.get("centre_ratio_breaches"):
-            with st.expander(f"⚠️ {len(validation['centre_ratio_breaches'])} ratio breach(es)"):
-                for w in validation["centre_ratio_breaches"]:
-                    st.warning(w)
-
-        if validation.get("ft_below_4_days"):
-            with st.expander("⚠️ Full-time staff below 4 rostered days"):
-                for w in validation["ft_below_4_days"]:
-                    st.warning(w)
-
-        if validation.get("ft_below_10h_days"):
-            with st.expander("⚠️ Full-time days below 10.5 hours"):
-                for w in validation["ft_below_10h_days"]:
+        # Ratio breaches
+        if ratio_breach:
+            with st.expander(f"⚠️ {len(ratio_breach)} ratio breach(es)"):
+                for w in ratio_breach:
                     st.warning(w)
 
     # ── Debug expander (replaces old shift/break tables) ─────────────
