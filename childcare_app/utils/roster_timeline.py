@@ -1,144 +1,110 @@
 # utils/roster_timeline.py
-# Builds a colour-coded HTML roster timeline grid from engine output.
-# Pure Python — no Streamlit, no database calls.
+# Colour-coded HTML roster timeline grid — pure Python, no Streamlit, no DB.
 #
 # GRID STRUCTURE
-# ──────────────
 #  Left fixed columns : Educator | Start | Finish
-#  Centre columns     : one per 15-min slot, 07:15 → 18:30
-#  Right columns      : room summary (name | children | ratio | req. staff)
+#  Centre columns     : one 15-min slot, 07:15 → 18:30
+#  Right columns      : room summary (name | children | ratio | req.staff)
 #
-# CELL CONTENT during each slot
-#  • Shift active, no break, no movement : short room code (≤4 chars)
-#  • Combined break                       : "B{dur}" e.g. "B40", "B50"
-#  • Rest break only                      : "B20" or "B10"
-#  • Meal break only                      : "B30"
-#  • Temporary movement (cover)           : room code + "†" marker
-#  • Outside shift                        : empty / grey
+# CELL CONTENT
+#  Shift, no break, no cover : room code, room colour
+#  Break slot                : B40 / B50 / B30 etc, grey (amber if manual_review)
+#  Temporary movement        : destination room code + "†", amber background
+#  Outside shift             : empty grey
 
 from __future__ import annotations
 from datetime import datetime, timedelta
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
+from collections import defaultdict
 
 GRID_START = "07:15:00"
 GRID_END   = "18:30:00"
 SLOT_MINS  = 15
 
-# Colour palette — room colours are assigned on first use from this list.
-# Must contrast with white text.  Design: muted-but-distinct, not candy.
 ROOM_PALETTE = [
-    "#2d6a8f",   # steel blue
-    "#3a7d44",   # forest green
-    "#7b4f9e",   # plum
-    "#b5541c",   # terracotta
-    "#4a7c74",   # teal
-    "#8f6d2d",   # ochre
-    "#2d4f8f",   # navy
-    "#6b3a3a",   # burgundy
+    "#2d6a8f", "#3a7d44", "#7b4f9e", "#b5541c",
+    "#4a7c74", "#8f6d2d", "#2d4f8f", "#6b3a3a",
 ]
 
-BREAK_BG     = "#f0f0f0"   # light grey for break cells
-BREAK_FG     = "#333333"
-MOVE_BG      = "#fff3cd"   # amber tint for temporary-movement cells
-MOVE_FG      = "#7a5c00"
-EMPTY_BG     = "#f8f9fa"   # outside-shift cells
-HEADER_BG    = "#0d1f35"   # app navy
-HEADER_FG    = "#ffffff"
-ROW_ALT_BG   = "#f6f8fa"   # alternating row stripe
+BREAK_BG  = "#f0f0f0"
+BREAK_FG  = "#333333"
+MOVE_BG   = "#fff3cd"
+MOVE_FG   = "#7a5c00"
+EMPTY_BG  = "#f8f9fa"
+ROW_ALT   = "#f6f8fa"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC API
+# PUBLIC
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_timeline_html(
     date_str: str,
-    shifts: list,        # list[SuggestedShift] for this day
-    breaks: list,        # list[SuggestedBreak] for this day
-    movements: list,     # list[SuggestedMovement] for this day
-    rooms: list[dict],   # room dicts with id, name, licensed_capacity,
-                         # required_ratio_staff, required_ratio_children
-    intervals: list[dict] | None = None,  # actual_children per room per slot
+    shifts: list,
+    breaks: list,
+    movements: list,
+    rooms: list[dict],
+    intervals: list[dict] | None = None,
 ) -> str:
     """
-    Build a complete self-contained HTML roster timeline for one day.
-
-    Returns an HTML string suitable for st.markdown(html, unsafe_allow_html=True).
-    The table uses inline styles only — no external CSS — so it renders cleanly
-    inside Streamlit's markdown renderer.
+    Build complete self-contained HTML roster timeline for one day.
+    Multiple shift segments for the same educator are merged into one row.
+    Room transitions across the day are shown per-slot using room colour.
     """
     slots      = _build_slots()
     room_map   = {r["id"]: r for r in rooms}
     room_color = _assign_room_colors(rooms)
 
-    # Build lookup structures
-    # break_map[uid][slot_str] = break_label
-    # break_status[uid][slot_str] = "scheduled" | "manual_review"
+    # Merge segments → one display row per educator
+    merged_rows   = _merge_educator_shifts(shifts)
+
+    # Build lookup maps
     break_map, break_status_map = _build_break_map(breaks, slots)
+    movement_map  = _build_movement_map(movements, slots)
+    children_map  = _build_children_map(intervals or [], slots)
 
-    # movement_map[slot_str] = {to_room_id: [SuggestedMovement, ...]}
-    movement_map = _build_movement_map(movements, slots)
+    # slot_room_map[uid][slot] = room_id — drives cell colour
+    slot_room_map = _build_slot_room_map(shifts, slots)
 
-    # children_map[room_id][slot_str] = count
-    children_map = _build_children_map(intervals or [], slots)
+    # Sort: by room name of primary segment, then educator name
+    sorted_rows = sorted(
+        merged_rows,
+        key=lambda r: (r["primary_room_name"], r["user_name"]),
+    )
 
-    # Sort educators: by room name then educator name
-    sorted_shifts = sorted(shifts, key=lambda s: (s.room_name, s.user_name))
-
-    # ── HTML header ───────────────────────────────────────────────────
-    html_parts = [
+    parts = [
         "<div style='overflow-x:auto;font-family:DM Sans,system-ui,sans-serif;"
         "font-size:11px;line-height:1.3;'>",
-        f"<table style='border-collapse:collapse;min-width:100%;white-space:nowrap;'>",
+        "<table style='border-collapse:collapse;min-width:100%;white-space:nowrap;'>",
+        "<thead>",
+        _build_hour_header(slots),
+        _build_slot_header(slots),
+        "</thead>",
+        "<tbody>",
     ]
 
-    # ── Header row 1: date + hour labels ─────────────────────────────
-    # Group slots by hour for a clean hour header
-    html_parts.append("<thead>")
-    html_parts.append(_build_hour_header(slots))
-    html_parts.append(_build_slot_header(slots))
-    html_parts.append("</thead>")
-
-    # ── Body rows ─────────────────────────────────────────────────────
-    html_parts.append("<tbody>")
-    for i, shift in enumerate(sorted_shifts):
-        row_bg = "#ffffff" if i % 2 == 0 else ROW_ALT_BG
-        html_parts.append(
-            _build_educator_row(
-                shift, slots, room_map, room_color,
-                break_map, break_status_map, movement_map, row_bg,
+    for i, row in enumerate(sorted_rows):
+        bg = "#ffffff" if i % 2 == 0 else ROW_ALT
+        parts.append(
+            _build_merged_row(
+                row, slots, room_map, room_color,
+                slot_room_map.get(row["user_id"], {}),
+                break_map, break_status_map, movement_map, bg,
             )
         )
-    html_parts.append("</tbody>")
 
-    # ── Room summary footer rows ──────────────────────────────────────
-    html_parts.append("<tfoot>")
-    html_parts.append(
-        _build_room_summary_rows(
-            shifts, slots, rooms, room_color, children_map,
-        )
+    parts += ["</tbody>", "<tfoot>"]
+    parts.append(
+        _build_room_summary_rows(shifts, slots, rooms, room_color, children_map)
     )
-    html_parts.append("</tfoot>")
-
-    html_parts.append("</table>")
-
-    # ── Colour legend ─────────────────────────────────────────────────
-    html_parts.append(_build_legend(rooms, room_color))
-
-    html_parts.append("</div>")
-    return "\n".join(html_parts)
+    parts += ["</tfoot>", "</table>"]
+    parts.append(_build_legend(rooms, room_color))
+    parts.append("</div>")
+    return "\n".join(parts)
 
 
 def build_movement_notes_html(movements: list) -> str:
-    """
-    Build a simple HTML movement notes section for display below the grid.
-    """
     if not movements:
         return ""
-
     rows = sorted(movements, key=lambda m: (m.move_date, m.start_time))
     parts = [
         "<div style='margin-top:16px;font-family:DM Sans,system-ui,sans-serif;"
@@ -151,7 +117,7 @@ def build_movement_notes_html(movements: list) -> str:
         "</tr>",
     ]
     for i, mv in enumerate(rows):
-        bg = "#ffffff" if i % 2 == 0 else ROW_ALT_BG
+        bg = "#ffffff" if i % 2 == 0 else ROW_ALT
         parts += [
             f"<tr style='background:{bg};'>",
             f"<td style='padding:3px 8px;'>{mv.educator_name}</td>",
@@ -166,215 +132,206 @@ def build_movement_notes_html(movements: list) -> str:
     return "\n".join(parts)
 
 
-def get_day_summary(
-    date_str: str,
-    shifts: list,
-    breaks: list,
-    movements: list,
-) -> dict:
-    """Return summary counts for a single day."""
+def get_day_summary(date_str, shifts, breaks, movements) -> dict:
     return {
-        "date":       date_str,
-        "educators":  len(shifts),
-        "breaks":     len(breaks),
-        "movements":  len(movements),
+        "date":          date_str,
+        "educators":     len(_merge_educator_shifts(shifts)),
+        "breaks":        len(breaks),
+        "movements":     len(movements),
         "manual_review": sum(1 for b in breaks if b.status == "manual_review"),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRIVATE: slot helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_slots() -> list[str]:
-    """Return list of HH:MM:SS slot strings from GRID_START to GRID_END."""
-    slots = []
-    t     = datetime.strptime(GRID_START, "%H:%M:%S")
-    end   = datetime.strptime(GRID_END,   "%H:%M:%S")
-    while t < end:
-        slots.append(t.strftime("%H:%M:%S"))
-        t += timedelta(minutes=SLOT_MINS)
-    return slots
-
-
-def _slot_label(slot: str) -> str:
-    """'07:15:00' → '7:15'"""
-    h, m = int(slot[:2]), int(slot[3:5])
-    return f"{h}:{m:02d}"
-
-
-def _slot_hour(slot: str) -> int:
-    return int(slot[:2])
-
-
-def _overlaps_slot(slot: str, start: str, end: str) -> bool:
-    """Return True when slot_start ≤ slot < end (half-open interval)."""
-    slot_end = (datetime.strptime(slot, "%H:%M:%S")
-                + timedelta(minutes=SLOT_MINS)).strftime("%H:%M:%S")
-    # slot is active if slot_start < end AND start < slot_end
-    return start < slot_end and slot >= start and slot < end
-
-
-def _is_in_shift(slot: str, shift_start: str, shift_end: str) -> bool:
-    return shift_start <= slot < shift_end
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PRIVATE: lookup builders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _assign_room_colors(rooms: list[dict]) -> dict[str, str]:
-    color_map = {}
-    for i, room in enumerate(rooms):
-        color_map[room["id"]] = ROOM_PALETTE[i % len(ROOM_PALETTE)]
-    return color_map
-
-
-def _room_code(room: dict) -> str:
-    """Short code: first 4 chars of room name, upper-cased."""
-    return room.get("name", "?")[:4].upper()
-
-
-def _break_label(brk) -> str:
+def build_weekly_summary_html(
+    all_shifts: list,
+    all_breaks: list,
+    days: list,
+    staff_profiles: dict,   # {uid: {name, employment_type}}
+) -> str:
     """
-    Label to show in break cells.
-    Combined: "B{total_dur}"  e.g. B40, B50
-    Rest only: "B{paid_min}"  e.g. B20, B10
-    Meal only: "B30"
+    Weekly staff summary table.
+    Counts merged shifts (one per educator per day), total hours, 10.5h days.
     """
-    dur = getattr(brk, "planned_duration_minutes", 0)
-    return f"B{dur}"
+    from collections import defaultdict
+    import math
+
+    by_uid: dict[str, list] = defaultdict(list)
+    for s in all_shifts:
+        by_uid[s.user_id].append(s)
+
+    rows_html = []
+    for uid, shifts in sorted(by_uid.items(), key=lambda x: x[1][0].user_name):
+        merged_by_day: dict[str, dict] = {}
+        for s in shifts:
+            d = s.shift_date
+            if d not in merged_by_day:
+                merged_by_day[d] = {"start": s.start_time, "end": s.end_time}
+            else:
+                merged_by_day[d]["start"] = min(merged_by_day[d]["start"], s.start_time)
+                merged_by_day[d]["end"]   = max(merged_by_day[d]["end"],   s.end_time)
+
+        name       = shifts[0].user_name
+        etype      = staff_profiles.get(uid, {}).get("employment_type", "—")
+        n_days     = len(merged_by_day)
+        total_hrs  = 0.0
+        n_10h      = 0
+        warnings   = []
+
+        for d, seg in merged_by_day.items():
+            dur = _mins_str(seg["start"], seg["end"]) / 60
+            total_hrs += dur
+            if dur >= 10.4:
+                n_10h += 1
+
+        if etype == "full_time" and n_days < 4:
+            warnings.append("Full-time target not met due to availability.")
+
+        warn_html = (
+            f"<span style='color:#b45309;font-size:9px;'>⚠ {'; '.join(warnings)}</span>"
+            if warnings else ""
+        )
+        rows_html.append(
+            f"<tr>"
+            f"<td style='padding:3px 8px;font-weight:600;'>{name}</td>"
+            f"<td style='padding:3px 8px;'>{etype.replace('_',' ').title()}</td>"
+            f"<td style='padding:3px 8px;text-align:center;'>{n_days}</td>"
+            f"<td style='padding:3px 8px;text-align:center;'>{total_hrs:.1f}h</td>"
+            f"<td style='padding:3px 8px;text-align:center;'>{n_10h}</td>"
+            f"<td style='padding:3px 8px;'>{warn_html}</td>"
+            f"</tr>"
+        )
+
+    if not rows_html:
+        return ""
+
+    return (
+        "<div style='font-family:DM Sans,system-ui,sans-serif;font-size:11px;"
+        "margin-top:12px;'>"
+        "<strong style='color:#0d1f35;'>📋 Weekly Staff Summary</strong>"
+        "<table style='border-collapse:collapse;margin-top:8px;width:100%;'>"
+        "<tr style='background:#0d1f35;color:#fff;'>"
+        + "".join(
+            f"<th style='padding:4px 8px;text-align:left;'>{h}</th>"
+            for h in ["Educator","Type","Days","Hours","10.5h days","Warnings"]
+        )
+        + "</tr>"
+        + "".join(rows_html)
+        + "</table></div>"
+    )
 
 
-def _build_break_map(
-    breaks: list,
+# ─────────────────────────────────────────────────────────────────────────────
+# MERGE LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _merge_educator_shifts(shifts: list) -> list[dict]:
+    """
+    Collapse all same-educator same-day SuggestedShift segments into
+    one display row per educator per day.
+
+    Returns list of dicts:
+        user_id, user_name, shift_date,
+        start_time (earliest),  end_time (latest),
+        primary_room_id, primary_room_name,
+        segments (original SuggestedShift list, sorted by start)
+    """
+    groups: dict[tuple, list] = defaultdict(list)
+    for s in shifts:
+        groups[(s.user_id, s.shift_date)].append(s)
+
+    rows = []
+    for (uid, date_str), segs in groups.items():
+        segs_sorted = sorted(segs, key=lambda s: s.start_time)
+        start_time  = segs_sorted[0].start_time
+        end_time    = max(s.end_time for s in segs_sorted)
+
+        # Primary room = whichever segment covers the most time
+        room_minutes: dict[str, int] = defaultdict(int)
+        for s in segs_sorted:
+            room_minutes[s.room_id] += _mins_str(s.start_time, s.end_time)
+        primary_rid = max(room_minutes, key=lambda r: room_minutes[r])
+        primary_name = segs_sorted[0].room_name  # fallback
+        for s in segs_sorted:
+            if s.room_id == primary_rid:
+                primary_name = s.room_name
+                break
+
+        rows.append({
+            "user_id":           uid,
+            "user_name":         segs_sorted[0].user_name,
+            "shift_date":        date_str,
+            "start_time":        start_time,
+            "end_time":          end_time,
+            "primary_room_id":   primary_rid,
+            "primary_room_name": primary_name,
+            "break_opt_out_override": segs_sorted[0].break_opt_out_override,
+            "segments":          segs_sorted,
+        })
+
+    return rows
+
+
+def _build_slot_room_map(
+    shifts: list,
     slots: list[str],
-) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+) -> dict[str, dict[str, str]]:
     """
-    Returns:
-        break_label_map[uid][slot] = label string (e.g. "B40")
-        break_status_map[uid][slot] = "scheduled" | "manual_review"
+    slot_room_map[uid][slot_str] = room_id
+    When an educator has multiple segments, each slot is assigned to the
+    room whose segment covers it.  Latest-placed segment wins ties.
     """
-    label_map:  dict[str, dict[str, str]] = {}
-    status_map: dict[str, dict[str, str]] = {}
-
-    for brk in breaks:
-        uid   = brk.user_id
-        bs    = brk.planned_start_time
-        be    = brk.planned_end_time
-        label = _break_label(brk)
-        stat  = brk.status
-
-        if uid not in label_map:
-            label_map[uid]  = {}
-            status_map[uid] = {}
-
+    result: dict[str, dict[str, str]] = {}
+    for s in shifts:
+        uid = s.user_id
+        if uid not in result:
+            result[uid] = {}
         for slot in slots:
-            if _is_in_shift(slot, bs, be):
-                label_map[uid][slot]  = label
-                status_map[uid][slot] = stat
-
-    return label_map, status_map
-
-
-def _build_movement_map(
-    movements: list,
-    slots: list[str],
-) -> dict[str, dict[str, list]]:
-    """
-    movement_map[slot][to_room_id] = [SuggestedMovement, ...]
-    Used to show covering educator in destination room.
-    """
-    mv_map: dict[str, dict[str, list]] = {}
-    for mv in movements:
-        for slot in slots:
-            if _is_in_shift(slot, mv.start_time, mv.end_time):
-                if slot not in mv_map:
-                    mv_map[slot] = {}
-                rid = mv.to_room_id
-                mv_map[slot].setdefault(rid, []).append(mv)
-    return mv_map
-
-
-def _build_children_map(
-    intervals: list[dict],
-    slots: list[str],
-) -> dict[str, dict[str, int]]:
-    """
-    children_map[room_id][slot] = actual_children count.
-    Used for room summary footer.
-    """
-    result: dict[str, dict[str, int]] = {}
-    for iv in intervals:
-        rid   = iv.get("room_id", "")
-        istart = iv.get("interval_start", "")
-        count  = iv.get("actual_children") or iv.get("expected_children") or 0
-        if rid and istart:
-            result.setdefault(rid, {})[istart] = int(count)
+            if _is_in_shift(slot, s.start_time, s.end_time):
+                result[uid][slot] = s.room_id
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRIVATE: HTML row builders
+# HTML ROW BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TH = "style='padding:3px 6px;border:1px solid #dde;text-align:center;"
 _TD = "style='padding:3px 5px;border:1px solid #e2e8f0;"
 
+
 def _th(content: str, extra: str = "", colspan: int = 1) -> str:
     col = f"colspan='{colspan}' " if colspan > 1 else ""
     return f"<th {col}{_TH}{extra}'>{content}</th>"
 
-def _td(content: str, bg: str, fg: str = "#ffffff", extra: str = "") -> str:
-    return (
-        f"<td {_TD}background:{bg};color:{fg};text-align:center;{extra}'>"
-        f"{content}</td>"
-    )
-
 
 def _build_hour_header(slots: list[str]) -> str:
-    """Hour-level merged header row."""
-    # Group consecutive slots by hour
     parts = [
         "<tr style='background:#0d1f35;color:#fff;font-weight:600;'>",
-        _th("Educator", "text-align:left;min-width:110px;"),
+        _th("Educator", "text-align:left;min-width:120px;"),
         _th("Start",    "min-width:44px;"),
         _th("Finish",   "min-width:44px;"),
     ]
-
-    # Emit hour headers spanning all slots in that hour
-    current_hour = None
-    span_count   = 0
-    pending_parts = []
-
+    current_hour, span_count, pending = None, 0, []
     for slot in slots:
-        h = _slot_hour(slot)
+        h = int(slot[:2])
         if h != current_hour:
             if current_hour is not None:
-                pending_parts.append(
-                    _th(f"{current_hour:02d}:00", "", colspan=span_count)
-                )
-            current_hour = h
-            span_count   = 1
+                pending.append(_th(f"{current_hour:02d}:00", "", colspan=span_count))
+            current_hour, span_count = h, 1
         else:
             span_count += 1
     if current_hour is not None:
-        pending_parts.append(
-            _th(f"{current_hour:02d}:00", "", colspan=span_count)
-        )
-
-    parts.extend(pending_parts)
-    # Room summary header spanning the right-side columns (empty for now)
+        pending.append(_th(f"{current_hour:02d}:00", "", colspan=span_count))
+    parts.extend(pending)
     parts.append(_th("Room summary", "min-width:120px;", colspan=4))
     parts.append("</tr>")
     return "".join(parts)
 
 
 def _build_slot_header(slots: list[str]) -> str:
-    """15-min slot sub-header."""
     parts = [
         "<tr style='background:#1a3350;color:#cce;font-size:9px;'>",
-        _th("", "min-width:110px;"),
+        _th("", "min-width:120px;"),
         _th("", "min-width:44px;"),
         _th("", "min-width:44px;"),
     ]
@@ -383,50 +340,46 @@ def _build_slot_header(slots: list[str]) -> str:
         label = f":{m:02d}" if m != 0 else slot[:5]
         parts.append(_th(label, "min-width:28px;max-width:36px;font-size:9px;padding:2px 2px;"))
     parts += [
-        _th("Room", "font-size:9px;"),
-        _th("👶", "font-size:9px;"),
+        _th("Room",  "font-size:9px;"),
+        _th("👶",   "font-size:9px;"),
         _th("Ratio", "font-size:9px;"),
-        _th("Req", "font-size:9px;"),
+        _th("Req",   "font-size:9px;"),
     ]
     parts.append("</tr>")
     return "".join(parts)
 
 
-def _build_educator_row(
-    shift,
+def _build_merged_row(
+    row: dict,
     slots: list[str],
     room_map: dict,
     room_color: dict[str, str],
+    slot_rooms: dict[str, str],   # {slot: room_id} for this educator
     break_map: dict[str, dict[str, str]],
     break_status_map: dict[str, dict[str, str]],
     movement_map: dict[str, dict[str, list]],
     row_bg: str,
 ) -> str:
-    uid       = shift.user_id
-    rid       = shift.room_id
-    room      = room_map.get(rid, {})
-    room_clr  = room_color.get(rid, "#666")
-    code      = _room_code(room)
-    user_brks = break_map.get(uid, {})
-    user_stat = break_status_map.get(uid, {})
+    uid        = row["user_id"]
+    start_time = row["start_time"]
+    end_time   = row["end_time"]
+    user_brks  = break_map.get(uid, {})
+    user_stat  = break_status_map.get(uid, {})
 
     parts = [
         f"<tr style='background:{row_bg};'>",
-        # Educator name cell
         f"<td style='padding:3px 8px;border:1px solid #e2e8f0;font-weight:600;"
-        f"color:#0d1f35;white-space:nowrap;min-width:110px;'>{shift.user_name}</td>",
-        # Start / Finish
+        f"color:#0d1f35;white-space:nowrap;min-width:120px;'>{row['user_name']}</td>",
         f"<td style='padding:3px 6px;border:1px solid #e2e8f0;text-align:center;"
-        f"color:#374151;'>{shift.start_time[:5]}</td>",
+        f"color:#374151;'>{start_time[:5]}</td>",
         f"<td style='padding:3px 6px;border:1px solid #e2e8f0;text-align:center;"
-        f"color:#374151;'>{shift.end_time[:5]}</td>",
+        f"color:#374151;'>{end_time[:5]}</td>",
     ]
 
     for slot in slots:
-        in_shift = _is_in_shift(slot, shift.start_time, shift.end_time)
+        in_shift = _is_in_shift(slot, start_time, end_time)
 
         if not in_shift:
-            # Grey out-of-shift cell
             parts.append(
                 f"<td style='background:{EMPTY_BG};border:1px solid #e2e8f0;"
                 f"min-width:28px;max-width:36px;'></td>"
@@ -437,10 +390,7 @@ def _build_educator_row(
         brk_label = user_brks.get(slot)
         if brk_label:
             stat = user_stat.get(slot, "scheduled")
-            if stat == "manual_review":
-                bg, fg = "#fef3c7", "#92400e"
-            else:
-                bg, fg = BREAK_BG, BREAK_FG
+            bg, fg = ("#fef3c7", "#92400e") if stat == "manual_review" else (BREAK_BG, BREAK_FG)
             parts.append(
                 f"<td style='background:{bg};color:{fg};border:1px solid #e2e8f0;"
                 f"text-align:center;min-width:28px;max-width:36px;"
@@ -448,7 +398,7 @@ def _build_educator_row(
             )
             continue
 
-        # Temporary movement to another room?
+        # Temporary movement (this educator is covering another room)?
         slot_movs = movement_map.get(slot, {})
         covering_mv = None
         for to_rid, mvs in slot_movs.items():
@@ -458,11 +408,10 @@ def _build_educator_row(
                     break
 
         if covering_mv is not None:
-            temp_room    = room_map.get(covering_mv.to_room_id, {})
-            temp_code    = _room_code(temp_room)
-            temp_clr     = room_color.get(covering_mv.to_room_id, "#aaa")
-            # Amber border + temp room code
-            temp_name = temp_room.get("name", "")
+            temp_room  = room_map.get(covering_mv.to_room_id, {})
+            temp_code  = _room_code(temp_room)
+            temp_clr   = room_color.get(covering_mv.to_room_id, "#aaa")
+            temp_name  = temp_room.get("name", "")
             parts.append(
                 f"<td style='background:{MOVE_BG};color:{MOVE_FG};"
                 f"border:2px solid {temp_clr};text-align:center;"
@@ -472,15 +421,20 @@ def _build_educator_row(
             )
             continue
 
-        # Normal shift cell — show room code with room colour
+        # Normal slot — look up which room this educator is in at this slot
+        current_rid  = slot_rooms.get(slot, row["primary_room_id"])
+        current_room = room_map.get(current_rid, {})
+        current_clr  = room_color.get(current_rid, "#888")
+        current_code = _room_code(current_room)
+
         parts.append(
-            f"<td style='background:{room_clr};color:#fff;"
+            f"<td style='background:{current_clr};color:#fff;"
             f"border:1px solid rgba(255,255,255,0.25);text-align:center;"
             f"min-width:28px;max-width:36px;font-size:9px;font-weight:600;'>"
-            f"{code}</td>"
+            f"{current_code}</td>"
         )
 
-    # Room summary columns (right side — blank per educator row)
+    # Room summary columns — blank per educator row
     for _ in range(4):
         parts.append(f"<td style='border:1px solid #e2e8f0;background:{row_bg};'></td>")
 
@@ -495,23 +449,17 @@ def _build_room_summary_rows(
     room_color: dict[str, str],
     children_map: dict[str, dict[str, int]],
 ) -> str:
-    """
-    Build summary rows below the grid — one per room.
-    Each row shows peak children, ratio, required staff.
-    Also shows a staff-count bar across the timeline.
-    """
-    # Staff per room per slot
+    import math
+
     staff_counts: dict[str, dict[str, int]] = {}
-    for shift in shifts:
-        rid = shift.room_id
+    for s in shifts:
+        rid = s.room_id
         for slot in slots:
-            if _is_in_shift(slot, shift.start_time, shift.end_time):
+            if _is_in_shift(slot, s.start_time, s.end_time):
                 staff_counts.setdefault(rid, {})
                 staff_counts[rid][slot] = staff_counts[rid].get(slot, 0) + 1
 
     html = []
-
-    # Separator row
     n_cols = 3 + len(slots) + 4
     html.append(
         f"<tr><td colspan='{n_cols}' style='background:#e2e8f0;"
@@ -524,49 +472,35 @@ def _build_room_summary_rows(
         clr   = room_color.get(rid, "#888")
         r_s   = room.get("required_ratio_staff",    1)
         r_c   = room.get("required_ratio_children", 4)
-        cap   = room.get("licensed_capacity", 0)
 
-        # Peak children from attendance intervals
-        room_ivs = children_map.get(rid, {})
+        room_ivs      = children_map.get(rid, {})
         peak_children = max(room_ivs.values(), default=0)
-        import math
-        req_staff = math.ceil(peak_children / r_c) * r_s if peak_children > 0 else r_s
+        req_staff     = math.ceil(peak_children / r_c) * r_s if peak_children > 0 else r_s
 
         html.append("<tr style='background:#f0f4f8;'>")
-        # Educator col: room name
         html.append(
             f"<td style='padding:3px 8px;border:1px solid #e2e8f0;font-weight:600;"
-            f"color:{clr};min-width:110px;white-space:nowrap;'>{rname}</td>"
+            f"color:{clr};min-width:120px;white-space:nowrap;'>{rname}</td>"
         )
-        # Start/Finish: show ratio formula
         html.append(
             f"<td colspan='2' style='padding:3px 6px;border:1px solid #e2e8f0;"
-            f"text-align:center;font-size:10px;color:#555;'>"
-            f"1:{r_c}</td>"
+            f"text-align:center;font-size:10px;color:#555;'>1:{r_c}</td>"
         )
 
-        # Timeline slots: show staff count
         for slot in slots:
-            count      = staff_counts.get(rid, {}).get(slot, 0)
-            child_cnt  = room_ivs.get(slot, 0)
-            # Colour by ratio status
+            count     = staff_counts.get(rid, {}).get(slot, 0)
+            child_cnt = room_ivs.get(slot, 0)
             if count == 0:
                 bg, fg = "#f8f9fa", "#ccc"
             else:
-                import math as _math
-                needed = _math.ceil(child_cnt / r_c) * r_s if child_cnt > 0 else r_s
-                if count >= needed:
-                    bg, fg = "#dcfce7", "#14532d"   # green = ok
-                else:
-                    bg, fg = "#fee2e2", "#991b1b"   # red = under ratio
-            label = str(count) if count else ""
+                needed = math.ceil(child_cnt / r_c) * r_s if child_cnt > 0 else r_s
+                bg, fg = ("#dcfce7", "#14532d") if count >= needed else ("#fee2e2", "#991b1b")
             html.append(
                 f"<td style='background:{bg};color:{fg};border:1px solid #e2e8f0;"
                 f"text-align:center;font-size:9px;font-weight:700;"
-                f"min-width:28px;max-width:36px;'>{label}</td>"
+                f"min-width:28px;max-width:36px;'>{count if count else ''}</td>"
             )
 
-        # Right summary columns
         html.append(
             f"<td style='padding:3px 6px;border:1px solid #e2e8f0;font-weight:600;"
             f"color:{clr};white-space:nowrap;font-size:10px;'>{rname}</td>"
@@ -581,8 +515,7 @@ def _build_room_summary_rows(
         )
         html.append(
             f"<td style='padding:3px 6px;border:1px solid #e2e8f0;text-align:center;"
-            f"font-weight:700;font-size:10px;"
-            f"color:#1e3a55;'>{req_staff}</td>"
+            f"font-weight:700;font-size:10px;color:#1e3a55;'>{req_staff}</td>"
         )
         html.append("</tr>")
 
@@ -603,7 +536,6 @@ def _build_legend(rooms: list[dict], room_color: dict[str, str]) -> str:
             f"<span style='background:{clr};color:#fff;padding:2px 8px;"
             f"border-radius:4px;font-weight:600;' title='{name}'>{code} {name}</span>"
         )
-    # Break + movement swatches
     parts.append(
         f"<span style='background:{BREAK_BG};color:{BREAK_FG};padding:2px 8px;"
         f"border-radius:4px;border:1px solid #ccc;'>B## Break</span>"
@@ -618,3 +550,79 @@ def _build_legend(rooms: list[dict], room_color: dict[str, str]) -> str:
     )
     parts.append("</div>")
     return "".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_slots() -> list[str]:
+    slots = []
+    t     = datetime.strptime(GRID_START, "%H:%M:%S")
+    end   = datetime.strptime(GRID_END,   "%H:%M:%S")
+    while t < end:
+        slots.append(t.strftime("%H:%M:%S"))
+        t += timedelta(minutes=SLOT_MINS)
+    return slots
+
+
+def _is_in_shift(slot: str, start: str, end: str) -> bool:
+    return start <= slot < end
+
+
+def _assign_room_colors(rooms: list[dict]) -> dict[str, str]:
+    return {room["id"]: ROOM_PALETTE[i % len(ROOM_PALETTE)]
+            for i, room in enumerate(rooms)}
+
+
+def _room_code(room: dict) -> str:
+    return room.get("name", "?")[:4].upper()
+
+
+def _build_break_map(breaks, slots):
+    label_map:  dict[str, dict[str, str]] = {}
+    status_map: dict[str, dict[str, str]] = {}
+    for brk in breaks:
+        uid   = brk.user_id
+        bs    = brk.planned_start_time
+        be    = brk.planned_end_time
+        dur   = brk.planned_duration_minutes
+        label = f"B{dur}"
+        stat  = brk.status
+        label_map.setdefault(uid,  {})
+        status_map.setdefault(uid, {})
+        for slot in slots:
+            if _is_in_shift(slot, bs, be):
+                label_map[uid][slot]  = label
+                status_map[uid][slot] = stat
+    return label_map, status_map
+
+
+def _build_movement_map(movements, slots):
+    mv_map: dict[str, dict[str, list]] = {}
+    for mv in movements:
+        for slot in slots:
+            if _is_in_shift(slot, mv.start_time, mv.end_time):
+                mv_map.setdefault(slot, {})
+                mv_map[slot].setdefault(mv.to_room_id, []).append(mv)
+    return mv_map
+
+
+def _build_children_map(intervals, slots):
+    result: dict[str, dict[str, int]] = {}
+    for iv in intervals:
+        rid   = iv.get("room_id", "")
+        istart = iv.get("interval_start", "")
+        count  = iv.get("actual_children") or iv.get("expected_children") or 0
+        if rid and istart:
+            result.setdefault(rid, {})[istart] = int(count)
+    return result
+
+
+def _mins_str(start: str, end: str) -> int:
+    try:
+        s = datetime.strptime(start[:5], "%H:%M")
+        e = datetime.strptime(end[:5],   "%H:%M")
+        return max(0, int((e - s).total_seconds() / 60))
+    except Exception:
+        return 0
