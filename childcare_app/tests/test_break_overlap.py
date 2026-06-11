@@ -133,35 +133,35 @@ class TestCheckBreakImpact:
 
     def test_bug_report_overlap_detected(self):
         """12:21–13:01 and 12:30–12:40 overlap and must be detected."""
-        conflict, reason = self._run("12:30:00", "12:40:00",
+        conflict, reason, _ = self._run("12:30:00", "12:40:00",
                                      [("12:21:00", "13:01:00")])
         assert conflict == "breach", f"Expected 'breach', got '{conflict}': {reason}"
 
     def test_non_overlapping_ok(self):
-        conflict, _ = self._run("12:30:00", "13:10:00",
+        conflict, _, _ = self._run("12:30:00", "13:10:00",
                                 [("11:00:00", "11:10:00")])
         assert conflict == "ok"
 
     def test_adjacent_breaks_ok(self):
-        conflict, _ = self._run("11:10:00", "11:40:00",
+        conflict, _, _ = self._run("11:10:00", "11:40:00",
                                 [("11:00:00", "11:10:00")])
         assert conflict == "ok"
 
     def test_fixed_break_causes_fixed_conflict(self):
-        conflict, reason = self._run("12:30:00", "12:40:00",
+        conflict, reason, _ = self._run("12:30:00", "12:40:00",
                                      [("12:21:00", "13:01:00")], fixed=True)
         assert conflict == "fixed_conflict", (
             f"Expected 'fixed_conflict', got '{conflict}': {reason}"
         )
 
     def test_non_fixed_overlap_is_breach(self):
-        conflict, _ = self._run("12:30:00", "12:40:00",
+        conflict, _, _ = self._run("12:30:00", "12:40:00",
                                 [("12:21:00", "13:01:00")], fixed=False)
         assert conflict == "breach"
 
     def test_different_educator_no_interference(self):
         breaks_by_user = {"user-2": [("12:21:00", "13:01:00", False)]}
-        conflict, _ = _check_break_impact(
+        conflict, _, _ = _check_break_impact(
             "12:30:00", "12:40:00", self.RID, self.UID,
             _empty_coverage(self.RID), {}, breaks_by_user, 1, 4,
         )
@@ -169,9 +169,9 @@ class TestCheckBreakImpact:
 
     def test_same_educator_multiple_breaks(self):
         existing = [("10:00:00", "10:10:00"), ("15:00:00", "15:30:00")]
-        c_yes, _ = self._run("10:05:00", "10:35:00", existing)
+        c_yes, _, _ = self._run("10:05:00", "10:35:00", existing)
         assert c_yes == "breach"
-        c_no, _  = self._run("13:00:00", "13:40:00", existing)
+        c_no, _, _  = self._run("13:00:00", "13:40:00", existing)
         assert c_no == "ok"
 
 
@@ -371,7 +371,7 @@ class TestBreakOverlapRegression:
 
     def test_bug_report_case_still_detected(self):
         breaks_by_user = {"user-1": [("12:21:00", "13:01:00", False)]}
-        conflict, _ = _check_break_impact(
+        conflict, _, _ = _check_break_impact(
             "12:30:00", "12:40:00", "room-1", "user-1",
             _empty_coverage("room-1"), {}, breaks_by_user, 1, 4,
         )
@@ -836,7 +836,7 @@ class TestPreferredBreakWindow:
         """
         # 1 staff in room → removing them always breaches r_staff=1
         cov_1 = self._cov(n_staff=1)
-        conflict, reason = _check_break_impact(
+        conflict, reason, _ = _check_break_impact(
             "12:00:00", "12:30:00",
             self.RID, self.UID,
             cov_1, {}, {}, r_staff=1, r_child=4,
@@ -851,7 +851,7 @@ class TestPreferredBreakWindow:
         still leaves 1 ≥ r_staff → no breach.
         """
         cov_2 = self._cov(n_staff=2)
-        conflict, _ = _check_break_impact(
+        conflict, _, _ = _check_break_impact(
             "12:00:00", "12:30:00",
             self.RID, self.UID,
             cov_2, {}, {}, r_staff=1, r_child=4,
