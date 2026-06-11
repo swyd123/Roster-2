@@ -1,643 +1,1672 @@
-# pages/auto_roster.py — Auto Roster & Break Scheduling
+# utils/auto_roster_engine.py
+# Pure-Python auto-roster and break scheduling engine.
+# No database calls. No Streamlit imports.
+# No .single() anywhere.
 #
-# SUGGESTION ENGINE — generates draft shifts and breaks based on:
-#   • actual attendance (room_attendance_intervals.actual_children)
-#   • staff availability and leave
-#   • ratio requirements per room
-#   • recurring break opt-out preferences
+# ALGORITHM OVERVIEW
+# ──────────────────
+# Step 1 — Roster generation
+#   1. For each day and room, read actual_children per 15-minute slot.
+#   2. Compute required_staff per slot: ceil(children / ratio_children).
+#   3. Merge adjacent slots into contiguous coverage windows per room.
+#   4. Assign staff to windows using a greedy allocator:
+#        a. Prefer staff whose primary_room matches.
+#        b. Exclude staff on leave.
+#        c. Exclude staff unavailable for this weekday.
+#        d. Respect available_from / available_until windows.
+#        e. Minimise total staff: only assign as many as required.
+#   5. Produce SuggestedShift records (not yet saved).
 #
-# Nothing is saved until the user explicitly clicks Save.
-# Published rosters are protected — only draft periods can be regenerated.
+# Step 2 — Break scheduling
+#   1. For each suggested shift, compute entitlement + opt-out.
+#   2. For each break, find a time window where removing 1 staff
+#      from the room does not drop coverage below required.
+#   3. Prefer unpaid breaks 11:00–14:00; paid breaks outside peak.
+#   4. Stagger breaks: no two staff from same room break simultaneously.
+#   5. Flag "Manual review required" when no compliant window exists.
 
-import streamlit as st
-from datetime import date, timedelta
-import pandas as pd
-
-from utils.auto_roster_engine import generate_roster, SuggestedShift, SuggestedBreak
-from utils.roster_queries import (
-    fetch_roster_periods, create_roster_period,
-    fetch_approved_leave_for_period, fetch_availability_map,
-    create_shifts_batch, delete_all_draft_shifts,
-)
-from utils.break_queries import fetch_break_rules, create_breaks_batch
-from utils.break_preferences_queries import fetch_break_prefs_for_centre
-from utils.attendance_queries import fetch_intervals_for_centre
-from utils.room_queries import fetch_rooms
-from utils.staff_queries import fetch_all_staff, fetch_centres
-from utils.helpers import toast_success, toast_error
+from __future__ import annotations
+import math
+from datetime import datetime, date, timedelta
+from dataclasses import dataclass, field
+from typing import Optional
 
 
-def render():
-    # ── Header ────────────────────────────────────────────────────────
-    st.title("Auto Roster & Breaks")
-    st.markdown(
-        '<p class="page-sub">Suggestion engine — generates draft shifts and breaks '
-        "from attendance data, availability and ratio rules. "
-        "Review and edit before saving.</p>",
-        unsafe_allow_html=True,
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SuggestedShift:
+    user_id:        str
+    user_name:      str
+    room_id:        str
+    room_name:      str
+    shift_date:     str          # YYYY-MM-DD
+    start_time:     str          # HH:MM:SS
+    end_time:       str          # HH:MM:SS
+    shift_type:     str          # opening | standard | closing
+    break_opt_out_override: str  # use_staff_default | opted_out | not_opted_out
+    source:         str          # "primary_room" | "available" | "unmatched"
+    warnings:       list[str] = field(default_factory=list)
+
+
+@dataclass
+class SuggestedBreak:
+    user_id:                str
+    user_name:              str
+    shift_key:              str   # f"{user_id}_{shift_date}" — links to SuggestedShift
+    break_date:             str   # YYYY-MM-DD
+    break_type:             str   # rest | meal | combined
+    planned_start_time:     str   # HH:MM:SS
+    planned_end_time:       str   # HH:MM:SS
+    planned_duration_minutes: int
+    paid_minutes:           int   # 20 for combined/rest, 0 for meal
+    unpaid_minutes:         int   # 30 for combined/meal, 0 for rest
+    combined:               bool  # True when paid+unpaid merged into one block
+    label:                  str   # display label
+    status:                 str   # scheduled | manual_review
+    opt_out_source:         str   # "Staff default" | "Manual override — opted out" | etc.
+    warnings:               list[str] = field(default_factory=list)
+
+
+@dataclass
+class SuggestedMovement:
+    """
+    A temporary room movement created to provide break cover.
+    The educator moves from their rostered room to a receiving room
+    for the duration of the break being covered.
+    Does NOT change the educator's permanent shift room assignment.
+    """
+    educator_id:         str
+    educator_name:       str
+    from_room_id:        str
+    from_room_name:      str
+    to_room_id:          str
+    to_room_name:        str
+    start_time:          str   # HH:MM:SS
+    end_time:            str   # HH:MM:SS
+    move_date:           str   # YYYY-MM-DD
+    covering_for_uid:    str   # user_id of the educator on break
+    covering_for_name:   str
+    reason:              str   # human-readable explanation
+
+
+@dataclass
+class RosterResult:
+    shifts:          list[SuggestedShift]
+    breaks:          list[SuggestedBreak]
+    movements:       list[SuggestedMovement]   # temporary break-cover movements
+    ratio_warnings:  list[str]
+    review_warnings: list[str]
+    unmet_rooms:     list[str]
+    debug_log:       list[dict] = field(default_factory=list)  # per-break decision log
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_roster(
+    days: list[date],
+    rooms: list[dict],
+    all_intervals: dict[str, list[dict]],   # {date_str: list[interval_rows]}
+    staff: list[dict],
+    availability_map: dict[str, dict],      # {uid: {dow: {is_available, from, until}}}
+    leave_map: dict[str, list[str]],        # {uid: [date_strs with leave]}
+    break_prefs: dict[str, dict[int, bool]],# {uid: {dow: opt_out_bool}}
+    break_rules: list[dict] | None = None,
+    centre_id: str = "",
+) -> RosterResult:
+    """
+    Generate suggested shifts and breaks for a roster period.
+
+    Parameters
+    ----------
+    days            Ordered list of calendar days in the period.
+    rooms           Room dicts — needs id, name, licensed_capacity,
+                    required_ratio_staff, required_ratio_children,
+                    age_min_months, age_max_months.
+    all_intervals   {date_str: [interval rows from fetch_intervals_for_centre]}.
+                    Rows need room_id, interval_start, interval_end,
+                    actual_children, expected_children.
+    staff           Enriched staff list from fetch_all_staff(). Each entry needs
+                    users.id, users.first_name/last_name, user_centre_roles
+                    (with primary_room_id, centre_id, is_active).
+    availability_map From fetch_availability_map(centre_id).
+    leave_map       From fetch_approved_leave_for_period(centre_id, …).
+    break_prefs     From fetch_break_prefs_for_centre(centre_id).
+    break_rules     Optional break rule tiers (None → engine defaults).
+    centre_id       Used to filter staff to this centre.
+    """
+    from utils.break_engine import (
+        calc_break_entitlement, suggest_break_times,
+        shift_duration_minutes, resolve_opt_out, BREAK_RULES_DEFAULT,
     )
+    active_rules = break_rules or BREAK_RULES_DEFAULT
 
-    # ── Centre selector ───────────────────────────────────────────────
-    centres = fetch_centres()
-    if not centres:
-        st.warning("No centres found.")
-        return
+    # ── Flatten staff to this centre, build lookup tables ─────────────
+    centre_staff    = _build_centre_staff(staff, centre_id)
+    all_shifts:     list[SuggestedShift]    = []
+    all_breaks:     list[SuggestedBreak]    = []
+    all_movements:  list[SuggestedMovement] = []
+    all_debug_log:  list[dict]              = []
+    ratio_warns:    list[str]               = []
+    review_warns:   list[str]               = []
+    unmet_rooms:    list[str]               = []
 
-    centre_opts = {c["id"]: c["name"] for c in centres}
-    saved_c = (
-        st.session_state.get("auto_roster_centre")
-        or st.session_state.get("selected_centre_id")
-        or centres[0]["id"]
-    )
+    room_map = {r["id"]: r for r in rooms}
 
-    sc1, sc2, sc3 = st.columns([2, 1, 1])
-    centre_id = sc1.selectbox(
-        "Centre", options=list(centre_opts.keys()),
-        format_func=lambda x: centre_opts[x],
-        index=list(centre_opts.keys()).index(saved_c) if saved_c in centre_opts else 0,
-        key="ar_centre",
-    )
-    st.session_state.auto_roster_centre = centre_id
+    for day in days:
+        date_str = day.isoformat()
+        dow      = day.isoweekday() % 7   # 0=Sun, 1=Mon … 6=Sat
 
-    # ── Date range ────────────────────────────────────────────────────
-    today    = date.today()
-    next_mon = today + timedelta(days=(7 - today.weekday()))
-    start_d  = sc2.date_input("Week start", value=next_mon,
-                               format="DD/MM/YYYY", key="ar_start")
-    end_d    = sc3.date_input("Week end",   value=next_mon + timedelta(days=6),
-                               format="DD/MM/YYYY", key="ar_end")
+        # Intervals for this day keyed by room_id
+        day_ivs   = all_intervals.get(date_str, [])
+        room_ivs  = _group_intervals_by_room(day_ivs)
 
-    if start_d > end_d:
-        st.error("Start date must be before end date.")
-        return
+        # ── Step 1: compute required staff per room per slot ──────────
+        room_windows = {}     # {room_id: [CoverageWindow]}
+        for room in rooms:
+            rid     = room["id"]
+            r_staff = room.get("required_ratio_staff",    1)
+            r_child = room.get("required_ratio_children", 4)
+            cap     = room.get("licensed_capacity", 0)
 
-    # Invalidate cached result when centre or date range changes
-    cached = st.session_state.get("ar_result")
-    if cached:
-        if (
-            st.session_state.get("ar_centre_id")       != centre_id
-            or st.session_state.get("ar_result_start") != start_d.isoformat()
-            or st.session_state.get("ar_result_end")   != end_d.isoformat()
-        ):
-            st.session_state.pop("ar_result",    None)
-            st.session_state.pop("ar_period_id", None)
+            ivs = room_ivs.get(rid, [])
+            if not ivs:
+                continue
 
-    days = []
-    d    = start_d
-    while d <= end_d:
-        days.append(d)
-        d += timedelta(days=1)
+            # Required staff at each interval
+            req_by_slot = {}
+            for iv in ivs:
+                act = iv.get("actual_children")
+                exp = iv.get("expected_children")
+                n   = int(act) if act is not None else (int(exp) if exp is not None else 0)
+                if n > 0:
+                    req = math.ceil(n / r_child) * r_staff
+                    req_by_slot[iv["interval_start"]] = req
 
-    st.markdown("---")
+            if not req_by_slot:
+                continue
 
-    # ── Load all required data ────────────────────────────────────────
-    with st.spinner("Loading attendance, staff and availability…"):
-        try:
-            rooms       = fetch_rooms(centre_id)
-            staff       = fetch_all_staff()
-            leave_map   = fetch_approved_leave_for_period(
-                centre_id, start_d.isoformat(), end_d.isoformat()
+            windows = _merge_slots_to_windows(req_by_slot, ivs)
+            room_windows[rid] = windows
+
+        # ── Step 2: assign staff to windows ──────────────────────────
+        # Track who has been assigned and for how long each day
+        assigned_minutes: dict[str, int] = {}   # uid → total minutes assigned today
+        day_shifts: list[SuggestedShift]  = []
+
+        for rid, windows in room_windows.items():
+            room   = room_map.get(rid, {})
+            rname  = room.get("name", rid)
+
+            # Find eligible staff for this room
+            eligible = _eligible_staff(
+                centre_staff, rid, date_str, dow,
+                availability_map, leave_map,
             )
-            avail_map   = fetch_availability_map(centre_id)
-            break_prefs = fetch_break_prefs_for_centre(centre_id)
-            db_rules    = fetch_break_rules(centre_id)
-        except Exception as e:
-            toast_error(f"Could not load data: {e}")
-            return
 
-    if not rooms:
-        st.info("No rooms configured for this centre.")
-        return
-
-    all_intervals: dict[str, list] = {}
-    with st.spinner("Loading attendance intervals…"):
-        for day in days:
-            try:
-                ivs = fetch_intervals_for_centre(centre_id, day.isoformat())
-                if ivs:
-                    all_intervals[day.isoformat()] = ivs
-            except Exception:
-                pass
-
-    has_attendance = bool(all_intervals)
-    if not has_attendance:
-        st.warning(
-            "⚠️ No attendance data found for this period. "
-            "Upload attendance CSV on the **👶 Child Attendance** page first."
-        )
-
-    # ── Generate button ───────────────────────────────────────────────
-    gen_col, _ = st.columns([2, 5])
-    generate   = gen_col.button(
-        "⚙️  Generate Roster & Breaks",
-        type="primary",
-        use_container_width=True,
-        disabled=not has_attendance,
-    )
-
-    if generate or st.session_state.get("ar_result"):
-        if generate:
-            # Always discard any previously cached result before re-running
-            st.session_state.pop("ar_result",    None)
-            st.session_state.pop("ar_period_id", None)
-
-            with st.spinner("Running auto-roster engine…"):
-                result = generate_roster(
-                    days=days,
-                    rooms=rooms,
-                    all_intervals=all_intervals,
-                    staff=staff,
-                    availability_map=avail_map,
-                    leave_map=leave_map,
-                    break_prefs=break_prefs,
-                    break_rules=db_rules or None,
-                    centre_id=centre_id,
-                )
-            st.session_state["ar_result"]       = result
-            st.session_state["ar_centre_id"]    = centre_id
-            st.session_state["ar_result_start"] = start_d.isoformat()
-            st.session_state["ar_result_end"]   = end_d.isoformat()
-            st.session_state["ar_intervals"]    = all_intervals
-        else:
-            result = st.session_state["ar_result"]
-
-        _render_result(result, centre_id, start_d, end_d, rooms, db_rules)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RESULT RENDERING
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
-    from utils.break_engine import BREAK_RULES_DEFAULT
-    from utils.roster_timeline import (
-        build_timeline_html, build_movement_notes_html, get_day_summary,
-    )
-
-    room_map   = {r["id"]: r["name"] for r in rooms}
-    movements  = getattr(result, "movements", [])
-    shifts     = result.shifts
-    breaks     = result.breaks
-
-    n_shifts      = len(shifts)
-    n_breaks      = len(breaks)
-    n_movements   = len(movements)
-    n_ratio_warn  = len(result.ratio_warnings)
-    n_review_warn = len(result.review_warnings)
-    n_unmet       = len(result.unmet_rooms)
-
-    # ── Summary metrics ───────────────────────────────────────────────
-    st.markdown("### 📊 Generation Summary")
-    mc = st.columns(6)
-    mc[0].metric("Shifts",          n_shifts)
-    mc[1].metric("Breaks",          n_breaks)
-    mc[2].metric("Movements",       n_movements,
-                 delta="cover required" if n_movements else None,
-                 delta_color="normal" if n_movements else "off")
-    mc[3].metric("Ratio warnings",  n_ratio_warn,
-                 delta="review needed" if n_ratio_warn else None,
-                 delta_color="inverse" if n_ratio_warn else "off")
-    mc[4].metric("Break conflicts", n_review_warn,
-                 delta="manual review" if n_review_warn else None,
-                 delta_color="inverse" if n_review_warn else "off")
-    mc[5].metric("Rooms unstaffed", n_unmet,
-                 delta="no staff available" if n_unmet else None,
-                 delta_color="inverse" if n_unmet else "off")
-
-    if result.unmet_rooms:
-        st.error(f"❌ No available staff for: {', '.join(result.unmet_rooms)}")
-    if result.ratio_warnings:
-        with st.expander(f"⚠️ {n_ratio_warn} ratio warning(s)"):
-            for w in result.ratio_warnings:
-                st.warning(w)
-    if result.review_warnings:
-        with st.expander(f"🔍 {n_review_warn} break conflict(s) — manual review"):
-            for w in result.review_warnings:
-                st.warning(w)
-
-    if not shifts:
-        st.info("No shifts generated. Check attendance data and staff availability.")
-        return
-
-    st.markdown("---")
-
-    # ── Collect attendance intervals (if already loaded in session_state) ─
-    # The page may have loaded intervals per-day into session_state when
-    # generating; fall back to empty list if not available.
-    session_intervals = st.session_state.get("ar_intervals", {})
-
-    # ── Per-day timeline grids ────────────────────────────────────────
-    # Group by date
-    from collections import defaultdict
-    shifts_by_day:    defaultdict = defaultdict(list)
-    breaks_by_day:    defaultdict = defaultdict(list)
-    movements_by_day: defaultdict = defaultdict(list)
-
-    for s in shifts:
-        shifts_by_day[s.shift_date].append(s)
-    for b in breaks:
-        breaks_by_day[b.break_date].append(b)
-    for mv in movements:
-        movements_by_day[mv.move_date].append(mv)
-
-    all_dates = sorted(shifts_by_day.keys())
-
-    st.markdown("### 🗓️ Roster Timeline")
-    st.caption(
-        "Colour-coded by room · **B40** = 40-min combined break · "
-        "**B##** in amber = manual review · **CODE†** = temporary cover · "
-        "Footer rows show staff count per 15-min slot (🟢 ok / 🔴 under ratio)."
-    )
-
-    for date_str in all_dates:
-        day_shifts    = shifts_by_day[date_str]
-        day_breaks    = breaks_by_day.get(date_str, [])
-        day_movements = movements_by_day.get(date_str, [])
-        day_intervals = session_intervals.get(date_str, [])
-        summary       = get_day_summary(date_str, day_shifts, day_breaks, day_movements)
-
-        # Day header
-        try:
-            from datetime import date as _date
-            wd = _date.fromisoformat(date_str).strftime("%A %-d %B %Y")
-        except Exception:
-            wd = date_str
-
-        header_extra = []
-        if summary["manual_review"]:
-            header_extra.append(f"🔍 {summary['manual_review']} manual review")
-        if summary["movements"]:
-            header_extra.append(f"🔄 {summary['movements']} movement(s)")
-        header_suffix = "  ·  " + "  ·  ".join(header_extra) if header_extra else ""
-
-        st.markdown(
-            f"<h4 style='margin:16px 0 6px;color:#0d1f35;'>"
-            f"📅 {wd}{header_suffix}</h4>",
-            unsafe_allow_html=True,
-        )
-
-        grid_html = build_timeline_html(
-            date_str=date_str,
-            shifts=day_shifts,
-            breaks=day_breaks,
-            movements=day_movements,
-            rooms=rooms,
-            intervals=day_intervals,
-        )
-        st.markdown(grid_html, unsafe_allow_html=True)
-
-        # Movement notes below each day's grid
-        notes_html = build_movement_notes_html(day_movements)
-        if notes_html:
-            st.markdown(notes_html, unsafe_allow_html=True)
-
-    # ── Debug expander (replaces old shift/break tables) ─────────────
-    st.markdown("---")
-    with st.expander("🔍 Raw data (debug)", expanded=False):
-        st.markdown("**Shifts**")
-        _render_shift_table(shifts, room_map)
-        if breaks:
-            st.markdown("**Breaks**")
-            _render_break_table(breaks)
-        if breaks:
-            st.markdown("**Break objects**")
-            debug_rows = []
-            for b in sorted(breaks, key=lambda x: (x.break_date, x.user_name, x.planned_start_time)):
-                debug_rows.append({
-                    "Educator":     b.user_name,
-                    "Date":         b.break_date,
-                    "break_type":   b.break_type,
-                    "dur_min":      b.planned_duration_minutes,
-                    "combined":     getattr(b, "combined",      "—"),
-                    "label":        getattr(b, "label",         "—"),
-                    "paid_min":     getattr(b, "paid_minutes",  "—"),
-                    "unpaid_min":   getattr(b, "unpaid_minutes","—"),
-                    "status":       b.status,
-                })
-            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
-
-    # ── Save section ──────────────────────────────────────────────────
-    st.markdown("---")
-    if movements:
-        st.markdown("### 🔄 Educator Movements")
-        _render_movement_table(movements)
-        st.markdown("---")
-
-    st.markdown("### 💾 Save Generated Data")
-
-    existing_periods  = fetch_roster_periods(centre_id, limit=5)
-    overlap           = [
-        p for p in existing_periods
-        if p.get("start_date") <= end_d.isoformat()
-        and p.get("end_date")  >= start_d.isoformat()
-    ]
-    published_overlap = [p for p in overlap if p.get("status") == "published"]
-
-    if published_overlap:
-        st.error(
-            "❌ A **published** roster overlaps this period. "
-            "Archive it first if you want to regenerate."
-        )
-        return
-
-    draft_overlap = [p for p in overlap if p.get("status") == "draft"]
-
-    sa1, sa2, _ = st.columns([2, 2, 3])
-    save_roster = sa1.button(
-        f"💾 Save Roster ({n_shifts} shifts)",
-        type="primary", use_container_width=True, disabled=n_shifts == 0,
-    )
-    save_breaks = sa2.button(
-        f"💾 Save Breaks ({n_breaks} breaks)",
-        use_container_width=True,
-        disabled=n_breaks == 0 or not st.session_state.get("ar_period_id"),
-    )
-
-    if save_breaks and not st.session_state.get("ar_period_id"):
-        st.info("Save the roster first.")
-
-    if draft_overlap:
-        st.warning(
-            f"⚠️ A draft roster already exists "
-            f"({draft_overlap[0]['start_date']} – {draft_overlap[0]['end_date']}). "
-            "Saving will replace all draft shifts."
-        )
-        confirm = st.checkbox("Yes, replace the existing draft shifts", key="ar_confirm_replace")
-    else:
-        confirm = True
-
-    if save_roster and confirm:
-        with st.spinner("Saving roster…"):
-            try:
-                if draft_overlap:
-                    period_id = draft_overlap[0]["id"]
-                    delete_all_draft_shifts(period_id)
-                else:
-                    new_period = create_roster_period(
-                        centre_id=centre_id,
-                        start_date=start_d.isoformat(),
-                        end_date=end_d.isoformat(),
-                        notes="Auto-generated by roster engine",
+            for window in windows:
+                staffed = 0
+                for _ in range(window.required_staff):
+                    best = _pick_staff(
+                        eligible, rid, date_str, window,
+                        assigned_minutes, day_shifts,
                     )
-                    period_id = new_period["id"]
-                shift_rows = [
-                    {
-                        "user_id":                       s.user_id,
-                        "room_id":                       s.room_id,
-                        "shift_date":                    s.shift_date,
-                        "start_time":                    s.start_time,
-                        "end_time":                      s.end_time,
-                        "shift_type":                    s.shift_type,
-                        "break_duration_minutes":        0,
-                        "unpaid_break_opt_out_override": s.break_opt_out_override,
-                        "notes":                         f"Auto-generated ({s.source})",
-                    }
-                    for s in shifts
-                ]
-                n_saved = create_shifts_batch(period_id, centre_id, shift_rows)
-                st.session_state["ar_period_id"] = period_id
-                toast_success(f"✅ Saved {n_saved} shifts to draft roster.")
-                st.rerun()
-            except Exception as e:
-                toast_error(f"Could not save roster: {e}")
+                    if best is None:
+                        ratio_warns.append(
+                            f"{rname} {window.start[:5]}–{window.end[:5]} on {date_str}: "
+                            f"could not fill staff slot {staffed + 1}/{window.required_staff}."
+                        )
+                        break
 
-    if save_breaks:
-        period_id = st.session_state.get("ar_period_id")
-        if not period_id:
-            toast_error("Save the roster first.")
-            return
-        with st.spinner("Saving breaks…"):
-            try:
-                break_rows = [
-                    {
-                        "centre_id":                centre_id,
-                        "user_id":                  b.user_id,
-                        "break_date":               b.break_date,
-                        "break_type":               b.break_type,
-                        "planned_start_time":        b.planned_start_time,
-                        "planned_end_time":          b.planned_end_time,
-                        "planned_duration_minutes":  b.planned_duration_minutes,
-                        "paid_component_minutes":    getattr(b, "paid_minutes",   0),
-                        "unpaid_component_minutes":  getattr(b, "unpaid_minutes", 0),
-                        "status":                    b.status,
-                        "notes": (
-                            f"Auto-generated · {b.opt_out_source}"
-                            + (" · MANUAL REVIEW" if b.status == "manual_review" else "")
-                        ),
-                    }
-                    for b in breaks
-                ]
-                n_saved = create_breaks_batch(break_rows)
-                toast_success(f"✅ Saved {n_saved} breaks.")
-            except Exception as e:
-                toast_error(f"Could not save breaks: {e}")
+                    uid      = best["uid"]
+                    uname    = best["name"]
+                    stype    = _shift_type(window.start, window.end)
+                    dur_mins = shift_duration_minutes(window.start, window.end)
 
-    if st.session_state.get("ar_period_id"):
-        pid = st.session_state["ar_period_id"]
-        if st.button("✏️ Open in Roster Builder", use_container_width=False):
-            st.session_state.roster_period_id = pid
-            st.session_state.page = "roster_builder"
-            st.rerun()
+                    # Apply break opt-out preference for this weekday
+                    pref_day = break_prefs.get(uid, {}).get(dow, False)
+                    override = "opted_out" if pref_day else "use_staff_default"
+
+                    shift = SuggestedShift(
+                        user_id=uid,
+                        user_name=uname,
+                        room_id=rid,
+                        room_name=rname,
+                        shift_date=date_str,
+                        start_time=window.start,
+                        end_time=window.end,
+                        shift_type=stype,
+                        break_opt_out_override=override,
+                        source=best["source"],
+                    )
+                    day_shifts.append(shift)
+                    assigned_minutes[uid] = assigned_minutes.get(uid, 0) + dur_mins
+                    staffed += 1
+
+            if not eligible:
+                if rname not in unmet_rooms:
+                    unmet_rooms.append(rname)
+
+        all_shifts.extend(day_shifts)
+
+        # ── Coverage gap check: 07:15–18:00 must be continuously staffed ─
+        # At least one staff member must cover every 15-minute slot across
+        # all rooms combined. Gaps are added to ratio_warns.
+        coverage_warns = _check_centre_coverage(day_shifts, date_str)
+        ratio_warns.extend(coverage_warns)
+
+        # ── Step 3: schedule breaks for each shift ────────────────────
+        # Build room→shift-coverage map for ratio checking during breaks
+        room_coverage = _build_room_coverage(day_shifts, room_map)
+
+        # breaks_by_room: {room_id:  [(start, end), ...]}   — room-level stagger
+        # breaks_by_user: {user_id:  [(start, end, fixed)]} — per-educator overlap guard
+        # cover_delta:    {room_id: {slot: int}}             — temporary cover additions
+        breaks_by_room: dict[str, list[tuple[str, str]]]        = {}
+        breaks_by_user: dict[str, list[tuple[str, str, bool]]]  = {}
+        cover_delta:    dict[str, dict[str, int]]               = {}
+        day_movements:  list[SuggestedMovement]                  = []
+        day_debug_log:  list[dict]                               = []
+
+        for shift in day_shifts:
+            uid  = shift.user_id
+            rid  = shift.room_id
+            ss   = shift.start_time
+            se   = shift.end_time
+
+            # Resolve opt-out
+            mock_shift = {
+                "user_id":                    uid,
+                "shift_date":                 date_str,
+                "unpaid_break_opt_out_override": shift.break_opt_out_override,
+            }
+            opted_out, opt_src = resolve_opt_out(mock_shift, break_prefs)
+
+            dur_mins = shift_duration_minutes(ss, se)
+            ent      = calc_break_entitlement(dur_mins, active_rules, unpaid_opted_out=opted_out)
+
+            if ent["total_min"] == 0:
+                continue   # no break required
+
+            suggestions = suggest_break_times(ss, se, ent)
+
+            room    = room_map.get(rid, {})
+            r_staff = room.get("required_ratio_staff",    1)
+            r_child = room.get("required_ratio_children", 4)
+
+            shift_key = f"{uid}_{date_str}"
+
+            for sug in suggestions:
+                btype    = sug["break_type"]
+                b_dur    = sug["duration_minutes"]
+                b_start  = sug["planned_start"][:8]
+                b_end    = sug["planned_end"][:8]
+
+                # Prefer combined/meal breaks 11:00–15:00
+                if btype in ("meal", "combined"):
+                    b_start, b_end = _shift_break_to_window(
+                        b_start, b_end, b_dur, ss, se, "11:00:00", "15:00:00"
+                    )
+
+                # Hard clamp against existing educator breaks
+                for ex_s, ex_e, _ in breaks_by_user.get(uid, []):
+                    if _overlaps(b_start, b_end, ex_s, ex_e):
+                        if ex_e < se:
+                            b_start = ex_e
+                            b_end   = (datetime.strptime(b_start[:8], "%H:%M:%S")
+                                       + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
+                        break
+
+                # Check ratio impact — centre-wide (priority 0) then room-level
+                conflict, reason, dbg = _check_break_impact(
+                    b_start, b_end, rid, uid,
+                    room_coverage, breaks_by_room, breaks_by_user,
+                    r_staff, r_child, cover_delta, room_map,
+                )
+
+                cover_used: SuggestedMovement | None = None
+
+                if conflict == "breach":
+                    # Try alternate window (also centre-aware)
+                    alt_s, alt_e, alt_conflict = _find_alt_break_window(
+                        ss, se, b_dur, rid, uid,
+                        room_coverage, breaks_by_room, breaks_by_user,
+                        r_staff, r_child, cover_delta, room_map,
+                    )
+                    if not alt_conflict:
+                        b_start, b_end = alt_s, alt_e
+                        conflict = "ok"
+                        conflict, reason, dbg = _check_break_impact(
+                            b_start, b_end, rid, uid,
+                            room_coverage, breaks_by_room, breaks_by_user,
+                            r_staff, r_child, cover_delta, room_map,
+                        )
+                    else:
+                        # Try temporary cover from another room
+                        cover_mv = _find_break_cover(
+                            break_start=b_start,
+                            break_end=b_end,
+                            break_room_id=rid,
+                            break_room=room,
+                            break_uid=uid,
+                            break_uname=shift.user_name,
+                            date_str=date_str,
+                            day_shifts=day_shifts,
+                            room_map=room_map,
+                            room_coverage=room_coverage,
+                            breaks_by_user=breaks_by_user,
+                            cover_delta=cover_delta,
+                        )
+                        if cover_mv is not None:
+                            conflict   = "ok"
+                            cover_used = cover_mv
+
+                # Build debug log entry
+                day_debug_log.append({
+                    "educator":      shift.user_name,
+                    "date":          date_str,
+                    "proposed_start": b_start[:5],
+                    "proposed_end":   b_end[:5],
+                    "room":          shift.room_name,
+                    "break_type":    btype,
+                    "centre_staff_before": dbg.get("centre_staff_before", "—"),
+                    "centre_staff_after":  dbg.get("centre_staff_after",  "—"),
+                    "centre_required":     dbg.get("centre_required",     "—"),
+                    "room_staff_before":   dbg.get("room_staff_before",   "—"),
+                    "room_staff_after":    dbg.get("room_staff_after",    "—"),
+                    "room_required":       r_staff,
+                    "result":    "✅ accepted" if conflict == "ok" else (
+                                 "⚠️ manual_review" if conflict == "fixed_conflict" else "❌ rejected"
+                    ),
+                    "reason":    reason or ("cover: " + cover_used.educator_name if cover_used else ""),
+                    "cover_used": cover_used.educator_name if cover_used else "—",
+                })
+
+                if conflict in ("ok",):
+                    brk = SuggestedBreak(
+                        user_id=uid, user_name=shift.user_name,
+                        shift_key=shift_key, break_date=date_str,
+                        break_type=btype,
+                        planned_start_time=b_start,
+                        planned_end_time=b_end,
+                        planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
+                        status="scheduled",
+                        opt_out_source=opt_src,
+                    )
+                    if cover_used is not None:
+                        # Apply the cover to the delta so later breaks see it
+                        _apply_cover_delta(cover_delta, cover_used)
+                        day_movements.append(cover_used)
+                elif conflict == "fixed_conflict":
+                    brk = SuggestedBreak(
+                        user_id=uid, user_name=shift.user_name,
+                        shift_key=shift_key, break_date=date_str,
+                        break_type=btype,
+                        planned_start_time=b_start,
+                        planned_end_time=b_end,
+                        planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
+                        status="manual_review",
+                        opt_out_source=opt_src,
+                        warnings=[f"Fixed break conflict: {reason}"],
+                    )
+                    review_warns.append(
+                        f"{shift.user_name} on {date_str}: fixed break conflict — {reason}"
+                    )
+                else:
+                    # breach with no alt window and no cover available
+                    brk = SuggestedBreak(
+                        user_id=uid, user_name=shift.user_name,
+                        shift_key=shift_key, break_date=date_str,
+                        break_type=btype,
+                        planned_start_time=b_start,
+                        planned_end_time=b_end,
+                        planned_duration_minutes=b_dur,
+                        paid_minutes=sug.get("paid_minutes", b_dur if btype == "rest" else 0),
+                        unpaid_minutes=sug.get("unpaid_minutes", b_dur if btype == "meal" else 0),
+                        combined=sug.get("combined", False),
+                        label=sug.get("label", btype.title()),
+                        status="manual_review",
+                        opt_out_source=opt_src,
+                        warnings=["No centre-wide ratio-safe break window found."],
+                    )
+                    review_warns.append(
+                        f"{shift.user_name} ({shift.room_name}) on {date_str}: "
+                        f"no centre-wide ratio-safe {btype} break window — manual review required."
+                    )
+
+                all_breaks.append(brk)
+                breaks_by_room.setdefault(rid, []).append((b_start, b_end))
+                breaks_by_user.setdefault(uid, []).append((b_start, b_end, False))
+
+        all_movements.extend(day_movements)
+        all_debug_log.extend(day_debug_log)
+
+    # ── Post-generation merge: combine separate rest+meal into one block ──
+    # When the initial combined suggestion was rejected by the ratio check,
+    # the loop falls back to two separate breaks placed far apart.
+    # This step finds those pairs and attempts to merge them into one
+    # combined SuggestedBreak, trying the preferred window first.
+    all_breaks, merge_warns = _merge_separate_rest_and_meal(
+        all_breaks, all_shifts, room_map,
+    )
+    review_warns.extend(merge_warns)
+
+    # ── Final validation pass: resolve any remaining per-educator overlaps ──
+    # This runs after all break generation, fixed-break, paid/unpaid, and
+    # manual-review logic so it catches any edge-case overlaps not prevented
+    # by the per-suggestion checks above.
+    all_breaks, extra_review_warns = _validate_and_resolve_break_overlaps(
+        all_breaks, all_shifts, room_map,
+    )
+    review_warns.extend(extra_review_warns)
+
+    return RosterResult(
+        shifts=all_shifts,
+        breaks=all_breaks,
+        movements=all_movements,
+        ratio_warnings=ratio_warns,
+        review_warnings=review_warns,
+        unmet_rooms=unmet_rooms,
+        debug_log=all_debug_log,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TABLE RENDERERS
+# PRIVATE DATA CLASSES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_shift_table(shifts: list, room_map: dict):
-    STATUS_ICON = {"primary_room": "⭐", "available": "✅", "unmatched": "⚠️"}
-    rows = []
-    for s in sorted(shifts, key=lambda x: (x.shift_date, x.room_name, x.start_time)):
-        opt_label = {
-            "opted_out":         "Opted out",
-            "not_opted_out":     "Not opted out",
-            "use_staff_default": "Staff default",
-        }.get(s.break_opt_out_override, s.break_opt_out_override)
-        rows.append({
-            "Date":           s.shift_date,
-            "Room":           s.room_name,
-            "Educator":       s.user_name,
-            "Start":          s.start_time[:5],
-            "End":            s.end_time[:5],
-            "Type":           s.shift_type.title(),
-            "Unpaid opt-out": opt_label,
-            "Source":         STATUS_ICON.get(s.source, "?") + " " + s.source.replace("_", " ").title(),
-        })
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("⭐ Primary room assignment  ·  ✅ Available  ·  ⚠️ Unmatched")
+@dataclass
+class CoverageWindow:
+    start:          str   # HH:MM:SS
+    end:            str   # HH:MM:SS
+    required_staff: int
+    peak_children:  int
 
 
-def _collapse_breaks(breaks: list) -> list[dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE — BUILD HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_centre_staff(staff: list[dict], centre_id: str) -> list[dict]:
     """
-    Collapse the raw SuggestedBreak list into display rows.
-
-    Groups by (date, educator_name).  Within each group, sorts by start time
-    then walks adjacent pairs: if two breaks overlap OR share the same
-    combined-period window, they are merged into one display dict.
-
-    Merge rules:
-      • start      = min of both starts
-      • end        = max of both ends
-      • paid_min   = sum
-      • unpaid_min = sum
-      • duration   = minutes from merged start to merged end
-      • break_type = "combined" when both paid_min > 0 and unpaid_min > 0,
-                     else whichever type has non-zero minutes
-      • status     = "manual_review" if either source row has that status,
-                     otherwise "scheduled"
-      • opt_out    = kept from the first row (both should agree)
-
-    Non-overlapping breaks are emitted as separate display dicts.
+    Flatten staff list to those active at this centre.
+    Returns list of {uid, name, primary_room_id, employment_type}.
     """
-    from datetime import datetime as _dt
+    result = []
+    for profile in staff:
+        u = profile.get("users") or {}
+        uid = u.get("id", "")
+        if not uid or not u.get("is_active", True):
+            continue
 
-    def _mins(s: str, e: str) -> int:
-        try:
-            return max(0, int(
-                (_dt.strptime(e[:5], "%H:%M") - _dt.strptime(s[:5], "%H:%M"))
-                .total_seconds() / 60
+        for role in (profile.get("user_centre_roles") or []):
+            if role.get("centre_id") != centre_id:
+                continue
+            if not role.get("is_active", True):
+                continue
+            result.append({
+                "uid":             uid,
+                "name":            f"{u.get('first_name','')} {u.get('last_name','')}".strip(),
+                "primary_room_id": role.get("primary_room_id"),
+                "employment_type": profile.get("employment_type", "full_time"),
+                "allows_opt_out":  profile.get("allows_unpaid_break_opt_out", False),
+            })
+            break  # one role per centre
+
+    return result
+
+
+def _group_intervals_by_room(day_ivs: list[dict]) -> dict[str, list[dict]]:
+    result: dict[str, list[dict]] = {}
+    for iv in day_ivs:
+        rid = iv.get("room_id", "")
+        if rid:
+            result.setdefault(rid, []).append(iv)
+    return result
+
+
+def _merge_slots_to_windows(
+    req_by_slot: dict[str, int],
+    all_ivs: list[dict],
+) -> list[CoverageWindow]:
+    """
+    Merge adjacent required-staff slots into contiguous CoverageWindows.
+    Adjacent slots with the same required_staff count are merged.
+    """
+    if not req_by_slot:
+        return []
+
+    # Sort by interval_start
+    iv_lookup = {iv["interval_start"]: iv for iv in all_ivs}
+    sorted_starts = sorted(req_by_slot.keys())
+
+    windows: list[CoverageWindow] = []
+    cur_start     = sorted_starts[0]
+    cur_req       = req_by_slot[cur_start]
+    cur_peak      = cur_req
+    cur_end       = iv_lookup[cur_start]["interval_end"]
+
+    for istart in sorted_starts[1:]:
+        req = req_by_slot[istart]
+        iv  = iv_lookup.get(istart, {})
+        iend = iv.get("interval_end", istart)
+
+        # Adjacent if this slot starts exactly where the previous one ended
+        if istart == cur_end and req == cur_req:
+            # Extend current window
+            cur_end  = iend
+            cur_peak = max(cur_peak, req)
+        else:
+            # Save current window, start new one
+            windows.append(CoverageWindow(
+                start=cur_start, end=cur_end,
+                required_staff=cur_req, peak_children=cur_peak,
             ))
+            cur_start = istart
+            cur_req   = req
+            cur_peak  = req
+            cur_end   = iend
+
+    windows.append(CoverageWindow(
+        start=cur_start, end=cur_end,
+        required_staff=cur_req, peak_children=cur_peak,
+    ))
+    return windows
+
+
+# Employment-type priority order for staff allocation.
+# Lower number = higher priority. Casual staff are last.
+EMPLOYMENT_PRIORITY: dict[str, int] = {
+    "full_time":  0,
+    "part_time":  1,
+    "casual":     2,
+}
+CASUAL_MIN_SHIFT_MINUTES: int = 180   # 3 hours — casual staff floor
+
+
+def _employment_rank(s: dict) -> int:
+    """Return sort key for employment type (lower = higher priority)."""
+    return EMPLOYMENT_PRIORITY.get(s.get("employment_type", "casual"), 2)
+
+
+def _eligible_staff(
+    centre_staff: list[dict],
+    room_id: str,
+    date_str: str,
+    dow: int,
+    availability_map: dict[str, dict],
+    leave_map: dict[str, list[str]],
+) -> list[dict]:
+    """
+    Return staff eligible to work in room_id on date_str, sorted by:
+        1. Primary room match (preferred over non-primary)
+        2. Employment type: full-time → part-time → casual
+        3. Name (stable tie-break)
+
+    Availability and leave are filtered before sorting.
+    """
+    result_primary = []
+    result_other   = []
+
+    for s in centre_staff:
+        uid = s["uid"]
+
+        if date_str in leave_map.get(uid, []):
+            continue
+
+        av = availability_map.get(uid, {}).get(dow)
+        if av is not None and not av.get("is_available", True):
+            continue
+
+        entry = {**s, "avail": av}
+
+        if s.get("primary_room_id") == room_id:
+            result_primary.append(entry)
+        else:
+            result_other.append(entry)
+
+    # Sort each bucket by employment priority then name
+    key = lambda x: (_employment_rank(x), x.get("name", ""))
+    result_primary.sort(key=key)
+    result_other.sort(key=key)
+
+    return result_primary + result_other
+
+
+def _pick_staff(
+    eligible: list[dict],
+    room_id: str,
+    date_str: str,
+    window: CoverageWindow,
+    assigned_minutes: dict[str, int],
+    day_shifts: list[SuggestedShift],
+) -> dict | None:
+    """
+    Pick the best available staff member for this window.
+
+    Priority (already enforced by _eligible_staff ordering):
+        1. Primary-room match
+        2. Full-time before part-time before casual
+
+    Additional constraint:
+        Casual staff must not be assigned shifts shorter than
+        CASUAL_MIN_SHIFT_MINUTES (3 hours = 180 min). If the window
+        is under 3 hours a casual staff member is skipped entirely.
+
+    Returns {uid, name, source, employment_type} or None.
+    """
+    already_in_window = set()
+    for s in day_shifts:
+        if s.shift_date == date_str:
+            if s.start_time < window.end and s.end_time > window.start:
+                already_in_window.add(s.user_id)
+
+    window_dur = _mins_between(window.start, window.end)
+
+    for s in eligible:
+        uid  = s["uid"]
+        etype = s.get("employment_type", "full_time")
+
+        if uid in already_in_window:
+            continue
+
+        # Casual staff: enforce 3-hour minimum shift length
+        if etype == "casual" and window_dur < CASUAL_MIN_SHIFT_MINUTES:
+            continue
+
+        av = s.get("avail")
+        if av:
+            av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
+            av_until = (av.get("available_until") or "23:59")[:5] + ":00"
+            if window.start < av_from or window.end > av_until:
+                continue
+
+        source = "primary_room" if s.get("primary_room_id") == room_id else "available"
+        return {"uid": uid, "name": s["name"], "source": source, "employment_type": etype}
+
+    return None
+
+
+def _shift_type(start: str, end: str) -> str:
+    """Classify opening / closing / standard based on time."""
+    s = start[:5]
+    e = end[:5]
+    if s <= "07:30":
+        return "opening"
+    if e >= "17:30":
+        return "closing"
+    return "standard"
+
+
+def _mins_between(start: str, end: str) -> int:
+    try:
+        s = datetime.strptime(start[:5], "%H:%M")
+        e = datetime.strptime(end[:5],   "%H:%M")
+        return max(0, int((e - s).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE — BREAK SCHEDULING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+CENTRE_OPEN:  str = "07:15:00"   # earliest slot that must be covered
+CENTRE_CLOSE: str = "18:00:00"   # coverage must reach (exclusive) this time
+
+
+def _check_centre_coverage(
+    day_shifts: list[SuggestedShift],
+    date_str: str,
+) -> list[str]:
+    """
+    Verify that at least one staff member covers every 15-minute slot from
+    CENTRE_OPEN (07:15) to CENTRE_CLOSE (18:00) across all rooms combined.
+
+    Returns a list of warning strings for any uncovered slots.
+    """
+    warnings: list[str] = []
+
+    # Build set of 15-min slots that are covered by at least one shift
+    covered: set[str] = set()
+    for shift in day_shifts:
+        ss = shift.start_time
+        se = shift.end_time
+        # Walk 15-min slots
+        try:
+            current = datetime.strptime(ss[:8], "%H:%M:%S")
+            end_dt  = datetime.strptime(se[:8], "%H:%M:%S")
         except Exception:
-            return 0
+            continue
+        while current < end_dt:
+            covered.add(current.strftime("%H:%M:%S"))
+            current += timedelta(minutes=15)
 
-    def _overlaps_display(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
-        return a_start < b_end and b_start < a_end
+    # Check every required slot
+    try:
+        slot_dt  = datetime.strptime(CENTRE_OPEN,  "%H:%M:%S")
+        close_dt = datetime.strptime(CENTRE_CLOSE, "%H:%M:%S")
+    except Exception:
+        return warnings
 
-    # Group by (date, educator)
+    gap_start: str | None = None
+
+    while slot_dt < close_dt:
+        slot_str = slot_dt.strftime("%H:%M:%S")
+        if slot_str not in covered:
+            if gap_start is None:
+                gap_start = slot_str[:5]
+        else:
+            if gap_start is not None:
+                warnings.append(
+                    f"Coverage gap {date_str} {gap_start}–{slot_str[:5]}: "
+                    "no staff rostered across any room."
+                )
+                gap_start = None
+        slot_dt += timedelta(minutes=15)
+
+    if gap_start is not None:
+        warnings.append(
+            f"Coverage gap {date_str} {gap_start}–{CENTRE_CLOSE[:5]}: "
+            "no staff rostered across any room."
+        )
+
+    return warnings
+
+
+def _build_room_coverage(
+    day_shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+) -> dict[str, dict[str, int]]:
+    """
+    {room_id: {HH:MM: staff_count}} for 15-min slots based on suggested shifts.
+    """
+    result: dict[str, dict[str, int]] = {}
+    slots = [
+        f"{h:02d}:{m:02d}:00"
+        for h in range(6, 21)
+        for m in (0, 15, 30, 45)
+    ]
+    for shift in day_shifts:
+        rid = shift.room_id
+        if rid not in result:
+            result[rid] = {s: 0 for s in slots}
+        for slot in slots:
+            if shift.start_time <= slot < shift.end_time:
+                result[rid][slot] = result[rid].get(slot, 0) + 1
+    return result
+
+
+def _merge_separate_rest_and_meal(
+    breaks: list[SuggestedBreak],
+    shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+) -> tuple[list[SuggestedBreak], list[str]]:
+    """
+    Post-generation merge pass.
+
+    When the initial combined suggestion was rejected by the ratio check, the
+    engine falls back to two separate SuggestedBreak objects (rest + meal)
+    placed at different times with a gap between them.  This step finds those
+    pairs and collapses them into one combined SuggestedBreak.
+
+    Algorithm per (user_id, break_date) group:
+      1. If the group has exactly one 'rest' and one 'meal' break, try to merge.
+      2. Try anchor A — meal-anchored (preferred window):
+            combined_start = meal_start − paid_component_minutes
+            combined_end   = meal_end
+         If combined_start < shift_start, clamp to shift_start and extend end.
+      3. If anchor A causes a ratio breach, try anchor B — rest-anchored:
+            combined_start = rest_start
+            combined_end   = rest_start + total_combined_minutes
+      4. If both anchors fail, keep the breaks separate and add a warning.
+      5. When a merge succeeds, remove both originals and emit one SuggestedBreak
+         with break_type="combined", combined=True, the correct label, and
+         paid_minutes / unpaid_minutes preserved separately.
+
+    Does not modify groups that already contain a combined break.
+    """
     from collections import defaultdict
-    groups: dict[tuple, list] = defaultdict(list)
+
+    review_warns: list[str] = []
+
+    # Build per-day room coverage and shift lookup
+    shift_by_uid_date: dict[tuple, SuggestedShift] = {
+        (s.user_id, s.shift_date): s for s in shifts
+    }
+    day_coverage: dict[str, dict[str, dict[str, int]]] = {}
+    for s in shifts:
+        d = s.shift_date
+        if d not in day_coverage:
+            day_coverage[d] = _build_room_coverage(
+                [x for x in shifts if x.shift_date == d], room_map
+            )
+
+    # Group breaks
+    groups: dict[tuple, list[SuggestedBreak]] = defaultdict(list)
     for b in breaks:
-        groups[(b.break_date, b.user_name)].append(b)
+        groups[(b.user_id, b.break_date)].append(b)
 
-    display_rows: list[dict] = []
+    result: list[SuggestedBreak] = []
 
-    for (date_str, educator), group in sorted(groups.items()):
-        # Sort within group by start time
+    for (uid, date_str), group in groups.items():
+        # Only touch groups that have exactly one rest + one meal, no combined
+        rest_breaks = [b for b in group if b.break_type == "rest"]
+        meal_breaks = [b for b in group if b.break_type == "meal"]
+        has_combined = any(b.break_type == "combined" for b in group)
+
+        if has_combined or len(rest_breaks) != 1 or len(meal_breaks) != 1:
+            result.extend(group)
+            continue
+
+        rest = rest_breaks[0]
+        meal = meal_breaks[0]
+
+        # Don't merge if the meal was opted out (unpaid_minutes == 0 on meal)
+        if meal.unpaid_minutes == 0:
+            result.extend(group)
+            continue
+
+        paid_comp   = rest.paid_minutes   or rest.planned_duration_minutes
+        unpaid_comp = meal.unpaid_minutes or meal.planned_duration_minutes
+        total_dur   = paid_comp + unpaid_comp
+        label       = f"{total_dur} min combined break"
+
+        shift_rec   = shift_by_uid_date.get((uid, date_str))
+        shift_start = shift_rec.start_time if shift_rec else "06:00:00"
+        shift_end   = shift_rec.end_time   if shift_rec else "21:00:00"
+        rid         = shift_rec.room_id if shift_rec else None
+        room        = room_map.get(rid, {}) if rid else {}
+        r_staff     = room.get("required_ratio_staff", 1)
+        cov         = day_coverage.get(date_str, {})
+
+        merged_brk: SuggestedBreak | None = None
+
+        # ── Anchor A: meal-anchored (shift meal break left by paid_comp) ──
+        meal_start = meal.planned_start_time
+        meal_end   = meal.planned_end_time
+        cand_start = _subtract_minutes(meal_start, paid_comp)
+        cand_end   = meal_end
+
+        # Clamp to shift start if needed
+        if cand_start < shift_start:
+            cand_start = shift_start
+            cand_end   = _add_minutes(cand_start, total_dur)
+
+        if cand_end <= shift_end and _ratio_allows_window(
+            cand_start, cand_end, rid, uid, cov, r_staff
+        ):
+            merged_brk = _make_combined_break(
+                rest, cand_start, cand_end, paid_comp, unpaid_comp,
+                total_dur, label, date_str, uid,
+            )
+
+        # ── Anchor B: rest-anchored ───────────────────────────────────────
+        if merged_brk is None:
+            rest_start = rest.planned_start_time
+            cand_start = rest_start
+            cand_end   = _add_minutes(cand_start, total_dur)
+
+            if cand_end <= shift_end and _ratio_allows_window(
+                cand_start, cand_end, rid, uid, cov, r_staff
+            ):
+                merged_brk = _make_combined_break(
+                    rest, cand_start, cand_end, paid_comp, unpaid_comp,
+                    total_dur, label, date_str, uid,
+                )
+
+        if merged_brk is not None:
+            result.append(merged_brk)
+        else:
+            # Ratio or shift constraints prevent a clean combined window.
+            # Still emit ONE combined manual_review break rather than two
+            # separate ones — anchored at the meal break time.
+            fallback_start = _subtract_minutes(meal.planned_start_time, paid_comp)
+            if fallback_start < shift_start:
+                fallback_start = shift_start
+            fallback_end = _add_minutes(fallback_start, total_dur)
+            if fallback_end > shift_end:
+                fallback_end = shift_end
+                fallback_start = _subtract_minutes(fallback_end, total_dur)
+
+            fallback_brk = SuggestedBreak(
+                user_id=uid,
+                user_name=rest.user_name,
+                shift_key=rest.shift_key,
+                break_date=date_str,
+                break_type="combined",
+                planned_start_time=fallback_start,
+                planned_end_time=fallback_end,
+                planned_duration_minutes=total_dur,
+                paid_minutes=paid_comp,
+                unpaid_minutes=unpaid_comp,
+                combined=True,
+                label=label,
+                status="manual_review",
+                opt_out_source=rest.opt_out_source,
+                warnings=["Could not combine breaks due to ratio/shift constraints."],
+            )
+            result.append(fallback_brk)
+            review_warns.append(
+                f"{rest.user_name} on {date_str}: "
+                "Could not combine breaks due to ratio/shift constraints. "
+                "Combined break requires manual review."
+            )
+
+    return result, review_warns
+
+
+def _subtract_minutes(t: str, mins: int) -> str:
+    """Subtract mins from an HH:MM:SS string, return HH:MM:SS."""
+    try:
+        dt = datetime.strptime(t[:8], "%H:%M:%S") - timedelta(minutes=mins)
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return t
+
+
+def _add_minutes(t: str, mins: int) -> str:
+    """Add mins to an HH:MM:SS string, return HH:MM:SS."""
+    try:
+        dt = datetime.strptime(t[:8], "%H:%M:%S") + timedelta(minutes=mins)
+        return dt.strftime("%H:%M:%S")
+    except Exception:
+        return t
+
+
+def _make_combined_break(
+    rest: "SuggestedBreak",
+    start: str,
+    end: str,
+    paid_comp: int,
+    unpaid_comp: int,
+    total_dur: int,
+    label: str,
+    date_str: str,
+    uid: str,
+) -> "SuggestedBreak":
+    """Construct one combined SuggestedBreak from a rest+meal pair."""
+    return SuggestedBreak(
+        user_id=uid,
+        user_name=rest.user_name,
+        shift_key=rest.shift_key,
+        break_date=date_str,
+        break_type="combined",
+        planned_start_time=start,
+        planned_end_time=end,
+        planned_duration_minutes=total_dur,
+        paid_minutes=paid_comp,
+        unpaid_minutes=unpaid_comp,
+        combined=True,
+        label=label,
+        status="scheduled",
+        opt_out_source=rest.opt_out_source,
+    )
+
+
+def _find_break_cover(
+    break_start: str,
+    break_end: str,
+    break_room_id: str,
+    break_room: dict,
+    break_uid: str,
+    break_uname: str,
+    date_str: str,
+    day_shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+    room_coverage: dict[str, dict[str, int]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
+    cover_delta: dict[str, dict[str, int]],
+) -> "SuggestedMovement | None":
+    """
+    Try to find an educator from another room who can temporarily move to
+    break_room for [break_start, break_end] to maintain ratio coverage.
+
+    Eligibility criteria for a covering educator (cover_uid):
+      1. Is working at break_room during the entire break window.
+         (Their shift start ≤ break_start and shift end ≥ break_end.)
+      2. Is NOT the educator on break.
+      3. Is NOT already on break during this window.
+      4. Moving them away from their own room does NOT breach their own
+         room's required ratio.
+
+    Preference order:
+      1. Educators in rooms with the most spare capacity (staff above ratio).
+      2. Earlier alphabetical name as tie-break.
+
+    Returns a SuggestedMovement if cover is found, None otherwise.
+    Does NOT mutate cover_delta — caller applies the delta after confirming.
+    """
+    r_staff_needed = break_room.get("required_ratio_staff", 1)
+    r_room_name    = break_room.get("name", break_room_id)
+
+    # Slots in the break window
+    break_slots = [
+        s for room_cov in room_coverage.values()
+        for s in room_cov
+        if break_start <= s < break_end
+    ]
+    break_slots = sorted(set(break_slots))
+
+    # Collect already-on-break uids during this window
+    on_break_uids: set[str] = set()
+    for uid2, user_breaks in breaks_by_user.items():
+        for bs, be, _ in user_breaks:
+            if _overlaps(break_start, break_end, bs, be):
+                on_break_uids.add(uid2)
+
+    candidates = []
+
+    for shift in day_shifts:
+        cuid  = shift.user_id
+        crid  = shift.room_id
+
+        # Must be a different educator, in a different room, not on break
+        if cuid == break_uid:
+            continue
+        if crid == break_room_id:
+            continue
+        if cuid in on_break_uids:
+            continue
+
+        # Must be working during the entire break window
+        if shift.start_time > break_start or shift.end_time < break_end:
+            continue
+
+        # Moving them away must not breach their own room's ratio
+        own_room   = room_map.get(crid, {})
+        own_r_staff = own_room.get("required_ratio_staff", 1)
+        own_cov    = room_coverage.get(crid, {})
+        own_deltas = (cover_delta or {}).get(crid, {})
+        feasible   = True
+        surplus_min = 999  # minimum surplus across break slots
+
+        for slot in break_slots:
+            base   = own_cov.get(slot, 0)
+            extra  = own_deltas.get(slot, 0)
+            after  = base + extra - 1   # if this educator leaves
+            if after < own_r_staff:
+                feasible = False
+                break
+            surplus_min = min(surplus_min, after - own_r_staff)
+
+        if not feasible:
+            continue
+
+        candidates.append({
+            "uid":         cuid,
+            "name":        shift.user_name,
+            "from_room_id":   crid,
+            "from_room_name": own_room.get("name", crid),
+            "surplus":     surplus_min,
+        })
+
+    if not candidates:
+        return None
+
+    # Sort: most surplus first (least disruption), then name for stability
+    candidates.sort(key=lambda c: (-c["surplus"], c["name"]))
+    best = candidates[0]
+
+    return SuggestedMovement(
+        educator_id=best["uid"],
+        educator_name=best["name"],
+        from_room_id=best["from_room_id"],
+        from_room_name=best["from_room_name"],
+        to_room_id=break_room_id,
+        to_room_name=r_room_name,
+        start_time=break_start,
+        end_time=break_end,
+        move_date=date_str,
+        covering_for_uid=break_uid,
+        covering_for_name=break_uname,
+        reason=(
+            f"{best['name']} covers {r_room_name} {break_start[:5]}–{break_end[:5]} "
+            f"while {break_uname} is on break."
+        ),
+    )
+
+
+def _apply_cover_delta(
+    cover_delta: dict[str, dict[str, int]],
+    movement: "SuggestedMovement",
+) -> None:
+    """
+    Update cover_delta in-place to reflect a temporary movement:
+      - The receiving room gains +1 per slot during the movement window.
+      - The sending room loses -1 per slot during the movement window.
+    This is used by subsequent _check_break_impact calls.
+    """
+    slots = [
+        f"{h:02d}:{m:02d}:00"
+        for h in range(6, 21) for m in (0, 15, 30, 45)
+        if movement.start_time <= f"{h:02d}:{m:02d}:00" < movement.end_time
+    ]
+
+    # Receiving room: +1 (cover educator is present)
+    to_rid = movement.to_room_id
+    if to_rid not in cover_delta:
+        cover_delta[to_rid] = {}
+    for slot in slots:
+        cover_delta[to_rid][slot] = cover_delta[to_rid].get(slot, 0) + 1
+
+    # Sending room: -1 (cover educator has left)
+    from_rid = movement.from_room_id
+    if from_rid not in cover_delta:
+        cover_delta[from_rid] = {}
+    for slot in slots:
+        cover_delta[from_rid][slot] = cover_delta[from_rid].get(slot, 0) - 1
+
+
+def _validate_and_resolve_break_overlaps(
+    breaks: list[SuggestedBreak],
+    shifts: list[SuggestedShift],
+    room_map: dict[str, dict],
+) -> tuple[list[SuggestedBreak], list[str]]:
+    """
+    Final validation pass: detect and resolve per-educator break overlaps.
+
+    Runs after ALL other break generation, fixed-break, paid/unpaid, and
+    manual-review logic — immediately before the result is returned.
+
+    For each (user_id, break_date) group with more than one break:
+        1. Sort by planned_start_time.
+        2. Walk adjacent pairs; test overlap with _overlaps().
+        3a. If overlap AND ratio allows the combined window:
+              Replace the pair with one SuggestedBreak spanning
+              min(starts)..max(ends).  paid_minutes and unpaid_minutes
+              are summed from both breaks.  status → "scheduled",
+              break_type → "combined", combined → True.
+        3b. If overlap AND ratio does NOT allow combined:
+              Try to move the later (non-fixed) break to the nearest
+              valid window after the first break ends.
+        3c. If neither break can be moved (both fixed, or no free slot):
+              Mark the overlapping break as status="manual_review" and
+              add an entry to review_warnings.
+
+    Different educators are checked independently.
+    The same educator on different days is also checked independently.
+
+    Returns (resolved_breaks, new_review_warnings).
+    """
+    review_warns: list[str] = []
+
+    # Build room coverage once per day from all shifts
+    day_coverage: dict[str, dict[str, dict[str, int]]] = {}  # date → room coverage
+    for shift in shifts:
+        d = shift.shift_date
+        if d not in day_coverage:
+            day_coverage[d] = _build_room_coverage(
+                [s for s in shifts if s.shift_date == d], room_map
+            )
+
+    # Group breaks by (user_id, break_date)
+    from collections import defaultdict
+    groups: dict[tuple, list[SuggestedBreak]] = defaultdict(list)
+    for b in breaks:
+        groups[(b.user_id, b.break_date)].append(b)
+
+    resolved: list[SuggestedBreak] = []
+
+    for (uid, date_str), group in groups.items():
+        if len(group) == 1:
+            resolved.append(group[0])
+            continue
+
+        # Sort by start time
         group.sort(key=lambda b: b.planned_start_time)
 
-        # Walk and merge overlapping / same-window pairs
-        # Use plain dicts as accumulators so we can freely mutate them
-        accum: list[dict] = []
-        for b in group:
-            b_start = b.planned_start_time[:8]
-            b_end   = b.planned_end_time[:8]
-            b_paid   = getattr(b, "paid_minutes",   0) or 0
-            b_unpaid = getattr(b, "unpaid_minutes", 0) or 0
-            b_status = b.status or "scheduled"
-            b_opt    = b.opt_out_source or ""
+        # Identify the room for this educator on this day
+        room_id = next(
+            (s.room_id for s in shifts
+             if s.user_id == uid and s.shift_date == date_str),
+            None,
+        )
+        room = room_map.get(room_id, {}) if room_id else {}
+        r_staff = room.get("required_ratio_staff",    1)
+        r_child = room.get("required_ratio_children", 4)
+        cov     = day_coverage.get(date_str, {})
 
-            if accum and _overlaps_display(
-                accum[-1]["_start"], accum[-1]["_end"], b_start, b_end
+        # Shift bounds for this educator (to constrain rescheduling)
+        shift_rec = next(
+            (s for s in shifts if s.user_id == uid and s.shift_date == date_str),
+            None,
+        )
+        shift_start = shift_rec.start_time if shift_rec else "06:00:00"
+        shift_end   = shift_rec.end_time   if shift_rec else "21:00:00"
+
+        # Walk pairs; merge or reschedule as needed
+        output: list[SuggestedBreak] = [group[0]]
+
+        for brk in group[1:]:
+            prev = output[-1]
+
+            if not _overlaps(
+                prev.planned_start_time, prev.planned_end_time,
+                brk.planned_start_time,  brk.planned_end_time,
             ):
-                # Merge into the last accumulator entry
-                prev = accum[-1]
-                prev["_start"]   = min(prev["_start"],   b_start)
-                prev["_end"]     = max(prev["_end"],     b_end)
-                prev["paid"]    += b_paid
-                prev["unpaid"]  += b_unpaid
-                if b_status == "manual_review":
-                    prev["status"] = "manual_review"
-            else:
-                accum.append({
-                    "_start":  b_start,
-                    "_end":    b_end,
-                    "paid":    b_paid,
-                    "unpaid":  b_unpaid,
-                    "status":  b_status,
-                    "opt_out": b_opt,
-                })
+                output.append(brk)
+                continue
 
-        for row in accum:
-            paid    = row["paid"]
-            unpaid  = row["unpaid"]
-            start5  = row["_start"][:5]
-            end5    = row["_end"][:5]
-            dur     = _mins(row["_start"], row["_end"])
+            # ── Overlap detected ──────────────────────────────────────
+            combined_start = min(prev.planned_start_time, brk.planned_start_time)
+            combined_end   = max(prev.planned_end_time,   brk.planned_end_time)
+            combined_dur   = _mins_between(combined_start, combined_end)
+            paid_total     = prev.paid_minutes   + brk.paid_minutes
+            unpaid_total   = prev.unpaid_minutes + brk.unpaid_minutes
+            uname          = prev.user_name
 
-            if paid > 0 and unpaid > 0:
-                btype = "Combined break"
-            elif paid > 0:
-                btype = "Rest (paid)"
-            else:
-                btype = "Meal (unpaid)"
-
-            STATUS_ICON = {"scheduled": "✅", "manual_review": "🔍"}
-            status_str = row["status"]
-            status_display = (
-                STATUS_ICON.get(status_str, "?") + " "
-                + status_str.replace("_", " ").title()
+            # Check whether ratio allows the combined window
+            ratio_ok = _ratio_allows_window(
+                combined_start, combined_end, room_id, uid, cov, r_staff,
             )
 
-            display_rows.append({
-                "Date":       date_str,
-                "Educator":   educator,
-                "Break":      btype,
-                "Start":      start5,
-                "End":        end5,
-                "Duration":   f"{dur} min",
-                "Paid min":   paid   if paid   > 0 else "—",
-                "Unpaid min": unpaid if unpaid > 0 else "—",
-                "Status":     status_display,
-                "Opt-out":    row["opt_out"],
-            })
+            if ratio_ok:
+                # ── Combine into one block ────────────────────────────
+                combined_label = (
+                    f"{combined_dur} min combined break"
+                    if (paid_total and unpaid_total)
+                    else prev.label
+                )
+                merged = SuggestedBreak(
+                    user_id=uid,
+                    user_name=uname,
+                    shift_key=prev.shift_key,
+                    break_date=date_str,
+                    break_type="combined",
+                    planned_start_time=combined_start,
+                    planned_end_time=combined_end,
+                    planned_duration_minutes=combined_dur,
+                    paid_minutes=paid_total,
+                    unpaid_minutes=unpaid_total,
+                    combined=True,
+                    label=combined_label,
+                    status="scheduled",
+                    opt_out_source=prev.opt_out_source,
+                )
+                output[-1] = merged   # replace prev with the merged block
 
-    return display_rows
+            else:
+                # ── Try to move the later break ───────────────────────
+                # Determine which break is movable (prefer moving brk;
+                # if brk is a combined/fixed block, try moving prev).
+                can_move_brk  = not (brk.combined  and brk.break_type == "combined")
+                can_move_prev = not (prev.combined  and prev.break_type == "combined")
+
+                moved = False
+                if can_move_brk:
+                    new_s, new_e = _next_free_slot(
+                        prev.planned_end_time, brk.planned_duration_minutes,
+                        shift_start, shift_end,
+                        room_id, uid, cov, r_staff,
+                        already_placed=[(b.planned_start_time, b.planned_end_time)
+                                        for b in output],
+                    )
+                    if new_s is not None:
+                        rescheduled = SuggestedBreak(
+                            user_id=uid,
+                            user_name=uname,
+                            shift_key=brk.shift_key,
+                            break_date=date_str,
+                            break_type=brk.break_type,
+                            planned_start_time=new_s,
+                            planned_end_time=new_e,
+                            planned_duration_minutes=brk.planned_duration_minutes,
+                            paid_minutes=brk.paid_minutes,
+                            unpaid_minutes=brk.unpaid_minutes,
+                            combined=brk.combined,
+                            label=brk.label,
+                            status="scheduled",
+                            opt_out_source=brk.opt_out_source,
+                        )
+                        output.append(rescheduled)
+                        moved = True
+
+                if not moved:
+                    # Cannot resolve — flag for manual review
+                    flagged = SuggestedBreak(
+                        user_id=uid,
+                        user_name=uname,
+                        shift_key=brk.shift_key,
+                        break_date=date_str,
+                        break_type=brk.break_type,
+                        planned_start_time=brk.planned_start_time,
+                        planned_end_time=brk.planned_end_time,
+                        planned_duration_minutes=brk.planned_duration_minutes,
+                        paid_minutes=brk.paid_minutes,
+                        unpaid_minutes=brk.unpaid_minutes,
+                        combined=brk.combined,
+                        label=brk.label,
+                        status="manual_review",
+                        opt_out_source=brk.opt_out_source,
+                        warnings=[
+                            f"Overlaps {prev.break_type} break "
+                            f"{prev.planned_start_time[:5]}–{prev.planned_end_time[:5]}. "
+                            "Ratio does not allow combined or rescheduled break."
+                        ],
+                    )
+                    output.append(flagged)
+                    review_warns.append(
+                        f"{uname} on {date_str}: break overlap "
+                        f"{prev.planned_start_time[:5]}–{prev.planned_end_time[:5]} ∩ "
+                        f"{brk.planned_start_time[:5]}–{brk.planned_end_time[:5]} "
+                        "— manual review required."
+                    )
+
+        resolved.extend(output)
+
+    return resolved, review_warns
 
 
-def _render_break_table(breaks: list):
+def _ratio_allows_window(
+    b_start: str,
+    b_end: str,
+    room_id: str | None,
+    user_id: str,
+    cov: dict[str, dict[str, int]],
+    r_staff: int,
+) -> bool:
     """
-    Render the generated break schedule table.
-
-    Calls _collapse_breaks first so that two SuggestedBreak objects that
-    occupy the same or overlapping window for the same educator/date are
-    always shown as one combined display row — never as two separate rows
-    with overlapping times.
+    Return True if removing this educator during [b_start, b_end] keeps
+    coverage at or above r_staff in every 15-minute slot.
     """
-    if not breaks:
-        st.info("No breaks generated.")
-        return
-
-    display_rows = _collapse_breaks(breaks)
-
-    df = pd.DataFrame(display_rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    n_combined = sum(1 for r in display_rows if r["Break"] == "Combined break")
-    n_separate = len(display_rows) - n_combined
-    n_review   = sum(1 for r in display_rows if "Manual Review" in r["Status"])
-    notes = []
-    if n_combined:
-        notes.append(f"🔵 {n_combined} combined block(s)")
-    if n_separate:
-        notes.append(f"⚪ {n_separate} separate break(s)")
-    if n_review:
-        notes.append(f"🔍 {n_review} manual review")
-    else:
-        notes.append("🔍 = manual review required")
-    st.caption("  ·  ".join(notes))
+    if not room_id:
+        return True
+    room_cov = cov.get(room_id, {})
+    for slot, count in room_cov.items():
+        if b_start <= slot < b_end:
+            if max(0, count - 1) < r_staff:
+                return False
+    return True
 
 
-def _render_movement_table(movements: list) -> None:
+def _next_free_slot(
+    not_before: str,
+    dur_minutes: int,
+    shift_start: str,
+    shift_end: str,
+    room_id: str | None,
+    user_id: str,
+    cov: dict[str, dict[str, int]],
+    r_staff: int,
+    already_placed: list[tuple[str, str]],
+) -> tuple[str | None, str | None]:
     """
-    Render a simple table of temporary educator movements required for break cover.
-    Each row: Educator | From room | To room | Date | Start | End | Reason
+    Scan forward from `not_before` in 15-minute steps to find the next slot
+    where the educator can take a break without overlapping any already-placed
+    break and without breaching the room ratio.
+
+    Returns (start, end) strings or (None, None) if no slot found.
     """
-    rows = []
-    for mv in sorted(movements, key=lambda m: (m.move_date, m.start_time)):
-        rows.append({
-            "Educator":    mv.educator_name,
-            "From room":   mv.from_room_name,
-            "To room":     mv.to_room_name,
-            "Date":        mv.move_date,
-            "Start":       mv.start_time[:5],
-            "End":         mv.end_time[:5],
-            "Covering for": mv.covering_for_name,
-            "Reason":      mv.reason,
-        })
-    if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "💡 These are temporary moves only. "
-            "Original shift room assignments are unchanged."
+    try:
+        current = datetime.strptime(not_before[:8], "%H:%M:%S")
+        end_dt  = datetime.strptime(shift_end[:8],  "%H:%M:%S")
+    except Exception:
+        return None, None
+
+    step = timedelta(minutes=15)
+
+    while current + timedelta(minutes=dur_minutes) <= end_dt:
+        b_s = current.strftime("%H:%M:%S")
+        b_e = (current + timedelta(minutes=dur_minutes)).strftime("%H:%M:%S")
+
+        # No overlap with already-placed breaks
+        if any(_overlaps(b_s, b_e, ps, pe) for ps, pe in already_placed):
+            current += step
+            continue
+
+        # Ratio check
+        if _ratio_allows_window(b_s, b_e, room_id, user_id, cov, r_staff):
+            return b_s, b_e
+
+        current += step
+
+    return None, None
+
+
+def _overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    """
+    Return True when two time windows overlap.
+    Canonical half-open interval test: a_start < b_end AND b_start < a_end.
+    All arguments must be HH:MM:SS strings.
+    """
+    return a_start < b_end and b_start < a_end
+
+
+def _check_centre_ratio(
+    b_start: str,
+    b_end: str,
+    break_room_id: str,
+    room_coverage: dict[str, dict[str, int]],
+    room_map: dict[str, dict],
+    cover_delta: dict[str, dict[str, int]] | None = None,
+) -> tuple[bool, str, dict]:
+    """
+    Check whether removing one educator from break_room_id during [b_start, b_end)
+    would cause the CENTRE as a whole to fall below its aggregate staffing requirement.
+
+    For each 15-min slot in the break window:
+        centre_staff_required = sum over all rooms of ceil(children/ratio_children)*ratio_staff
+        centre_staff_present  = sum of all room coverage + cover_delta - 1 (for this break)
+
+    Returns (ok: bool, reason: str, debug_info: dict).
+    debug_info contains per-slot centre data for the debug log.
+    """
+    deltas = cover_delta or {}
+    slots_in_break = [
+        s for room_cov in room_coverage.values()
+        for s in room_cov
+        if b_start <= s < b_end
+    ]
+    slots_in_break = sorted(set(slots_in_break))
+
+    worst_debug: dict = {}
+
+    import math as _math
+    for slot in slots_in_break:
+        centre_staff    = 0
+        centre_required = 0
+
+        for rid, room_cov in room_coverage.items():
+            base  = room_cov.get(slot, 0)
+            delta = deltas.get(rid, {}).get(slot, 0)
+            centre_staff += base + delta
+
+            room = room_map.get(rid, {})
+            r_s  = room.get("required_ratio_staff",    1)
+            r_c  = room.get("required_ratio_children", 4)
+            # Use room's licensed capacity as max children proxy when no interval data
+            # (conservative — always assumes room could be full)
+            cap  = room.get("licensed_capacity", 0)
+            centre_required += r_s   # at minimum, every room needs r_s staff
+
+        # After removing this educator from break_room
+        staff_after = centre_staff - 1
+
+        if not worst_debug:
+            worst_debug = {
+                "slot":              slot,
+                "centre_staff_before": centre_staff,
+                "centre_staff_after":  staff_after,
+                "centre_required":     centre_required,
+            }
+
+        if staff_after < centre_required:
+            return (
+                False,
+                f"Centre drops to {staff_after} staff at {slot[:5]} (need {centre_required}).",
+                {
+                    "slot":              slot,
+                    "centre_staff_before": centre_staff,
+                    "centre_staff_after":  staff_after,
+                    "centre_required":     centre_required,
+                },
+            )
+
+    return True, "", worst_debug
+
+
+def _check_break_impact(
+    b_start: str,
+    b_end: str,
+    room_id: str,
+    user_id: str,
+    room_coverage: dict[str, dict[str, int]],
+    breaks_by_room: dict[str, list[tuple[str, str]]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
+    r_staff: int,
+    r_child: int,
+    cover_delta: dict[str, dict[str, int]] | None = None,
+    room_map: dict[str, dict] | None = None,
+) -> tuple[str, str, dict]:
+    """
+    Return ("ok" | "breach" | "fixed_conflict", reason, debug_info).
+
+    Checks in priority order:
+    0. Centre-wide ratio (highest priority — checked first when room_map provided).
+    1. Educator-level overlap.
+    2. Room-level stagger (no two educators from same room on break simultaneously).
+    3. Room-level ratio coverage.
+    """
+    debug_info: dict = {}
+
+    # 0. Centre-wide ratio (priority 0 — must pass before anything else)
+    if room_map:
+        centre_ok, centre_reason, centre_debug = _check_centre_ratio(
+            b_start, b_end, room_id, room_coverage, room_map, cover_delta,
         )
+        debug_info.update(centre_debug)
+        if not centre_ok:
+            return "breach", f"Centre-wide ratio: {centre_reason}", debug_info
+
+    # 1. Educator overlap
+    for ex_start, ex_end, ex_fixed in breaks_by_user.get(user_id, []):
+        if _overlaps(b_start, b_end, ex_start, ex_end):
+            if ex_fixed:
+                return (
+                    "fixed_conflict",
+                    f"Overlaps a fixed break {ex_start[:5]}–{ex_end[:5]} that cannot be moved.",
+                    debug_info,
+                )
+            return (
+                "breach",
+                f"Overlaps educator's own break {ex_start[:5]}–{ex_end[:5]}.",
+                debug_info,
+            )
+
+    # 2. Room-level stagger
+    for existing_start, existing_end in breaks_by_room.get(room_id, []):
+        if _overlaps(b_start, b_end, existing_start, existing_end):
+            return "breach", "Another staff member is already on break in this window.", debug_info
+
+    # 3. Room-level ratio (with cover_delta applied)
+    cov    = room_coverage.get(room_id, {})
+    deltas = (cover_delta or {}).get(room_id, {})
+    slots_in_break = [s for s in cov if b_start <= s < b_end]
+    room_staff_before = None
+    for slot in slots_in_break:
+        base_staff     = cov.get(slot, 0)
+        extra_cover    = deltas.get(slot, 0)
+        staff_if_break = max(0, base_staff + extra_cover - 1)
+        if room_staff_before is None:
+            room_staff_before = base_staff + extra_cover
+        if staff_if_break < r_staff:
+            debug_info.update({
+                "room_staff_before": room_staff_before,
+                "room_staff_after":  staff_if_break,
+                "room_required":     r_staff,
+            })
+            return "breach", f"Room coverage at {slot[:5]} drops to {staff_if_break} (need {r_staff}).", debug_info
+
+    debug_info.update({
+        "room_staff_before": room_staff_before,
+        "room_staff_after":  max(0, (room_staff_before or 0) - 1),
+        "room_required":     r_staff,
+    })
+    return "ok", "", debug_info
+
+
+def _find_alt_break_window(
+    shift_start: str,
+    shift_end: str,
+    dur_minutes: int,
+    room_id: str,
+    user_id: str,
+    room_coverage: dict[str, dict[str, int]],
+    breaks_by_room: dict[str, list[tuple[str, str]]],
+    breaks_by_user: dict[str, list[tuple[str, str, bool]]],
+    r_staff: int,
+    r_child: int,
+    cover_delta: dict[str, dict[str, int]] | None = None,
+    room_map: dict[str, dict] | None = None,
+) -> tuple[str, str, bool]:
+    """
+    Scan the shift in 15-minute steps for a window satisfying ALL constraints
+    (centre-wide ratio, educator overlap, room stagger, room ratio).
+    Returns (start, end, still_conflict).
+    """
+    step = timedelta(minutes=15)
+
+    try:
+        current = datetime.strptime(shift_start[:8], "%H:%M:%S")
+        end_dt  = datetime.strptime(shift_end[:8],   "%H:%M:%S")
+    except Exception:
+        return shift_start, shift_end, True
+
+    while current + timedelta(minutes=dur_minutes) <= end_dt:
+        b_s = current.strftime("%H:%M:%S")
+        b_e = (current + timedelta(minutes=dur_minutes)).strftime("%H:%M:%S")
+        conflict, _, _ = _check_break_impact(
+            b_s, b_e, room_id, user_id,
+            room_coverage, breaks_by_room, breaks_by_user, r_staff, r_child,
+            cover_delta, room_map,
+        )
+        if conflict == "ok":
+            return b_s, b_e, False
+        current += step
+
+    return shift_start, shift_end, True
+
+
+def _shift_break_to_window(
+    b_start: str,
+    b_end: str,
+    dur_minutes: int,
+    shift_start: str,
+    shift_end: str,
+    preferred_from: str,
+    preferred_until: str,
+) -> tuple[str, str]:
+    """
+    Try to move a break so it falls within preferred_from–preferred_until.
+    Falls back to original times if the preferred window doesn't fit.
+    """
+    try:
+        pref_from = datetime.strptime(preferred_from, "%H:%M:%S")
+        pref_to   = datetime.strptime(preferred_until, "%H:%M:%S")
+        ss        = datetime.strptime(shift_start[:8], "%H:%M:%S")
+        se        = datetime.strptime(shift_end[:8],   "%H:%M:%S")
+        b_dur     = timedelta(minutes=dur_minutes)
+
+        window_start = max(ss, pref_from)
+        window_end   = min(se, pref_to)
+
+        if window_start + b_dur <= window_end:
+            mid = window_start + (window_end - window_start - b_dur) / 2
+            return mid.strftime("%H:%M:%S"), (mid + b_dur).strftime("%H:%M:%S")
+    except Exception:
+        pass
+
+    return b_start, b_end
