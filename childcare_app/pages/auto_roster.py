@@ -171,7 +171,8 @@ def render():
 def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
     from utils.break_engine import BREAK_RULES_DEFAULT
     from utils.roster_timeline import (
-        build_timeline_html, build_movement_notes_html, get_day_summary,
+        build_timeline_html, build_movement_notes_html,
+        get_day_summary, build_weekly_summary_html,
     )
 
     room_map   = {r["id"]: r["name"] for r in rooms}
@@ -290,6 +291,17 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         notes_html = build_movement_notes_html(day_movements)
         if notes_html:
             st.markdown(notes_html, unsafe_allow_html=True)
+
+    # ── Weekly staff summary ──────────────────────────────────────────
+    if len(all_dates) > 1 or True:   # always show for context
+        staff_profiles = {}
+        for s in shifts:
+            if s.user_id not in staff_profiles:
+                staff_profiles[s.user_id] = {"employment_type": "full_time"}
+        weekly_html = build_weekly_summary_html(shifts, breaks, all_dates, staff_profiles)
+        if weekly_html:
+            st.markdown("---")
+            st.markdown(weekly_html, unsafe_allow_html=True)
 
     # ── Debug expander (replaces old shift/break tables) ─────────────
     st.markdown("---")
