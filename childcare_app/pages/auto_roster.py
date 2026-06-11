@@ -15,7 +15,7 @@ import pandas as pd
 
 from utils.auto_roster_engine import (
     generate_roster, SuggestedShift, SuggestedBreak,
-    FT_MIN_DAYS, FT_MIN_HOURS,
+    FT_MIN_DAYS, FT_MIN_HOURS, FT_OVERTIME_THRESHOLD_HOURS,
 )
 from utils.roster_queries import (
     fetch_roster_periods, create_roster_period,
@@ -328,8 +328,16 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                 "Review the FT Allocation Report below before saving."
             )
 
-        # Summary metrics
-        mc = st.columns(5)
+        # Over-contract warnings
+        over_contract = validation.get("over_contract_warnings", [])
+        if over_contract:
+            st.warning(
+                f"⚠️ **{len(over_contract)} educator(s) rostered above contracted hours.** "
+                "Review the Weekly Hours Report below."
+            )
+
+        # Summary metrics — add over-contract count
+        mc = st.columns(6)
         mc[0].metric("Centre coverage 7:15–18:00",
                      "✅ Met" if coverage_ok else "❌ Gaps",
                      delta=f"{len(uncovered)} gap(s)" if uncovered else None,
@@ -337,14 +345,17 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         mc[1].metric("FT below 4 days",  len(ft_low_days),
                      delta="CRITICAL" if ft_low_days else None,
                      delta_color="inverse" if ft_low_days else "off")
-        mc[2].metric("FT below 10.25h", len(ft_low_hrs),
+        mc[2].metric("FT below 10h", len(ft_low_hrs),
                      delta="CRITICAL" if ft_low_hrs else None,
                      delta_color="inverse" if ft_low_hrs else "off")
-        mc[3].metric("Ratio breaches",  len(ratio_breach),
+        mc[3].metric("Over contracted",  len(over_contract),
+                     delta="review" if over_contract else None,
+                     delta_color="inverse" if over_contract else "off")
+        mc[4].metric("Ratio breaches",  len(ratio_breach),
                      delta_color="inverse" if ratio_breach else "off")
-        mc[4].metric("PT/casual hours", f"{pt_hrs:.1f}h")
+        mc[5].metric("PT/casual hours", f"{pt_hrs:.1f}h")
 
-        # FT Allocation Report — always shown when FT staff exist
+        # FT Allocation Report
         ft_report = validation.get("ft_allocation_report", [])
         if ft_report:
             st.markdown("#### 👷 Full-Time Allocation Report")
@@ -363,11 +374,33 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                     "Got days":      row["allocated_days"],
                     "Req hrs/day":   row["required_hours"],
                     "Got hrs total": f"{row['allocated_hours']:.1f}h",
-                    "10.5h days":    row["compliant_days"],
+                    "10h days":      row["compliant_days"],
                     "✓ Compliant":  "✅ Yes" if compliant else "❌ No",
                     "Reason":        row.get("reason", ""),
                 })
             st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
+
+        # Weekly Hours Report — contracted vs rostered for all staff
+        hrs_report = validation.get("weekly_hours_report", [])
+        if hrs_report:
+            st.markdown("#### 🕐 Weekly Hours Report")
+            st.caption(
+                "Contracted hours vs rostered hours for all staff this period. "
+                "⚠️ Over contracted = rostered hours exceed contracted by more than "
+                f"{FT_OVERTIME_THRESHOLD_HOURS}h threshold. "
+                "⬇ Under contracted = rostered more than 0.5h below contracted."
+            )
+            hrs_rows = []
+            for row in hrs_report:
+                hrs_rows.append({
+                    "Educator":       row["name"],
+                    "Type":           row["employment_type"],
+                    "Contracted hrs": row["contracted_hrs"],
+                    "Rostered hrs":   row["rostered_hrs"],
+                    "Variance":       row["variance"],
+                    "Status":         row["status"],
+                })
+            st.dataframe(pd.DataFrame(hrs_rows), use_container_width=True, hide_index=True)
 
         # Uncovered intervals
         if uncovered:
@@ -381,6 +414,12 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
             with st.expander(f"⚠️ {len(ratio_breach)} ratio breach(es)"):
                 for w in ratio_breach:
                     st.warning(w)
+
+        # Over-contract detail
+        if over_contract:
+            with st.expander(f"⚠️ {len(over_contract)} over-contracted hour(s)"):
+                for w in over_contract:
+                    st.warning(f"Full-time contracted hours exceeded — {w}")
 
     # ── Debug expander (replaces old shift/break tables) ─────────────
     st.markdown("---")
