@@ -150,7 +150,7 @@ def build_weekly_summary_html(
 ) -> str:
     """
     Weekly staff summary table.
-    Counts merged shifts (one per educator per day), total hours, 10.5h days.
+    Counts merged shifts (one per educator per day), total hours, 10h days.
     """
     from collections import defaultdict
     import math
@@ -180,7 +180,7 @@ def build_weekly_summary_html(
         for d, seg in merged_by_day.items():
             dur = _mins_str(seg["start"], seg["end"]) / 60
             total_hrs += dur
-            if dur >= 10.4:
+            if dur >= 10.0:
                 n_10h += 1
 
         if etype == "full_time" and n_days < 4:
@@ -212,7 +212,7 @@ def build_weekly_summary_html(
         "<tr style='background:#0d1f35;color:#fff;'>"
         + "".join(
             f"<th style='padding:4px 8px;text-align:left;'>{h}</th>"
-            for h in ["Educator","Type","Days","Hours","10.5h days","Warnings"]
+            for h in ["Educator","Type","Days","Hours","10h days","Warnings"]
         )
         + "</tr>"
         + "".join(rows_html)
