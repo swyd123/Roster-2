@@ -360,22 +360,26 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         if ft_report:
             st.markdown("#### 👷 Full-Time Allocation Report")
             st.caption(
-                "Hard constraint: every full-time educator must receive "
-                f"≥ {FT_MIN_DAYS} rostered days and ≥ {FT_MIN_HOURS}h per day. "
-                "Exceptions: leave, unavailability, public holiday."
+                "Hard constraint: every active, available full-time educator must be rostered. "
+                f"Target: ≥ {FT_MIN_DAYS} days and ≥ {FT_MIN_HOURS}h per day. "
+                "Exceptions: leave, genuine unavailability."
             )
             report_rows = []
             for row in ft_report:
                 compliant = row.get("compliant", True)
+                zero_shifts = row.get("allocated_days", 1) == 0
                 report_rows.append({
                     "Educator":      row["name"],
-                    "Type":          row["employment_type"],
+                    "Avail days":    row.get("available_days", "—"),
+                    "Leave days":    row.get("leave_days", 0),
                     "Req days":      row["required_days"],
                     "Got days":      row["allocated_days"],
                     "Req hrs/day":   row["required_hours"],
                     "Got hrs total": f"{row['allocated_hours']:.1f}h",
                     "10h days":      row["compliant_days"],
-                    "✓ Compliant":  "✅ Yes" if compliant else "❌ No",
+                    "Opens":         row.get("opening_shifts", "—"),
+                    "Closes":        row.get("closing_shifts", "—"),
+                    "✓ Compliant":  "⛔ ZERO SHIFTS" if zero_shifts else ("✅ Yes" if compliant else "❌ No"),
                     "Reason":        row.get("reason", ""),
                 })
             st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
@@ -402,7 +406,26 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                 })
             st.dataframe(pd.DataFrame(hrs_rows), use_container_width=True, hide_index=True)
 
-        # Uncovered intervals
+        # Attendance demand validation
+        demand = validation.get("attendance_demand", [])
+        if demand:
+            shortfalls = [d for d in demand if d["delta"] < 0]
+            surpluses  = [d for d in demand if d["delta"] > 1]
+            with st.expander(
+                f"📊 Attendance demand vs rostered staff "
+                f"({'❌ ' + str(len(shortfalls)) + ' shortfall(s)' if shortfalls else '✅ all covered'})",
+                expanded=bool(shortfalls),
+            ):
+                st.caption(
+                    "Required educators = calculated from actual_children ÷ ratio. "
+                    "Delta = rostered − required. Negative = shortfall, high positive = surplus."
+                )
+                # Show only rows with shortfall or surplus for brevity
+                notable = [d for d in demand if d["delta"] != 0]
+                if notable:
+                    st.dataframe(pd.DataFrame(notable), use_container_width=True, hide_index=True)
+                else:
+                    st.success("Rostered staff exactly matches attendance demand for all intervals.")
         if uncovered:
             with st.expander(f"❌ {len(uncovered)} uncovered interval(s) — centre not staffed",
                              expanded=True):
