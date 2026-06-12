@@ -179,101 +179,150 @@ def generate_roster(
         day_shifts: list[SuggestedShift] = []
 
         # ── Step 1A: Full-time base shifts ────────────────────────────
-        # Give every available full-time educator a full-day shift first,
-        # regardless of demand, using preferred patterns. This satisfies
-        # centre operating coverage before we ever look at intervals.
+        # HARD CONSTRAINT: every available full-time educator MUST receive
+        # a shift on this day unless they are on leave or explicitly unavailable.
+        # Priority order within each day:
+        #   1. Assign opener (start ≤ 07:15)
+        #   2. Assign closer (end ≥ 18:00)
+        #   3. Assign remaining FT staff standard shifts
+        # Contract cap only applies AFTER FT_MIN_DAYS are already satisfied.
         ft_staff = [s for s in centre_staff if s.get("employment_type") == "full_time"]
+        ft_openers_today:  list[str] = []   # uids with opening shift this day
+        ft_closers_today:  list[str] = []   # uids with closing shift this day
 
-        for s in sorted(ft_staff, key=lambda x: (_employment_rank(x), x.get("name", ""))):
+        for s in sorted(ft_staff, key=lambda x: x.get("name", "")):
             uid  = s["uid"]
             name = s["name"]
 
-            # Leave check
+            # ── Hard skip: leave ──────────────────────────────────────
             if date_str in leave_map.get(uid, []):
                 continue
 
-            # Availability check
+            # ── Hard skip: explicitly unavailable ────────────────────
             av = availability_map.get(uid, {}).get(dow)
             if av is not None and not av.get("is_available", True):
                 continue
 
-            # Pick pattern — rotate fairly across the week.
-            # When contracted hours are set, after FT_MIN_DAYS are placed,
-            # prefer patterns that keep total weekly hours closest to contract.
+            # ── Contract-hours state ──────────────────────────────────
             uid_contracted = contracted.get(uid, 0.0)
             uid_weekly_hrs = weekly_hours.get(uid, 0.0)
             days_so_far    = ft_rostered_days.get(uid, 0)
+            cap            = uid_contracted + FT_OVERTIME_THRESHOLD_HOURS if uid_contracted > 0 else 9999.0
+            need_min_days  = days_so_far < FT_MIN_DAYS   # must roster regardless of cap
 
-            patterns     = FT_SHIFT_PATTERNS
-            pat_idx      = ft_pattern_idx.get(uid, 0)
-
-            # After min days are met, sort remaining attempts by closest-to-contract
-            if uid_contracted > 0 and days_so_far >= FT_MIN_DAYS:
-                remaining_contract = uid_contracted - uid_weekly_hrs
-                # Sort patterns by how close they bring hours to contract
-                # (prefer patterns that don't overshoot; reject those > cap)
-                cap = uid_contracted + FT_OVERTIME_THRESHOLD_HOURS
-                viable = []
-                for i, (ps, pe) in enumerate(patterns):
-                    dur = _mins_between(ps, pe) / 60
-                    if uid_weekly_hrs + dur <= cap:
-                        viable.append((abs(dur - remaining_contract), i))
-                viable.sort()
-                pattern_order = [idx for _, idx in viable]
-                # If no viable patterns fit contract, skip this day entirely
-                if not pattern_order:
-                    ratio_warns.append(
-                        f"Full-time {name}: skipping {date_str} — "
-                        f"all patterns would exceed contracted hours cap "
-                        f"({uid_weekly_hrs:.1f}h + pattern > {cap:.1f}h)."
-                    )
-                    continue
+            # ── Availability window ───────────────────────────────────
+            if av:
+                av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
+                av_until = (av.get("available_until") or "23:59")[:5] + ":00"
             else:
-                # Below min days: use normal rotation, no contract cap
-                pattern_order = [(pat_idx + i) % len(patterns) for i in range(len(patterns))]
+                av_from, av_until = "00:00:00", "23:59:00"
 
-            # Try patterns in order; skip if outside availability window
-            assigned_ft = False
-            for idx in pattern_order:
-                ss, se = patterns[idx]
+            # ── Build candidate list ──────────────────────────────────
+            # Each candidate: (score, pattern_idx, actual_start, actual_end)
+            # Lower score = better. Score:
+            #   0 = fits availability AND within contract cap
+            #   1 = fits availability, over cap but min days not yet met (assign anyway)
+            #   2 = trimmed to availability window (still ≥ FT_MIN_HOURS)
+            #   3 = trimmed but < FT_MIN_HOURS (last resort, with warning)
+            candidates = []
+            for idx, (ps, pe) in enumerate(FT_SHIFT_PATTERNS):
+                fits_av  = ps >= av_from and pe <= av_until
+                fits_cap = uid_contracted == 0 or uid_weekly_hrs + _mins_between(ps, pe) / 60 <= cap
 
-                # Check availability window compatibility
-                if av:
-                    av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
-                    av_until = (av.get("available_until") or "23:59")[:5] + ":00"
-                    if ss < av_from or se > av_until:
-                        continue
+                if fits_av:
+                    if fits_cap:
+                        candidates.append((0, idx, ps, pe))
+                    elif need_min_days:
+                        # Must assign even though it overshoots cap
+                        candidates.append((1, idx, ps, pe))
+                else:
+                    # Try trimming to availability window
+                    trim_s = max(ps, av_from)
+                    trim_e = min(pe, av_until)
+                    trim_dur = _mins_between(trim_s, trim_e) / 60
+                    if trim_dur >= FT_MIN_HOURS:
+                        if fits_cap or need_min_days:
+                            candidates.append((2, idx, trim_s, trim_e))
+                    elif trim_dur > 0 and need_min_days:
+                        # Under FT_MIN_HOURS but better than nothing
+                        candidates.append((3, idx, trim_s, trim_e))
 
-                pref_day      = break_prefs.get(uid, {}).get(dow, False)
-                override      = "opted_out" if pref_day else "use_staff_default"
-                rid           = s.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
-                rname         = room_map.get(rid, {}).get("name", "")
-                shift_dur_hrs = _mins_between(ss, se) / 60
-
-                shift = SuggestedShift(
-                    user_id=uid,
-                    user_name=name,
-                    room_id=rid,
-                    room_name=rname,
-                    shift_date=date_str,
-                    start_time=ss,
-                    end_time=se,
-                    shift_type=_shift_type(ss, se),
-                    break_opt_out_override=override,
-                    source="full_time_base",
-                )
-                day_shifts.append(shift)
-                ft_rostered_days[uid]  = ft_rostered_days.get(uid, 0) + 1
-                ft_pattern_idx[uid]    = (idx + 1) % len(patterns)
-                weekly_hours[uid]      = weekly_hours.get(uid, 0.0) + shift_dur_hrs
-                assigned_ft = True
-                break
-
-            if not assigned_ft:
+            if not candidates:
+                # Genuinely cannot assign any shift today
                 ratio_warns.append(
-                    f"Full-time {name}: could not assign a shift on {date_str} "
-                    "— availability conflicts with all preferred patterns."
+                    f"CRITICAL: Full-time {name} could not be rostered on {date_str} "
+                    "— no viable shift fits availability window."
                 )
+                continue
+
+            # Sort by score then by duration ascending (prefer shortest compliant shift
+            # to respect contracted hours; avoid unnecessary over-rostering)
+            candidates.sort(key=lambda c: (c[0], _mins_between(c[2], c[3])))
+            # After min days met: also filter by contract cap if possible
+            if not need_min_days:
+                cap_ok = [c for c in candidates if c[0] == 0]
+                if cap_ok:
+                    candidates = cap_ok   # prefer cap-compliant
+
+            # Rotate through patterns for variety (opening/closing balance)
+            # Among equally-scored candidates at the same duration, prefer the
+            # one that follows the rotation index
+            pat_idx = ft_pattern_idx.get(uid, 0)
+            best_score = candidates[0][0]
+            best_dur   = _mins_between(candidates[0][2], candidates[0][3])
+            tied = [c for c in candidates
+                    if c[0] == best_score and _mins_between(c[2], c[3]) == best_dur]
+            if len(tied) > 1:
+                tied.sort(key=lambda c: (c[1] - pat_idx) % len(FT_SHIFT_PATTERNS))
+                candidates[0] = tied[0]
+
+            _, chosen_idx, ss, se = candidates[0]
+            shift_dur_hrs = _mins_between(ss, se) / 60
+
+            if shift_dur_hrs < FT_MIN_HOURS:
+                ratio_warns.append(
+                    f"⚠️ Full-time {name} on {date_str}: rostered {shift_dur_hrs:.1f}h "
+                    f"(below {FT_MIN_HOURS}h target) — availability only allows "
+                    f"{av_from[:5]}–{av_until[:5]}."
+                )
+
+            pref_day  = break_prefs.get(uid, {}).get(dow, False)
+            override  = "opted_out" if pref_day else "use_staff_default"
+            rid       = s.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
+            rname     = room_map.get(rid, {}).get("name", "")
+
+            shift = SuggestedShift(
+                user_id=uid,
+                user_name=name,
+                room_id=rid,
+                room_name=rname,
+                shift_date=date_str,
+                start_time=ss,
+                end_time=se,
+                shift_type=_shift_type(ss, se),
+                break_opt_out_override=override,
+                source="full_time_base",
+            )
+            day_shifts.append(shift)
+            ft_rostered_days[uid]  = ft_rostered_days.get(uid, 0) + 1
+            ft_pattern_idx[uid]    = (chosen_idx + 1) % len(FT_SHIFT_PATTERNS)
+            weekly_hours[uid]      = uid_weekly_hrs + shift_dur_hrs
+
+            # Track opening/closing for coverage validation
+            if ss <= CENTRE_OPEN:
+                ft_openers_today.append(uid)
+            if se >= CENTRE_CLOSE:
+                ft_closers_today.append(uid)
+
+        # Critical warnings for missing opener/closer
+        if not ft_openers_today and ft_staff:
+            ratio_warns.append(
+                f"CRITICAL: No full-time educator available for opening coverage on {date_str}."
+            )
+        if not ft_closers_today and ft_staff:
+            ratio_warns.append(
+                f"CRITICAL: No full-time educator available for closing coverage on {date_str}."
+            )
 
         # ── Step 1B: Compute room ratio requirements from intervals ───
         # Build demand windows as before, then check what additional staff
@@ -630,6 +679,16 @@ def generate_roster(
             ft_shift_map.setdefault(s.user_id, []).append(s)
 
     # FT allocation report
+    # Count opening/closing shifts per FT educator
+    ft_opening_count: dict[str, int] = {}
+    ft_closing_count: dict[str, int] = {}
+    for s in all_shifts:
+        if s.source == "full_time_base":
+            if s.start_time <= CENTRE_OPEN:
+                ft_opening_count[s.user_id] = ft_opening_count.get(s.user_id, 0) + 1
+            if s.end_time >= CENTRE_CLOSE:
+                ft_closing_count[s.user_id] = ft_closing_count.get(s.user_id, 0) + 1
+
     for s in ft_staff_all:
         uid   = s["uid"]
         name  = s["name"]
@@ -655,43 +714,52 @@ def generate_roster(
         else:
             hours_status = "✅ Compliant"
 
+        # Availability status
+        av_days = sum(
+            1 for d in days
+            if availability_map.get(uid, {}).get(d.isoweekday() % 7, {}).get("is_available", True) is not False
+            and d.isoformat() not in leave_map.get(uid, [])
+        )
+        leave_count = sum(1 for d in days if d.isoformat() in leave_map.get(uid, []))
+
         # Reason for non-compliance
         reason = ""
-        if not compliant:
+        if udays == 0:
+            reason = "CRITICAL: Zero shifts allocated"
+        elif not compliant:
             if udays < FT_MIN_DAYS:
-                leave_count = sum(1 for d in days if d.isoformat() in leave_map.get(uid, []))
-                av_blocked  = sum(
-                    1 for d in days
-                    if availability_map.get(uid, {}).get(
-                        d.isoweekday() % 7, {}
-                    ).get("is_available", True) is False
-                )
                 if leave_count:
-                    reason = f"Leave on {leave_count} day(s)"
-                elif av_blocked:
-                    reason = f"Unavailable on {av_blocked} day(s)"
+                    reason = f"Leave on {leave_count} day(s) — only {av_days} available days"
+                elif av_days < FT_MIN_DAYS:
+                    reason = f"Only {av_days} available days in period"
                 else:
-                    reason = "No compatible shift pattern found"
+                    reason = "No viable shift pattern matched availability window"
             else:
-                reason = f"Only {compliant_days}/{FT_MIN_DAYS} days meet {FT_MIN_HOURS}h"
+                reason = f"Only {compliant_days}/{FT_MIN_DAYS} days ≥ {FT_MIN_HOURS}h"
 
         ft_allocation_report.append({
             "name":              name,
             "employment_type":   "Full-time",
+            "available_days":    av_days,
+            "leave_days":        leave_count,
             "required_days":     FT_MIN_DAYS,
             "allocated_days":    udays,
             "required_hours":    f"≥{FT_MIN_HOURS}h/day",
             "allocated_hours":   uhrs,
             "compliant_days":    compliant_days,
+            "opening_shifts":    ft_opening_count.get(uid, 0),
+            "closing_shifts":    ft_closing_count.get(uid, 0),
             "compliant":         compliant,
             "reason":            reason,
         })
 
-        if udays < FT_MIN_DAYS:
+        if udays == 0:
+            ft_below_days.append(f"CRITICAL: {name} received zero shifts.")
+        elif udays < FT_MIN_DAYS:
             ft_below_days.append(
                 f"{name}: {udays} day(s) rostered (target {FT_MIN_DAYS}). {reason}"
             )
-        if compliant_days < FT_MIN_DAYS:
+        if compliant_days < FT_MIN_DAYS and udays > 0:
             ft_below_hours.append(
                 f"{name}: {compliant_days} day(s) ≥ {FT_MIN_HOURS}h (target {FT_MIN_DAYS}). {reason}"
             )
@@ -736,6 +804,48 @@ def generate_roster(
         if s.source != "full_time_base"
     )
 
+    # ── Attendance demand validation ─────────────────────────────────
+    # For every 15-min slot across the period, compute:
+    #   required_educators (from actual_children + ratio)
+    #   rostered_educators (from all_shifts)
+    # Flag slots where rostered < required (shortfall) or
+    # rostered > required + 1 (surplus) for information.
+    demand_rows: list[dict] = []
+    for date_str_v, ivs in sorted(all_intervals.items()):
+        room_iv_map: dict[str, dict] = {}
+        for iv in ivs:
+            room_iv_map.setdefault(iv["room_id"], {})[iv["interval_start"]] = iv
+
+        # Collect all unique slots for this day
+        all_slots = sorted({iv["interval_start"] for iv in ivs})
+        for slot in all_slots:
+            required = 0
+            for rid, slot_map in room_iv_map.items():
+                iv  = slot_map.get(slot, {})
+                act = iv.get("actual_children") or iv.get("expected_children") or 0
+                n   = int(act)
+                if n > 0:
+                    room = room_map.get(rid, {})
+                    r_s  = room.get("required_ratio_staff",    1)
+                    r_c  = room.get("required_ratio_children", 4)
+                    required += math.ceil(n / r_c) * r_s
+
+            rostered = sum(
+                1 for s in all_shifts
+                if s.shift_date == date_str_v
+                and s.start_time <= slot < s.end_time
+            )
+            delta = rostered - required
+            if required > 0 or rostered > 0:
+                demand_rows.append({
+                    "date":     date_str_v,
+                    "slot":     slot[:5],
+                    "required": required,
+                    "rostered": rostered,
+                    "delta":    delta,
+                    "status":   "✅ OK" if delta >= 0 else f"❌ Shortfall {delta}",
+                })
+
     validation = {
         "centre_coverage_achieved": len(coverage_gaps) == 0,
         "uncovered_intervals":      coverage_gaps,
@@ -745,6 +855,7 @@ def generate_roster(
         "over_contract_warnings":   over_contract_warns,
         "ft_allocation_report":     ft_allocation_report,
         "weekly_hours_report":      weekly_hours_report,
+        "attendance_demand":        demand_rows,
         "pt_ca_hours_used":         round(pt_hours, 1),
         "review_warnings":          review_warns,
     }
@@ -914,7 +1025,6 @@ FT_SHIFT_PATTERNS: list[tuple[str, str]] = [
 
 FT_MIN_HOURS: float = 10.0    # minimum hours per full-time rostered day
 FT_MIN_DAYS:  int   = 4       # minimum rostered days per full-time week
-FT_MIN_DAYS:  int   = 4       # target rostered days per full-time week
 
 
 def _employment_rank(s: dict) -> int:
