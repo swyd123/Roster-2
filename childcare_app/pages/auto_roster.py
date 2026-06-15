@@ -16,6 +16,7 @@ import pandas as pd
 from utils.auto_roster_engine import (
     generate_roster, SuggestedShift, SuggestedBreak,
     FT_MIN_DAYS, FT_MIN_HOURS, FT_OVERTIME_THRESHOLD_HOURS,
+    FT_TARGET_WEEKLY_HOURS, FT_PREFERRED_DAILY_HOURS,
 )
 from utils.roster_queries import (
     fetch_roster_periods, create_roster_period,
@@ -312,71 +313,91 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         st.markdown("---")
         st.markdown("### ✅ Roster Validation")
 
-        coverage_ok  = validation.get("centre_coverage_achieved", True)
-        uncovered    = validation.get("uncovered_intervals", [])
-        ratio_breach = validation.get("centre_ratio_breaches", [])
-        ft_low_days  = validation.get("ft_below_4_days", [])
-        ft_low_hrs   = validation.get("ft_below_10h_days", [])
-        pt_hrs       = validation.get("pt_ca_hours_used", 0)
+        coverage_ok       = validation.get("centre_coverage_achieved", True)
+        uncovered         = validation.get("uncovered_intervals", [])
+        ratio_breach      = validation.get("centre_ratio_breaches", [])
+        ft_below_contr    = validation.get("ft_below_contracted", [])
+        ft_over_contr     = validation.get("ft_over_contracted", [])
+        pt_hrs            = validation.get("pt_ca_hours_used", 0)
+        ft_onsite_ok      = validation.get("ft_onsite_achieved", True)
+        ft_onsite_violns  = validation.get("ft_onsite_violations", [])
+        corrections_log   = validation.get("corrections_log", [])
 
-        # Critical banner if hard constraints are breached
-        critical_items = ft_low_days + ft_low_hrs + uncovered
+        # Critical banner if hard constraints are breached.
+        # ft_over_contracted is intentionally EXCLUDED here — over-allocation
+        # caused by the FT onsite-coverage correction pass is a documented,
+        # accepted trade-off (shown as a warning below), not a hard failure.
+        critical_items = ft_below_contr + uncovered + ft_onsite_violns
         if critical_items:
             st.error(
                 f"⛔ **CRITICAL: {len(critical_items)} hard constraint violation(s).** "
-                "Full-time minimum allocation or centre coverage not achieved. "
-                "Review the FT Allocation Report below before saving."
+                "Full-time minimum allocation, FT onsite coverage, or centre coverage "
+                "not fully achieved. Review the reports below before saving."
             )
+
+        # Corrections applied — shown even if some violations remain,
+        # so the user can see what the engine already fixed automatically.
+        if corrections_log:
+            with st.expander(f"🔧 {len(corrections_log)} automatic correction(s) applied",
+                             expanded=True):
+                st.caption(
+                    "The engine automatically adjusted shifts to resolve hard "
+                    "constraint violations before finalising the roster."
+                )
+                for c in corrections_log:
+                    st.success(f"**{c['date']}** — {c['violation']}: {c['action']}")
 
         # Over-contract warnings
-        over_contract = validation.get("over_contract_warnings", [])
-        if over_contract:
+        if ft_over_contr:
             st.warning(
-                f"⚠️ **{len(over_contract)} educator(s) rostered above contracted hours.** "
-                "Review the Weekly Hours Report below."
+                f"⚠️ **{len(ft_over_contr)} full-time educator(s) rostered above "
+                f"their {FT_TARGET_WEEKLY_HOURS:.0f}h weekly contract.** "
+                "Review the Full-Time Allocation Report below — this may be an "
+                "accepted trade-off for full-time onsite coverage."
             )
 
-        # Summary metrics — add over-contract count
-        mc = st.columns(6)
+        # Summary metrics — add over-contract count and FT onsite coverage
+        mc = st.columns(7)
         mc[0].metric("Centre coverage 7:15–18:00",
                      "✅ Met" if coverage_ok else "❌ Gaps",
                      delta=f"{len(uncovered)} gap(s)" if uncovered else None,
                      delta_color="inverse" if uncovered else "off")
-        mc[1].metric("FT below 4 days",  len(ft_low_days),
-                     delta="CRITICAL" if ft_low_days else None,
-                     delta_color="inverse" if ft_low_days else "off")
-        mc[2].metric("FT below 10h", len(ft_low_hrs),
-                     delta="CRITICAL" if ft_low_hrs else None,
-                     delta_color="inverse" if ft_low_hrs else "off")
-        mc[3].metric("Over contracted",  len(over_contract),
-                     delta="review" if over_contract else None,
-                     delta_color="inverse" if over_contract else "off")
+        mc[1].metric("FT onsite 7:15–18:00",
+                     "✅ Met" if ft_onsite_ok else "❌ Gaps",
+                     delta=f"{len(ft_onsite_violns)} gap(s)" if ft_onsite_violns else None,
+                     delta_color="inverse" if ft_onsite_violns else "off")
+        mc[2].metric("FT below contracted",  len(ft_below_contr),
+                     delta="CRITICAL" if ft_below_contr else None,
+                     delta_color="inverse" if ft_below_contr else "off")
+        mc[3].metric("FT over contracted", len(ft_over_contr),
+                     delta="review" if ft_over_contr else None,
+                     delta_color="inverse" if ft_over_contr else "off")
         mc[4].metric("Ratio breaches",  len(ratio_breach),
                      delta_color="inverse" if ratio_breach else "off")
         mc[5].metric("PT/casual hours", f"{pt_hrs:.1f}h")
+        mc[6].metric("FT weekly target", f"{FT_TARGET_WEEKLY_HOURS:.0f}h")
 
         # FT Allocation Report
         ft_report = validation.get("ft_allocation_report", [])
         if ft_report:
             st.markdown("#### 👷 Full-Time Allocation Report")
             st.caption(
-                "Hard constraint: every active, available full-time educator must be rostered. "
-                f"Target: ≥ {FT_MIN_DAYS} days and ≥ {FT_MIN_HOURS}h per day. "
-                "Exceptions: leave, genuine unavailability."
+                f"Hard constraint: full-time compliance is measured against weekly "
+                f"contracted hours (default {FT_TARGET_WEEKLY_HOURS:.0f}h/week, "
+                f"≈{FT_PREFERRED_DAILY_HOURS:.1f}h × {FT_MIN_DAYS} days). "
+                f"Compliant = rostered within ±{FT_OVERTIME_THRESHOLD_HOURS:.0f}h of contracted. "
+                "Exceeding contract is only accepted when required for full-time "
+                "onsite coverage (see Corrections Applied above)."
             )
             report_rows = []
             for row in ft_report:
-                compliant = row.get("compliant", True)
+                compliant   = row.get("compliant", True)
                 zero_shifts = row.get("allocated_days", 1) == 0
                 report_rows.append({
                     "Educator":      row["name"],
-                    "Avail days":    row.get("available_days", "—"),
-                    "Leave days":    row.get("leave_days", 0),
-                    "Req days":      row["required_days"],
-                    "Got days":      row["allocated_days"],
-                    "Req hrs/day":   row["required_hours"],
-                    "Got hrs total": f"{row['allocated_hours']:.1f}h",
-                    "10h days":      row["compliant_days"],
+                    "Contracted":    f"{row['contracted_hours']:.1f}h",
+                    "Rostered":      f"{row['rostered_hours']:.1f}h",
+                    "Variance":      f"{row['variance']:+.1f}h",
                     "Opens":         row.get("opening_shifts", "—"),
                     "Closes":        row.get("closing_shifts", "—"),
                     "✓ Compliant":  "⛔ ZERO SHIFTS" if zero_shifts else ("✅ Yes" if compliant else "❌ No"),
@@ -390,9 +411,10 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
             st.markdown("#### 🕐 Weekly Hours Report")
             st.caption(
                 "Contracted hours vs rostered hours for all staff this period. "
-                "⚠️ Over contracted = rostered hours exceed contracted by more than "
-                f"{FT_OVERTIME_THRESHOLD_HOURS}h threshold. "
-                "⬇ Under contracted = rostered more than 0.5h below contracted."
+                f"⚠️ Over contracted = rostered hours exceed contracted by more than "
+                f"{FT_OVERTIME_THRESHOLD_HOURS:.0f}h. "
+                f"⬇ Under contracted = rostered hours below contracted by more than "
+                f"{FT_OVERTIME_THRESHOLD_HOURS:.0f}h."
             )
             hrs_rows = []
             for row in hrs_report:
@@ -426,6 +448,30 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                     st.dataframe(pd.DataFrame(notable), use_container_width=True, hide_index=True)
                 else:
                     st.success("Rostered staff exactly matches attendance demand for all intervals.")
+        # FT onsite coverage 7:15–18:00
+        ft_onsite = validation.get("ft_onsite_coverage", [])
+        if ft_onsite_violns or ft_onsite:
+            with st.expander(
+                f"👤 FT onsite coverage 7:15–18:00 "
+                f"({'❌ ' + str(len(ft_onsite_violns)) + ' gap(s)' if ft_onsite_violns else '✅ continuous'})",
+                expanded=bool(ft_onsite_violns),
+            ):
+                st.caption(
+                    "Hard constraint: at least one full-time educator must be onsite "
+                    "for every 15-minute interval the centre is open. "
+                    "Engine extends FT shift edges automatically where availability allows "
+                    "(see Corrections Applied above)."
+                )
+                if ft_onsite_violns:
+                    for w in ft_onsite_violns:
+                        st.error(w)
+                # Show only non-compliant slots for brevity; if all compliant, confirm
+                non_compliant = [r for r in ft_onsite if not r["compliant"]]
+                if non_compliant:
+                    st.dataframe(pd.DataFrame(non_compliant), use_container_width=True, hide_index=True)
+                else:
+                    st.success("At least one full-time educator is onsite for every interval, every day.")
+
         if uncovered:
             with st.expander(f"❌ {len(uncovered)} uncovered interval(s) — centre not staffed",
                              expanded=True):
@@ -439,10 +485,10 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                     st.warning(w)
 
         # Over-contract detail
-        if over_contract:
-            with st.expander(f"⚠️ {len(over_contract)} over-contracted hour(s)"):
-                for w in over_contract:
-                    st.warning(f"Full-time contracted hours exceeded — {w}")
+        if ft_over_contr:
+            with st.expander(f"⚠️ {len(ft_over_contr)} full-time educator(s) over contracted hours"):
+                for w in ft_over_contr:
+                    st.warning(w)
 
     # ── Debug expander (replaces old shift/break tables) ─────────────
     st.markdown("---")
