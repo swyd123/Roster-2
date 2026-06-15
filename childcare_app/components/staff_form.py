@@ -248,6 +248,30 @@ def staff_form(
                 "⚠️ **Confirm this complies with the applicable award/enterprise "
                 "agreement and employee agreement** before enabling unpaid break opt-out."
             )
+
+        # ── Responsible Person / Nominated Supervisor ───────────────────
+        st.markdown('<p class="section-label">Compliance Roles</p>', unsafe_allow_html=True)
+        c13, c14 = st.columns(2)
+        is_nominated_supervisor = c13.toggle(
+            "Nominated Supervisor",
+            value=bool(d.get("is_nominated_supervisor", False)),
+            key=f"{key_prefix}_is_ns",
+            help="This educator is a Nominated Supervisor under the Education "
+                 "and Care Services National Law/Regulations.",
+        )
+        is_responsible_person = c14.toggle(
+            "Responsible Person",
+            value=bool(d.get("is_responsible_person", False)),
+            key=f"{key_prefix}_is_rp",
+            help="This educator may be designated as the Responsible Person "
+                 "in charge when onsite.",
+        )
+        if is_nominated_supervisor or is_responsible_person:
+            st.caption(
+                "ℹ️ The roster engine will prioritise rostering this educator to "
+                "ensure at least one Nominated Supervisor or Responsible Person "
+                "is onsite at all times (Nominated Supervisor preferred)."
+            )
         notes = st.text_area(
             "Internal notes (not shown to staff member)",
             value=d.get("notes", "") or "",
@@ -304,4 +328,6 @@ def staff_form(
         "notes":                            notes.strip(),
         "is_active":                        is_active,
         "allows_unpaid_break_opt_out":      allows_opt_out,
+        "is_responsible_person":            is_responsible_person,
+        "is_nominated_supervisor":          is_nominated_supervisor,
     }
