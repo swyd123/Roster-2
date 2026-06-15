@@ -1,198 +1,147 @@
 # pages/staff_list.py
+# Staff list — table + add-new form.
+# Shows RP/NS compliance role badges alongside name and employment type.
+
+from __future__ import annotations
 import streamlit as st
-import pandas as pd
-from utils.staff_queries import fetch_all_staff, soft_delete_staff
+from utils.staff_queries import fetch_all_staff, create_staff_member
 from utils.helpers import (
-    fmt_name, fmt_employment, fmt_role, fmt_date,
-    active_badge, qual_risk_level, EMPLOYMENT_TYPE_KEYS, EMPLOYMENT_TYPES,
+    fmt_name, fmt_employment, fmt_role,
     toast_success, toast_error,
 )
+from components.staff_form import staff_form
 
 
 def render():
-    # ── Header ───────────────────────────────────────────────────────
-    col_h, col_btn = st.columns([4, 1])
-    col_h.title("Staff")
-    col_h.markdown('<p class="page-sub">All staff members in your organisation</p>',
-                   unsafe_allow_html=True)
-    with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("➕  Add Staff", type="primary", use_container_width=True):
-            st.session_state.page = "staff_add"
-            st.rerun()
+    st.title("👥 Staff List")
 
-    # ── Load data ─────────────────────────────────────────────────────
-    with st.spinner("Loading…"):
+    # ── Top actions bar ───────────────────────────────────────────────
+    col_search, col_add = st.columns([4, 1])
+    search = col_search.text_input(
+        "Search",
+        placeholder="Name, email, employee number…",
+        label_visibility="collapsed",
+    )
+
+    if col_add.button("➕ Add Staff", type="primary", use_container_width=True):
+        st.session_state["show_add_staff"] = True
+
+    # ── Load staff ────────────────────────────────────────────────────
+    with st.spinner("Loading staff…"):
         try:
-            staff = fetch_all_staff()
+            all_staff = fetch_all_staff()
         except Exception as e:
-            toast_error(f"Could not load staff: {e}")
-            return
+            st.error(f"Could not load staff: {e}")
+            all_staff = []
 
-    # ── Metrics ───────────────────────────────────────────────────────
-    total    = len(staff)
-    active   = sum(1 for s in staff if (s.get("users") or {}).get("is_active"))
-    ft       = sum(1 for s in staff if s.get("employment_type") == "full_time")
-    casual   = sum(1 for s in staff if s.get("employment_type") == "casual")
+    # ── Filter ────────────────────────────────────────────────────────
+    q = (search or "").lower().strip()
+    if q:
+        all_staff = [
+            s for s in all_staff
+            if q in fmt_name(s).lower()
+            or q in (s.get("users") or {}).get("email", "").lower()
+            or q in (s.get("employee_number") or "").lower()
+        ]
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Staff",  total)
-    m2.metric("Active",       active)
-    m3.metric("Full Time",    ft)
-    m4.metric("Casual",       casual)
+    # ── Add-staff form ────────────────────────────────────────────────
+    if st.session_state.get("show_add_staff"):
+        with st.expander("➕ Add New Staff Member", expanded=True):
+            values = staff_form(key_prefix="add", show_role_fields=True)
+            if values:
+                with st.spinner("Saving…"):
+                    try:
+                        create_staff_member(
+                            first_name=values["first_name"],
+                            last_name=values["last_name"],
+                            email=values["email"],
+                            phone=values["phone"],
+                            date_of_birth=values["date_of_birth"],
+                            employment_type=values["employment_type"],
+                            employment_start_date=values["employment_start_date"],
+                            employee_number=values["employee_number"],
+                            centre_id=values["centre_id"],
+                            role=values["role"],
+                            primary_room_id=values.get("primary_room_id"),
+                            emergency_contact_name=values["emergency_contact_name"],
+                            emergency_contact_phone=values["emergency_contact_phone"],
+                            emergency_contact_relationship=values["emergency_contact_relationship"],
+                            notes=values["notes"],
+                            contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
+                            is_responsible_person=values.get("is_responsible_person", False),
+                            is_nominated_supervisor=values.get("is_nominated_supervisor", False),
+                        )
+                        toast_success("Staff member added.")
+                        st.session_state.pop("show_add_staff", None)
+                        st.rerun()
+                    except Exception as e:
+                        err = str(e)
+                        if "duplicate" in err.lower() or "unique" in err.lower():
+                            toast_error(f"Email {values['email']} is already in use.")
+                        else:
+                            toast_error(f"Could not save: {err}")
 
-    st.markdown("---")
-
-    # ── Filters ───────────────────────────────────────────────────────
-    fc1, fc2, fc3, fc4 = st.columns([3, 1.5, 1.5, 1.5])
-    search    = fc1.text_input("🔍  Search", placeholder="Name or email…",
-                                label_visibility="collapsed")
-    et_filter = fc2.selectbox("Type", ["All"] + EMPLOYMENT_TYPE_KEYS,
-                               format_func=lambda x: "All Types" if x == "All" else EMPLOYMENT_TYPES[x],
-                               label_visibility="collapsed")
-    status_filter = fc3.selectbox("Status", ["All", "Active", "Inactive"],
-                                   label_visibility="collapsed")
-    sort_by   = fc4.selectbox("Sort", ["Name A–Z", "Name Z–A", "Start Date", "Employment Type"],
-                               label_visibility="collapsed")
-
-    # ── Apply filters ─────────────────────────────────────────────────
-    filtered = staff
-    if search:
-        t = search.lower()
-        filtered = [s for s in filtered if
-                    t in fmt_name(s).lower() or
-                    t in (s.get("users") or {}).get("email","").lower() or
-                    t in (s.get("employee_number") or "").lower()]
-    if et_filter != "All":
-        filtered = [s for s in filtered if s.get("employment_type") == et_filter]
-    if status_filter == "Active":
-        filtered = [s for s in filtered if (s.get("users") or {}).get("is_active")]
-    elif status_filter == "Inactive":
-        filtered = [s for s in filtered if not (s.get("users") or {}).get("is_active")]
-
-    # Sorting
-    if sort_by == "Name A–Z":
-        filtered.sort(key=lambda s: fmt_name(s))
-    elif sort_by == "Name Z–A":
-        filtered.sort(key=lambda s: fmt_name(s), reverse=True)
-    elif sort_by == "Start Date":
-        filtered.sort(key=lambda s: s.get("employment_start_date") or "", reverse=True)
-    elif sort_by == "Employment Type":
-        filtered.sort(key=lambda s: s.get("employment_type") or "")
-
-    if search or et_filter != "All" or status_filter != "All":
-        st.caption(f"Showing {len(filtered)} of {total} staff members")
-
-    # ── Export ────────────────────────────────────────────────────────
-    if filtered:
-        export_rows = []
-        for s in filtered:
-            u = s.get("users") or {}
-            export_rows.append({
-                "Name":            fmt_name(s),
-                "Email":           u.get("email",""),
-                "Phone":           u.get("phone",""),
-                "Employment Type": fmt_employment(s.get("employment_type","")),
-                "Employee #":      s.get("employee_number",""),
-                "Start Date":      fmt_date(s.get("employment_start_date")),
-                "Status":          "Active" if u.get("is_active") else "Inactive",
-            })
-        csv = pd.DataFrame(export_rows).to_csv(index=False)
-        st.download_button("⬇️  Export CSV", data=csv,
-                           file_name="staff_list.csv", mime="text/csv",
-                           help="Download the filtered list as a spreadsheet")
-
-    st.markdown("")
-
-    # ── Empty state ───────────────────────────────────────────────────
-    if not filtered:
-        st.info("No staff members found. Use **➕ Add Staff** to get started.")
+    # ── Staff table ───────────────────────────────────────────────────
+    if not all_staff:
+        st.info("No staff members found." + (" Try a different search." if q else ""))
         return
 
-    # ── Staff rows ────────────────────────────────────────────────────
-    for s in filtered:
+    # Sort: active first, then name
+    all_staff.sort(key=lambda s: (
+        0 if (s.get("users") or {}).get("is_active", True) else 1,
+        fmt_name(s).lower(),
+    ))
+
+    # Render rows
+    header_cols = st.columns([3, 2, 2, 2, 1])
+    header_cols[0].markdown("**Name**")
+    header_cols[1].markdown("**Type**")
+    header_cols[2].markdown("**Role**")
+    header_cols[3].markdown("**Roles**")
+    header_cols[4].markdown("")
+    st.divider()
+
+    for s in all_staff:
         u         = s.get("users") or {}
         name      = fmt_name(s)
-        et        = fmt_employment(s.get("employment_type",""))
-        is_active = u.get("is_active", False)
-        email     = u.get("email","—")
-        phone     = u.get("phone") or "—"
-        start     = fmt_date(s.get("employment_start_date"))
-        emp_num   = s.get("employee_number") or "—"
+        is_active = u.get("is_active", True)
+        etype     = fmt_employment(s.get("employment_type", ""))
+        roles     = s.get("user_centre_roles") or []
+        role_str  = fmt_role(roles[0]["role"]) if roles else "—"
 
-        # Role + centre from user_centre_roles (first active one)
-        roles_list = [r for r in (s.get("user_centre_roles") or []) if r.get("is_active")]
-        role_str   = fmt_role(roles_list[0]["role"]) if roles_list else "—"
-        centre_str = (roles_list[0].get("centres") or {}).get("name","—") if roles_list else "—"
-        room_str   = (roles_list[0].get("rooms") or {}).get("name","") if roles_list else ""
+        is_ns = bool(s.get("is_nominated_supervisor", False))
+        is_rp = bool(s.get("is_responsible_person", False))
 
-        # Status colour
-        status_colour = "#d4f0e4" if is_active else "#fde8e8"
-        status_text   = "Active" if is_active else "Inactive"
-        status_tc     = "#0f6b3a" if is_active else "#991b1b"
-
-        with st.expander(
-            f"**{name}**  ·  {et}  ·  {centre_str}",
-            expanded=False,
-        ):
-            # Top row — details grid
-            d1, d2, d3, d4 = st.columns(4)
-            d1.markdown(f"**Email**  \n{email}")
-            d2.markdown(f"**Phone**  \n{phone}")
-            d3.markdown(f"**Role**  \n{role_str}" + (f" · {room_str}" if room_str else ""))
-            d4.markdown(f"**Start Date**  \n{start}")
-
-            d5, d6, d7, d8 = st.columns(4)
-            d5.markdown(f"**Employee #**  \n{emp_num}")
-            d6.markdown(f"**Employment**  \n{et}")
-            d7.markdown(
-                f"**Status**  \n"
-                f'<span style="background:{status_colour};color:{status_tc};'
-                f'padding:2px 8px;border-radius:99px;font-size:0.78rem;font-weight:600;">'
-                f'{status_text}</span>',
-                unsafe_allow_html=True
+        # Build compact compliance badge HTML
+        badges = []
+        if is_ns:
+            badges.append(
+                '<span style="background:#e0e7ff;color:#3730a3;padding:1px 7px;'
+                'border-radius:99px;font-size:0.72rem;font-weight:600;'
+                'margin-right:4px;">NS</span>'
             )
-            d8.markdown(f"**Centre**  \n{centre_str}")
+        if is_rp:
+            badges.append(
+                '<span style="background:#dbeafe;color:#1e40af;padding:1px 7px;'
+                'border-radius:99px;font-size:0.72rem;font-weight:600;">RP</span>'
+            )
+        badges_html = "".join(badges) if badges else "—"
 
-            if s.get("notes"):
-                st.markdown(f"**Notes:** _{s['notes']}_")
+        # Dim inactive rows
+        name_display = name if is_active else f"~~{name}~~ (inactive)"
 
-            st.markdown("")
+        row_cols = st.columns([3, 2, 2, 2, 1])
+        row_cols[0].markdown(name_display)
+        row_cols[1].markdown(etype)
+        row_cols[2].markdown(role_str)
+        row_cols[3].markdown(badges_html, unsafe_allow_html=True)
+        if row_cols[4].button("View", key=f"view_{s['id']}"):
+            st.session_state["viewing_staff_id"] = s["id"]
+            st.session_state.page = "staff_profile"
+            st.rerun()
 
-            # Action buttons
-            ba1, ba2, ba3, _sp = st.columns([1, 1, 1, 4])
-
-            with ba1:
-                if st.button("👁  View Profile", key=f"view_{s['id']}", use_container_width=True):
-                    st.session_state.viewing_staff_id = s["id"]
-                    st.session_state.page = "staff_profile"
-                    st.rerun()
-
-            with ba2:
-                if st.button("✏️  Edit", key=f"edit_{s['id']}", use_container_width=True):
-                    st.session_state.editing_staff_id = s["id"]
-                    st.session_state.page = "staff_profile"
-                    st.session_state.profile_tab = "edit"
-                    st.rerun()
-
-            with ba3:
-                confirm_key = f"confirm_del_{s['id']}"
-                if st.session_state.get(confirm_key):
-                    st.warning(f"Remove **{name}**?")
-                    y, n = st.columns(2)
-                    if y.button("Yes, remove", key=f"yes_{s['id']}", type="primary",
-                                 use_container_width=True):
-                        try:
-                            soft_delete_staff(s["id"], u["id"])
-                            toast_success(f"{name} has been removed.")
-                            st.session_state.pop(confirm_key, None)
-                            st.rerun()
-                        except Exception as e:
-                            toast_error(str(e))
-                    if n.button("Cancel", key=f"no_{s['id']}", use_container_width=True):
-                        st.session_state.pop(confirm_key, None)
-                        st.rerun()
-                else:
-                    if st.button("🗑️  Remove", key=f"del_{s['id']}", use_container_width=True):
-                        st.session_state[confirm_key] = True
-                        st.rerun()
+    st.divider()
+    st.caption(
+        f"Showing {len(all_staff)} staff member(s). "
+        "**NS** = Nominated Supervisor · **RP** = Responsible Person."
+    )
