@@ -321,22 +321,20 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         pt_hrs            = validation.get("pt_ca_hours_used", 0)
         ft_onsite_ok      = validation.get("ft_onsite_achieved", True)
         ft_onsite_violns  = validation.get("ft_onsite_violations", [])
+        rpns_ok           = validation.get("rpns_onsite_achieved", True)
+        rpns_violns       = validation.get("rpns_onsite_violations", [])
         corrections_log   = validation.get("corrections_log", [])
 
-        # Critical banner if hard constraints are breached.
-        # ft_over_contracted is intentionally EXCLUDED here — over-allocation
-        # caused by the FT onsite-coverage correction pass is a documented,
-        # accepted trade-off (shown as a warning below), not a hard failure.
-        critical_items = ft_below_contr + uncovered + ft_onsite_violns
+        # Critical banner — excludes ft_over_contracted (accepted trade-off).
+        critical_items = ft_below_contr + uncovered + ft_onsite_violns + rpns_violns
         if critical_items:
             st.error(
                 f"⛔ **CRITICAL: {len(critical_items)} hard constraint violation(s).** "
-                "Full-time minimum allocation, FT onsite coverage, or centre coverage "
+                "Centre coverage, FT onsite, RP/NS coverage, or contracted hours "
                 "not fully achieved. Review the reports below before saving."
             )
 
-        # Corrections applied — shown even if some violations remain,
-        # so the user can see what the engine already fixed automatically.
+        # Corrections applied
         if corrections_log:
             with st.expander(f"🔧 {len(corrections_log)} automatic correction(s) applied",
                              expanded=True):
@@ -353,29 +351,33 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                 f"⚠️ **{len(ft_over_contr)} full-time educator(s) rostered above "
                 f"their {FT_TARGET_WEEKLY_HOURS:.0f}h weekly contract.** "
                 "Review the Full-Time Allocation Report below — this may be an "
-                "accepted trade-off for full-time onsite coverage."
+                "accepted trade-off for full-time onsite or RP/NS coverage."
             )
 
-        # Summary metrics — add over-contract count and FT onsite coverage
-        mc = st.columns(7)
-        mc[0].metric("Centre coverage 7:15–18:00",
-                     "✅ Met" if coverage_ok else "❌ Gaps",
+        # Summary metrics — 8 columns
+        mc = st.columns(8)
+        mc[0].metric("Centre 7:15–18:00",
+                     "✅" if coverage_ok else "❌",
                      delta=f"{len(uncovered)} gap(s)" if uncovered else None,
                      delta_color="inverse" if uncovered else "off")
         mc[1].metric("FT onsite 7:15–18:00",
-                     "✅ Met" if ft_onsite_ok else "❌ Gaps",
+                     "✅" if ft_onsite_ok else "❌",
                      delta=f"{len(ft_onsite_violns)} gap(s)" if ft_onsite_violns else None,
                      delta_color="inverse" if ft_onsite_violns else "off")
-        mc[2].metric("FT below contracted",  len(ft_below_contr),
+        mc[2].metric("RP/NS onsite 7:15–18:00",
+                     "✅" if rpns_ok else "❌",
+                     delta=f"{len(rpns_violns)} gap(s)" if rpns_violns else None,
+                     delta_color="inverse" if rpns_violns else "off")
+        mc[3].metric("FT below contracted", len(ft_below_contr),
                      delta="CRITICAL" if ft_below_contr else None,
                      delta_color="inverse" if ft_below_contr else "off")
-        mc[3].metric("FT over contracted", len(ft_over_contr),
+        mc[4].metric("FT over contracted", len(ft_over_contr),
                      delta="review" if ft_over_contr else None,
                      delta_color="inverse" if ft_over_contr else "off")
-        mc[4].metric("Ratio breaches",  len(ratio_breach),
+        mc[5].metric("Ratio breaches", len(ratio_breach),
                      delta_color="inverse" if ratio_breach else "off")
-        mc[5].metric("PT/casual hours", f"{pt_hrs:.1f}h")
-        mc[6].metric("FT weekly target", f"{FT_TARGET_WEEKLY_HOURS:.0f}h")
+        mc[6].metric("PT/casual hours", f"{pt_hrs:.1f}h")
+        mc[7].metric("FT target", f"{FT_TARGET_WEEKLY_HOURS:.0f}h/wk")
 
         # FT Allocation Report
         ft_report = validation.get("ft_allocation_report", [])
@@ -477,6 +479,36 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                              expanded=True):
                 for w in uncovered:
                     st.error(w)
+
+        # RP/NS onsite coverage
+        rpns_coverage = validation.get("rpns_onsite_coverage", [])
+        if rpns_violns or rpns_coverage:
+            with st.expander(
+                f"🏅 Responsible Person / Nominated Supervisor onsite 7:15–18:00 "
+                f"({'❌ ' + str(len(rpns_violns)) + ' gap(s)' if rpns_violns else '✅ continuous'})",
+                expanded=bool(rpns_violns),
+            ):
+                st.caption(
+                    "Hard constraint: at least one Responsible Person or Nominated Supervisor "
+                    "must be onsite for every 15-minute interval the centre is open. "
+                    "Nominated Supervisors take priority over Responsible Persons. "
+                    "Engine adds/extends their shifts automatically where availability allows "
+                    "(see Corrections Applied above)."
+                )
+                if rpns_violns:
+                    for w in rpns_violns:
+                        st.error(w)
+                non_compliant_rpns = [r for r in rpns_coverage if not r["compliant"]]
+                if non_compliant_rpns:
+                    st.dataframe(
+                        pd.DataFrame(non_compliant_rpns),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.success(
+                        "A Responsible Person or Nominated Supervisor is onsite "
+                        "for every 15-minute interval, every day."
+                    )
 
         # Ratio breaches
         if ratio_breach:
