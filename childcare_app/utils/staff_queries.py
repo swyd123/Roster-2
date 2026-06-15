@@ -78,7 +78,7 @@ def fetch_all_staff() -> list[dict]:
         .select(
             "id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, notes, organisation_id, allows_unpaid_break_opt_out,"
-            "contracted_hours_per_week,"
+            "contracted_hours_per_week, is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active, created_at"
             ")"
@@ -121,7 +121,7 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
             "employment_end_date, date_of_birth, super_fund_name, super_member_number,"
             "emergency_contact_name, emergency_contact_phone,"
             "emergency_contact_relationship, notes, organisation_id, allows_unpaid_break_opt_out,"
-            "contracted_hours_per_week,"
+            "contracted_hours_per_week, is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active"
             ")"
@@ -156,6 +156,8 @@ def create_staff_member(
     emergency_contact_name: str, emergency_contact_phone: str,
     emergency_contact_relationship: str, notes: str,
     contracted_hours_per_week: float = 0.0,
+    is_responsible_person: bool = False,
+    is_nominated_supervisor: bool = False,
 ) -> dict:
     """
     Create a staff member in three steps:
@@ -205,6 +207,8 @@ def create_staff_member(
             "employment_start_date":          employment_start_date or None,
             "date_of_birth":                  date_of_birth or None,
             "contracted_hours_per_week":      contracted_hours_per_week,
+            "is_responsible_person":          is_responsible_person,
+            "is_nominated_supervisor":        is_nominated_supervisor,
             "emergency_contact_name":         emergency_contact_name.strip() or None,
             "emergency_contact_phone":        emergency_contact_phone.strip() or None,
             "emergency_contact_relationship": emergency_contact_relationship.strip() or None,
@@ -322,6 +326,8 @@ def update_staff_member(
     is_active: bool,
     allows_unpaid_break_opt_out: bool = False,
     contracted_hours_per_week: float = 0.0,
+    is_responsible_person: bool = False,
+    is_nominated_supervisor: bool = False,
 ) -> dict:
     sb = get_supabase_client()
 
@@ -346,6 +352,8 @@ def update_staff_member(
             "notes":                          notes.strip() or None,
             "allows_unpaid_break_opt_out":    allows_unpaid_break_opt_out,
             "contracted_hours_per_week":      contracted_hours_per_week,
+            "is_responsible_person":          is_responsible_person,
+            "is_nominated_supervisor":        is_nominated_supervisor,
         })
         .eq("id", profile_id)
         .select()
