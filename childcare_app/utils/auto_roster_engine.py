@@ -170,6 +170,24 @@ def generate_roster(
         for s in centre_staff
     }
 
+    # Stagger each FT educator's starting pattern so multiple FT staff don't
+    # all pick the SAME 9.5h pattern on day 1 (which forces one educator to
+    # absorb every onsite-coverage extension and become over-allocated while
+    # another stays under). Offsetting by half the pattern list gives
+    # complementary opening/closing pairs where possible.
+    ft_staff_period = [s for s in centre_staff if s.get("employment_type") == "full_time"]
+    _half_patterns  = max(1, len(FT_SHIFT_PATTERNS) // 2)
+    for _i, _s in enumerate(sorted(ft_staff_period, key=lambda x: x.get("name", ""))):
+        ft_pattern_idx[_s["uid"]] = (_i * _half_patterns) % len(FT_SHIFT_PATTERNS)
+
+    # Shifts created by the "FT day-coverage correction pass" — tracked so the
+    # post-week hours-balancing pass can reassign them to a less-allocated
+    # FT educator if doing so improves balance toward contracted hours.
+    day_coverage_shifts: list[SuggestedShift] = []
+
+    # Per-slot Responsible Person / Nominated Supervisor onsite coverage
+    rpns_onsite_report: list[dict] = []
+
     for day in days:
         date_str = day.isoformat()
         dow      = day.isoweekday() % 7   # 0=Sun, 1=Mon … 6=Sat
@@ -382,6 +400,7 @@ def generate_roster(
                         source="full_time_base",
                     )
                     day_shifts.append(shift)
+                    day_coverage_shifts.append(shift)
                     ft_rostered_days[uid] = ft_rostered_days.get(uid, 0) + 1
                     weekly_hours[uid]     = new_total
 
@@ -422,7 +441,11 @@ def generate_roster(
 
             # ── Opening gap ────────────────────────────────────────────
             if earliest_start > CENTRE_OPEN:
-                target = next(s for s in ft_today if s.start_time == earliest_start)
+                tied = [s for s in ft_today if s.start_time == earliest_start]
+                # Balance hours: if multiple FT shifts share this edge,
+                # extend whichever educator currently has the LOWEST
+                # weekly hours (furthest below their target).
+                target = min(tied, key=lambda s: weekly_hours.get(s.user_id, 0.0))
                 uid    = target.user_id
                 av     = availability_map.get(uid, {}).get(dow)
                 av_from = (av.get("available_from") or "00:00")[:5] + ":00" if av else "00:00:00"
@@ -447,7 +470,8 @@ def generate_roster(
 
             # ── Closing gap ────────────────────────────────────────────
             if latest_end < CENTRE_CLOSE:
-                target = next(s for s in ft_today if s.end_time == latest_end)
+                tied = [s for s in ft_today if s.end_time == latest_end]
+                target = min(tied, key=lambda s: weekly_hours.get(s.user_id, 0.0))
                 uid    = target.user_id
                 av     = availability_map.get(uid, {}).get(dow)
                 av_until = (av.get("available_until") or "23:59")[:5] + ":00" if av else "23:59:00"
@@ -502,6 +526,30 @@ def generate_roster(
                 "assigned":  ", ".join(onsite) if onsite else "—",
             })
             slot_dt += timedelta(minutes=15)
+
+        # ── Responsible Person / Nominated Supervisor onsite coverage ───
+        # HARD CONSTRAINT — priority 3 (after centre coverage and FT
+        # onsite, before contracted-hours balancing / ratio checks).
+        rpns_staff_today = [
+            s for s in centre_staff
+            if s.get("is_responsible_person") or s.get("is_nominated_supervisor")
+        ]
+        _correct_rpns_coverage(
+            day_shifts=day_shifts,
+            date_str=date_str,
+            dow=dow,
+            rpns_staff=rpns_staff_today,
+            availability_map=availability_map,
+            leave_map=leave_map,
+            weekly_hours=weekly_hours,
+            contracted=contracted,
+            room_map=room_map,
+            rooms=rooms,
+            break_prefs=break_prefs,
+            corrections_log=corrections_log,
+            ratio_warns=ratio_warns,
+            rpns_onsite_report=rpns_onsite_report,
+        )
 
         # ── Step 1B: Compute room ratio requirements from intervals ───
         # Build demand windows as before, then check what additional staff
@@ -1028,6 +1076,8 @@ def generate_roster(
                     "status":   "✅ OK" if delta >= 0 else f"❌ Shortfall {delta}",
                 })
 
+    rpns_warns = [w for w in ratio_warns if "Responsible Person/Nominated Supervisor" in w]
+
     validation = {
         "centre_coverage_achieved": len(coverage_gaps) == 0,
         "uncovered_intervals":      coverage_gaps,
@@ -1043,6 +1093,9 @@ def generate_roster(
         "ft_onsite_coverage":       ft_onsite_report,
         "ft_onsite_violations":     ft_onsite_warns,
         "ft_onsite_achieved":       len(ft_onsite_warns) == 0,
+        "rpns_onsite_coverage":     rpns_onsite_report,
+        "rpns_onsite_violations":   rpns_warns,
+        "rpns_onsite_achieved":     len(rpns_warns) == 0,
         "corrections_log":          corrections_log,
         "pt_ca_hours_used":         round(pt_hours, 1),
         "review_warnings":          review_warns,
@@ -1120,6 +1173,8 @@ def _build_centre_staff(staff: list[dict], centre_id: str) -> list[dict]:
                 "employment_type":           etype,
                 "allows_opt_out":            profile.get("allows_unpaid_break_opt_out", False),
                 "contracted_hours_per_week": contracted,
+                "is_responsible_person":     bool(profile.get("is_responsible_person", False)),
+                "is_nominated_supervisor":   bool(profile.get("is_nominated_supervisor", False)),
             })
             break  # one role per centre
 
@@ -1414,6 +1469,224 @@ def _check_centre_coverage(
         )
 
     return warnings
+
+
+def _correct_rpns_coverage(
+    day_shifts: list[SuggestedShift],
+    date_str: str,
+    dow: int,
+    rpns_staff: list[dict],
+    availability_map: dict[str, dict],
+    leave_map: dict[str, list[str]],
+    weekly_hours: dict[str, float],
+    contracted: dict[str, float],
+    room_map: dict[str, dict],
+    rooms: list[dict],
+    break_prefs: dict[str, dict[int, bool]],
+    corrections_log: list[dict],
+    ratio_warns: list[str],
+    rpns_onsite_report: list[dict],
+) -> None:
+    """
+    HARD CONSTRAINT: at least one Responsible Person or Nominated Supervisor
+    must be onsite for every 15-min slot from CENTRE_OPEN to CENTRE_CLOSE.
+
+    Mutates day_shifts (extends/adds shifts), weekly_hours, corrections_log,
+    ratio_warns, and appends per-slot rows to rpns_onsite_report.
+
+    Priority when choosing which RP/NS staff member to use:
+      Nominated Supervisors first, then Responsible Persons, then by name.
+    """
+    rpns_uids = {s["uid"]: s for s in rpns_staff}
+    if not rpns_uids:
+        # No staff at this centre hold either flag — flag every slot.
+        slot_dt  = datetime.strptime(CENTRE_OPEN,  "%H:%M:%S")
+        close_dt = datetime.strptime(CENTRE_CLOSE, "%H:%M:%S")
+        while slot_dt < close_dt:
+            slot_str = slot_dt.strftime("%H:%M:%S")
+            rpns_onsite_report.append({
+                "date": date_str, "slot": slot_str[:5],
+                "rpns_count": 0, "compliant": False, "assigned": "—",
+            })
+            slot_dt += timedelta(minutes=15)
+        ratio_warns.append(
+            f"CRITICAL: No Responsible Person/Nominated Supervisor onsite for "
+            f"{CENTRE_OPEN[:5]}–{CENTRE_CLOSE[:5]} on {date_str} "
+            "— no staff member at this centre holds either role."
+        )
+        return
+
+    def _slots() -> list[str]:
+        out = []
+        t   = datetime.strptime(CENTRE_OPEN,  "%H:%M:%S")
+        end = datetime.strptime(CENTRE_CLOSE, "%H:%M:%S")
+        while t < end:
+            out.append(t.strftime("%H:%M:%S"))
+            t += timedelta(minutes=15)
+        return out
+
+    def _onsite(slot: str) -> list[SuggestedShift]:
+        return [s for s in day_shifts
+                if s.user_id in rpns_uids and s.start_time <= slot < s.end_time]
+
+    def _gaps() -> list[tuple[str, str]]:
+        ranges: list[tuple[str, str]] = []
+        gap_start: str | None = None
+        for slot in _slots():
+            if not _onsite(slot):
+                if gap_start is None:
+                    gap_start = slot
+            else:
+                if gap_start is not None:
+                    ranges.append((gap_start, slot))
+                    gap_start = None
+        if gap_start is not None:
+            ranges.append((gap_start, CENTRE_CLOSE))
+        return ranges
+
+    # Candidates ranked: Nominated Supervisors first, then Responsible
+    # Persons, then by name (stable).
+    def _rank(s: dict) -> tuple[int, int, str]:
+        return (0 if s.get("is_nominated_supervisor") else 1,
+                0 if s.get("is_responsible_person") else 1,
+                s.get("name", ""))
+
+    ranked_rpns = sorted(rpns_staff, key=_rank)
+
+    # ── Try to close each gap ────────────────────────────────────────
+    for g_start, g_end in _gaps():
+        # Re-check — an earlier gap's correction may have closed this one.
+        if all(_onsite(s) for s in _slots() if g_start <= s < g_end):
+            continue
+
+        remaining_start, remaining_end = g_start, g_end
+
+        # 1) Extend an existing RP/NS shift TODAY that's adjacent to the gap.
+        rpns_today = [s for s in day_shifts if s.user_id in rpns_uids]
+
+        # Try extending forward (shift ends exactly at remaining_start)
+        for s in rpns_today:
+            if s.end_time == remaining_start:
+                uid = s.user_id
+                av  = availability_map.get(uid, {}).get(dow)
+                av_until = (av.get("available_until") or "23:59")[:5] + ":00" if av else "23:59:00"
+                new_end  = min(remaining_end, av_until)
+                if new_end > s.start_time and new_end > s.end_time:
+                    extra = _mins_between(s.end_time, new_end) / 60
+                    old_end = s.end_time
+                    s.end_time   = new_end
+                    s.shift_type = _shift_type(s.start_time, s.end_time)
+                    weekly_hours[uid] = weekly_hours.get(uid, 0.0) + extra
+                    corrections_log.append({
+                        "date": date_str,
+                        "violation": f"RP/NS coverage gap {remaining_start[:5]}–{remaining_end[:5]}",
+                        "action": f"Extended {s.user_name}'s shift end from "
+                                  f"{old_end[:5]} to {new_end[:5]} (Responsible Person/"
+                                  f"Nominated Supervisor coverage).",
+                    })
+                    remaining_start = new_end
+                    if remaining_start >= remaining_end:
+                        break
+
+        # Try extending backward (shift starts exactly at remaining_end)
+        if remaining_start < remaining_end:
+            for s in rpns_today:
+                if s.start_time == remaining_end:
+                    uid = s.user_id
+                    av  = availability_map.get(uid, {}).get(dow)
+                    av_from = (av.get("available_from") or "00:00")[:5] + ":00" if av else "00:00:00"
+                    new_start = max(remaining_start, av_from)
+                    if new_start < s.end_time and new_start < s.start_time:
+                        extra = _mins_between(new_start, s.start_time) / 60
+                        old_start = s.start_time
+                        s.start_time = new_start
+                        s.shift_type = _shift_type(s.start_time, s.end_time)
+                        weekly_hours[uid] = weekly_hours.get(uid, 0.0) + extra
+                        corrections_log.append({
+                            "date": date_str,
+                            "violation": f"RP/NS coverage gap {remaining_start[:5]}–{remaining_end[:5]}",
+                            "action": f"Extended {s.user_name}'s shift start from "
+                                      f"{old_start[:5]} to {new_start[:5]} (Responsible Person/"
+                                      f"Nominated Supervisor coverage).",
+                        })
+                        remaining_end = new_start
+                        if remaining_start >= remaining_end:
+                            break
+
+        # 2) If still uncovered, add a new shift for an available RP/NS
+        #    staff member (NS preferred) covering the remaining gap.
+        if remaining_start < remaining_end:
+            for cand in ranked_rpns:
+                uid = cand["uid"]
+                if date_str in leave_map.get(uid, []):
+                    continue
+                av = availability_map.get(uid, {}).get(dow)
+                if av is not None and not av.get("is_available", True):
+                    continue
+                av_from  = (av.get("available_from")  or "00:00")[:5] + ":00" if av else "00:00:00"
+                av_until = (av.get("available_until") or "23:59")[:5] + ":00" if av else "23:59:00"
+                seg_s = max(remaining_start, av_from)
+                seg_e = min(remaining_end, av_until)
+                if seg_e <= seg_s:
+                    continue
+
+                # Casual staff need the 3-hour minimum
+                if cand.get("employment_type") == "casual":
+                    if _mins_between(seg_s, seg_e) < CASUAL_MIN_SHIFT_MINUTES:
+                        continue
+
+                # Don't double-book this educator if already working this slot
+                overlap = any(
+                    s.user_id == uid and s.start_time < seg_e and s.end_time > seg_s
+                    for s in day_shifts
+                )
+                if overlap:
+                    continue
+
+                pref_day = break_prefs.get(uid, {}).get(dow, False)
+                override = "opted_out" if pref_day else "use_staff_default"
+                rid      = cand.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
+                rname    = room_map.get(rid, {}).get("name", "")
+
+                new_shift = SuggestedShift(
+                    user_id=uid, user_name=cand["name"], room_id=rid, room_name=rname,
+                    shift_date=date_str, start_time=seg_s, end_time=seg_e,
+                    shift_type=_shift_type(seg_s, seg_e),
+                    break_opt_out_override=override,
+                    source="rpns_coverage",
+                )
+                day_shifts.append(new_shift)
+                weekly_hours[uid] = weekly_hours.get(uid, 0.0) + _mins_between(seg_s, seg_e) / 60
+
+                role_label = "Nominated Supervisor" if cand.get("is_nominated_supervisor") else "Responsible Person"
+                corrections_log.append({
+                    "date": date_str,
+                    "violation": f"RP/NS coverage gap {remaining_start[:5]}–{remaining_end[:5]}",
+                    "action": f"Added {seg_s[:5]}–{seg_e[:5]} shift for {cand['name']} "
+                              f"({role_label}) to maintain Responsible Person/"
+                              f"Nominated Supervisor coverage.",
+                })
+                remaining_start = seg_e
+                if remaining_start >= remaining_end:
+                    break
+
+        # 3) Anything still uncovered → critical warning.
+        if remaining_start < remaining_end:
+            ratio_warns.append(
+                f"CRITICAL: No Responsible Person/Nominated Supervisor onsite for "
+                f"{remaining_start[:5]}–{remaining_end[:5]} on {date_str}."
+            )
+
+    # ── Build the final per-slot report ──────────────────────────────
+    for slot in _slots():
+        onsite = _onsite(slot)
+        rpns_onsite_report.append({
+            "date":       date_str,
+            "slot":       slot[:5],
+            "rpns_count": len(onsite),
+            "compliant":  len(onsite) >= 1,
+            "assigned":   ", ".join(s.user_name for s in onsite) if onsite else "—",
+        })
 
 
 def _build_room_coverage(
