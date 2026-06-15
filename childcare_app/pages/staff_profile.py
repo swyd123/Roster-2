@@ -139,6 +139,28 @@ def render():
             _detail_row("Centre",      centre_str)
             _detail_row("Role",        role_str)
 
+            # Compliance role badges
+            is_rp = bool(staff.get("is_responsible_person", False))
+            is_ns = bool(staff.get("is_nominated_supervisor", False))
+            if is_rp or is_ns:
+                badges = []
+                if is_ns:
+                    badges.append(
+                        '<span style="background:#e0e7ff;color:#3730a3;padding:2px 9px;'
+                        'border-radius:99px;font-size:0.75rem;font-weight:600;'
+                        'margin-right:6px;">Nominated Supervisor</span>'
+                    )
+                if is_rp:
+                    badges.append(
+                        '<span style="background:#dbeafe;color:#1e40af;padding:2px 9px;'
+                        'border-radius:99px;font-size:0.75rem;font-weight:600;">'
+                        'Responsible Person</span>'
+                    )
+                st.markdown(
+                    f'<div style="margin-top:6px;">{"".join(badges)}</div>',
+                    unsafe_allow_html=True,
+                )
+
             if staff.get("notes"):
                 st.markdown("")
                 st.markdown('<p class="section-label">Notes</p>', unsafe_allow_html=True)
@@ -204,6 +226,9 @@ def render():
                         notes=values["notes"],
                         is_active=values["is_active"],
                         allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
+                        contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
+                        is_responsible_person=values.get("is_responsible_person", False),
+                        is_nominated_supervisor=values.get("is_nominated_supervisor", False),
                     )
 
                     # Step 2 — upsert the centre role assignment.
