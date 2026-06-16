@@ -691,15 +691,17 @@ from utils.break_engine import suggest_break_times, calc_break_entitlement
 class TestPreferredBreakWindow:
     """
     Tests confirming that:
-      1. Breaks are preferred between 11:00 and 15:00.
-      2. Breaks fall outside 11:00–15:00 only when coverage prevents a
-         valid break inside the window.
-      3. Outside-window breaks choose the nearest valid non-overlapping time.
+      1. Breaks must not start within the first 1.5 hours of the shift.
+      2. Breaks must not end within the last 1.5 hours of the shift.
+         earliest_start = shift_start + 90min
+         latest_end     = shift_end   - 90min
+      3. Breaks fall outside the eligible window only when the shift is too
+         short to accommodate the buffer (< 3h + break duration).
       4. Room ratio coverage is always preserved.
-      5. Same-educator same-day breaks never overlap (regardless of window).
+      5. Same-educator same-day breaks never overlap.
     """
 
-    PREF_FROM  = "11:00:00"
+    PREF_FROM  = "11:00:00"   # kept for _shift_break_to_window tests
     PREF_UNTIL = "15:00:00"
     RID        = "room-1"
     UID        = "user-1"
@@ -713,18 +715,16 @@ class TestPreferredBreakWindow:
         ]
         return {self.RID: {s: n_staff for s in slots}}
 
-    # ── 1. Breaks are preferred between 11:00 and 15:00 ──────────────────────
+    # ── 1. Breaks respect 1.5h buffer at start and end of shift ──────────────
 
     def test_meal_break_placed_inside_preferred_window(self):
         """
-        A meal break suggested outside 11:00–15:00 must be shifted
-        to fall inside the window when the shift and ratio allow it.
+        _shift_break_to_window still works as a utility for shifting breaks
+        to an explicit preferred window.
         """
-        # _shift_break_to_window is the direct mechanism
-        # Original suggestion outside preferred window (e.g. 09:00–09:30)
         result_s, result_e = _shift_break_to_window(
             "09:00:00", "09:30:00", 30,
-            "07:00:00", "18:00:00",   # long shift — window fits
+            "07:00:00", "18:00:00",
             self.PREF_FROM, self.PREF_UNTIL,
         )
         assert result_s >= self.PREF_FROM, (
@@ -737,32 +737,46 @@ class TestPreferredBreakWindow:
     def test_combined_block_placed_inside_preferred_window(self):
         """
         _suggest_combined for a 7+ hr shift must place the combined block
-        inside 11:00–15:00 when the shift allows it.
+        within the 1.5h-buffer eligible window.
+        Shift: 07:00–15:00 (8h)
+        eligible window: 08:30–13:30
+        Combined break (50 min) must start ≥ 08:30 and end ≤ 13:30.
         """
         ent  = calc_break_entitlement(8 * 60)   # 8 hr → 20m paid + 30m unpaid
         sugs = suggest_break_times("07:00:00", "15:00:00", ent)
         assert len(sugs) == 1
         sug = sugs[0]
         assert sug["combined"] is True
-        assert sug["planned_start"] >= self.PREF_FROM, (
-            f"Combined break start {sug['planned_start'][:5]} should be ≥ 11:00"
+        # 1.5h buffer: earliest start = 08:30, latest end = 13:30
+        assert sug["planned_start"] >= "08:30:00", (
+            f"Combined break start {sug['planned_start'][:5]} should be ≥ 08:30 "
+            f"(shift_start 07:00 + 1.5h buffer)"
         )
-        assert sug["planned_end"] <= self.PREF_UNTIL, (
-            f"Combined break end {sug['planned_end'][:5]} should be ≤ 15:00"
+        assert sug["planned_end"] <= "13:30:00", (
+            f"Combined break end {sug['planned_end'][:5]} should be ≤ 13:30 "
+            f"(shift_end 15:00 - 1.5h buffer)"
         )
 
     def test_40min_combined_placed_inside_preferred_window(self):
         """
-        _suggest_combined for a 5–7 hr shift (40 min block) fits inside
-        11:00–15:00 when the shift spans the window.
+        _suggest_combined for a 5–7 hr shift (40 min block) must land within
+        the 1.5h-buffer eligible window.
+        Shift: 08:00–14:00 (6h)
+        eligible window: 09:30–12:30
+        Combined break (40 min) must start ≥ 09:30 and end ≤ 12:30.
         """
         ent  = calc_break_entitlement(6 * 60)   # 6 hr → 10m paid + 30m unpaid
         sugs = suggest_break_times("08:00:00", "14:00:00", ent)
         assert len(sugs) == 1
         sug = sugs[0]
         assert sug["combined"] is True
-        assert sug["planned_start"] >= self.PREF_FROM
-        assert sug["planned_end"]   <= self.PREF_UNTIL
+        # 1.5h buffer: earliest start = 09:30, latest end = 12:30
+        assert sug["planned_start"] >= "09:30:00", (
+            f"Break start {sug['planned_start'][:5]} should be ≥ 09:30"
+        )
+        assert sug["planned_end"] <= "12:30:00", (
+            f"Break end {sug['planned_end'][:5]} should be ≤ 12:30"
+        )
 
     # ── 2. Breaks may extend outside 11:00–15:00 when coverage blocks ────────
 
@@ -962,12 +976,37 @@ def _load_collapse_breaks():
     _st = sys.modules.get("streamlit") or types.ModuleType("streamlit")
     for _attr in ("title","markdown","caption","dataframe","info","warning",
                   "error","button","expander","rerun","progress","selectbox",
-                  "date_input","columns","spinner","session_state"):
+                  "date_input","columns","spinner","session_state","success",
+                  "toggle","number_input","text_input","text_area","form",
+                  "form_submit_button","divider","tabs","metric"):
         if not hasattr(_st, _attr):
             setattr(_st, _attr,
                     {} if _attr == "session_state"
                     else (lambda *a, **k: None))
+    if not hasattr(_st, "columns"):
+        _st.columns = lambda n: [types.SimpleNamespace(**{a: (lambda *x,**k: None) for a in ("metric","markdown","button","selectbox","text_input","number_input","toggle","date_input","text_area","checkbox","info","warning","error","success","dataframe","expander","caption","divider")}) for _ in range(n if isinstance(n,int) else len(n))]
     sys.modules["streamlit"] = _st
+
+    # Stub any missing utils/pages modules that auto_roster.py imports.
+    # Use a permissive stub that returns None for any attribute access.
+    class _NoOpModule(types.ModuleType):
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    for _stub_mod in [
+        "utils.break_preferences_queries",
+        "utils.roster_queries",
+        "utils.staff_queries",
+        "utils.centre_queries",
+        "utils.supabase_client",
+        "utils.helpers",
+        "utils.child_queries",
+        "utils.room_queries",
+        "utils.attendance_queries",
+        "components.staff_form",
+    ]:
+        if _stub_mod not in sys.modules:
+            sys.modules[_stub_mod] = _NoOpModule(_stub_mod)
 
     page_path = _os.path.join(
         _os.path.dirname(__file__), "..", "pages", "auto_roster.py"
@@ -981,8 +1020,9 @@ def _load_collapse_breaks():
 try:
     _collapse_breaks = _load_collapse_breaks()
 except Exception as _ce:
-    def _collapse_breaks(breaks):
-        raise RuntimeError(f"Could not load _collapse_breaks: {_ce}")
+    _ce_msg = str(_ce)  # capture before _ce is deleted from scope
+    def _collapse_breaks(breaks, _msg=_ce_msg):
+        raise RuntimeError(f"Could not load _collapse_breaks: {_msg}")
 
 
 class TestCollapseBreaks:
