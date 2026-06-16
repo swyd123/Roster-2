@@ -19,9 +19,6 @@ from utils.helpers import (
     toast_success, toast_error, toast_warn, workdays_between,
 )
 from components.staff_form import staff_form
-from utils.break_preferences_queries import (
-    fetch_all_break_prefs_for_user, upsert_break_prefs_bulk, DAY_NAMES,
-)
 import time
 
 
@@ -48,19 +45,19 @@ def render():
             st.session_state.page = "staff_list"; st.rerun()
         return
 
-    user      = staff.get("users") or {}
-    user_id   = user.get("id", "")
-    name      = fmt_name(staff)
+    user    = staff.get("users") or {}
+    user_id = user.get("id","")
+    name    = fmt_name(staff)
     is_active = user.get("is_active", False)
 
-    # Role & centre — first active assignment
-    roles_list = [r for r in (staff.get("user_centre_roles") or []) if r.get("is_active")]
-    role_str   = fmt_role(roles_list[0]["role"]) if roles_list else "—"
-    centre_str = (roles_list[0].get("centres") or {}).get("name", "—") if roles_list else "—"
-    centre_id  = roles_list[0].get("centre_id") if roles_list else None
+    # Role & centre
+    roles_list  = [r for r in (staff.get("user_centre_roles") or []) if r.get("is_active")]
+    role_str    = fmt_role(roles_list[0]["role"]) if roles_list else "—"
+    centre_str  = (roles_list[0].get("centres") or {}).get("name","—") if roles_list else "—"
+    centre_id   = (roles_list[0].get("centre_id")) if roles_list else None
 
-    # ── Back button ───────────────────────────────────────────────────
-    bc, _ = st.columns([1, 10])
+    # ── Header ───────────────────────────────────────────────────────
+    bc, _ = st.columns([1,10])
     with bc:
         st.markdown('<div class="back-btn">', unsafe_allow_html=True)
         if st.button("← Back", key="profile_back"):
@@ -70,13 +67,13 @@ def render():
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Profile header card ───────────────────────────────────────────
+    # Profile header card
     status_html = (
-        '<span style="background:#d4f0e4;color:#0f6b3a;padding:3px 10px;'
-        'border-radius:99px;font-size:0.78rem;font-weight:600;">Active</span>'
+        f'<span style="background:#d4f0e4;color:#0f6b3a;padding:3px 10px;'
+        f'border-radius:99px;font-size:0.78rem;font-weight:600;">Active</span>'
         if is_active else
-        '<span style="background:#fde8e8;color:#991b1b;padding:3px 10px;'
-        'border-radius:99px;font-size:0.78rem;font-weight:600;">Inactive</span>'
+        f'<span style="background:#fde8e8;color:#991b1b;padding:3px 10px;'
+        f'border-radius:99px;font-size:0.78rem;font-weight:600;">Inactive</span>'
     )
     st.markdown(
         f'<div style="background:#ffffff;border:1px solid #e4edf5;border-radius:14px;'
@@ -85,28 +82,22 @@ def render():
         f'<div style="width:52px;height:52px;border-radius:50%;background:#0d1f35;'
         f'display:flex;align-items:center;justify-content:center;'
         f'font-family:DM Serif Display,serif;font-size:1.3rem;color:#ffffff;">'
-        f'{name[0].upper() if name else "?"}</div>'
+        f'{name[0].upper()}</div>'
         f'<div><div style="font-family:DM Serif Display,serif;font-size:1.4rem;'
         f'color:#0d1f35;">{name}</div>'
         f'<div style="font-size:0.85rem;color:#7a90a8;margin-top:2px;">'
         f'{role_str} · {centre_str}</div></div>'
         f'<div style="margin-left:auto;">{status_html}</div>'
         f'</div></div>',
-        unsafe_allow_html=True,
+        unsafe_allow_html=True
     )
 
-    # ── Alert when no centre is assigned ─────────────────────────────
-    if not centre_id:
-        st.warning(
-            "⚠️ **No centre assigned.** "
-            "Go to the **Edit** tab to assign this staff member to a centre. "
-            "Availability and Leave tracking require a centre assignment."
-        )
-
-    # ── Tabs ──────────────────────────────────────────────────────────
+    # ── Tabs ─────────────────────────────────────────────────────────
+    # Determine starting tab from session state
     default_tab = st.session_state.pop("profile_tab", "overview")
-    tab_labels  = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave", "☕ Break Prefs", "✏️ Edit"]
-    tab_map     = {"overview": 0, "quals": 1, "avail": 2, "leave": 3, "breaks": 4, "edit": 5}
+    tab_labels  = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave", "✏️ Edit"]
+    tab_map     = {"overview": 0, "quals": 1, "avail": 2, "leave": 3, "edit": 4}
+    start_idx   = tab_map.get(default_tab, 0)
 
     tabs = st.tabs(tab_labels)
 
@@ -119,9 +110,9 @@ def render():
 
         with col_a:
             st.markdown('<p class="section-label">Personal Details</p>', unsafe_allow_html=True)
-            _detail_row("Full name",     name)
-            _detail_row("Email",         user.get("email", "—"))
-            _detail_row("Phone",         user.get("phone") or "—")
+            _detail_row("Full name",    name)
+            _detail_row("Email",        user.get("email","—"))
+            _detail_row("Phone",        user.get("phone") or "—")
             _detail_row("Date of birth", fmt_date(staff.get("date_of_birth")))
 
             st.markdown("")
@@ -132,32 +123,32 @@ def render():
 
         with col_b:
             st.markdown('<p class="section-label">Employment Details</p>', unsafe_allow_html=True)
-            _detail_row("Employee #",  staff.get("employee_number") or "—")
-            _detail_row("Type",        fmt_employment(staff.get("employment_type", "")))
-            _detail_row("Start date",  fmt_date(staff.get("employment_start_date")))
-            _detail_row("End date",    fmt_date(staff.get("employment_end_date")) if staff.get("employment_end_date") else "Current")
-            _detail_row("Centre",      centre_str)
-            _detail_row("Role",        role_str)
+            _detail_row("Employee #",   staff.get("employee_number") or "—")
+            _detail_row("Type",         fmt_employment(staff.get("employment_type","")))
+            _detail_row("Start date",   fmt_date(staff.get("employment_start_date")))
+            _detail_row("End date",     fmt_date(staff.get("employment_end_date")) if staff.get("employment_end_date") else "Current")
+            _detail_row("Centre",       centre_str)
+            _detail_row("Role",         role_str)
 
-            # Compliance role badges
-            is_rp = bool(staff.get("is_responsible_person", False))
-            is_ns = bool(staff.get("is_nominated_supervisor", False))
-            if is_rp or is_ns:
-                badges = []
-                if is_ns:
-                    badges.append(
-                        '<span style="background:#e0e7ff;color:#3730a3;padding:2px 9px;'
+            # RP / NS compliance badges
+            _is_ns = bool(staff.get("is_nominated_supervisor", False))
+            _is_rp = bool(staff.get("is_responsible_person", False))
+            if _is_ns or _is_rp:
+                _badges = []
+                if _is_ns:
+                    _badges.append(
+                        '<span style="background:#e0e7ff;color:#3730a3;padding:2px 10px;'
                         'border-radius:99px;font-size:0.75rem;font-weight:600;'
                         'margin-right:6px;">Nominated Supervisor</span>'
                     )
-                if is_rp:
-                    badges.append(
-                        '<span style="background:#dbeafe;color:#1e40af;padding:2px 9px;'
+                if _is_rp:
+                    _badges.append(
+                        '<span style="background:#dbeafe;color:#1e40af;padding:2px 10px;'
                         'border-radius:99px;font-size:0.75rem;font-weight:600;">'
                         'Responsible Person</span>'
                     )
                 st.markdown(
-                    f'<div style="margin-top:6px;">{"".join(badges)}</div>',
+                    '<div style="margin:6px 0;">' + "".join(_badges) + "</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -167,8 +158,7 @@ def render():
                 st.markdown(
                     f'<div style="background:#f5f8fb;border:1px solid #e4edf5;'
                     f'border-radius:8px;padding:0.75rem;font-size:0.88rem;color:#4a6079;">'
-                    f'{staff["notes"]}</div>',
-                    unsafe_allow_html=True,
+                    f'{staff["notes"]}</div>', unsafe_allow_html=True
                 )
 
     # ════════════════════════════════════════════════════════════════
@@ -190,25 +180,14 @@ def render():
         _render_leave(user_id, centre_id)
 
     # ════════════════════════════════════════════════════════════════
-    # TAB 5 — Break Preferences
+    # TAB 5 — Edit
     # ════════════════════════════════════════════════════════════════
     with tabs[4]:
-        _render_break_preferences(user_id, centre_id, staff)
-
-    # ════════════════════════════════════════════════════════════════
-    # TAB 6 — Edit
-    # ════════════════════════════════════════════════════════════════
-    with tabs[5]:
         st.markdown("")
-
-        # Pass show_role_fields=True so centre/role can be added or changed.
-        # The form pre-fills from staff["user_centre_roles"] in edit mode.
         values = staff_form(key_prefix="edit", defaults=staff, show_role_fields=True)
-
         if values:
             with st.spinner("Saving…"):
                 try:
-                    # Step 1 — update user + staff profile fields
                     update_staff_member(
                         profile_id=profile_id,
                         user_id=user_id,
@@ -225,16 +204,12 @@ def render():
                         emergency_contact_relationship=values["emergency_contact_relationship"],
                         notes=values["notes"],
                         is_active=values["is_active"],
-                        allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
                         contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
+                        allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
                         is_responsible_person=values.get("is_responsible_person", False),
                         is_nominated_supervisor=values.get("is_nominated_supervisor", False),
                     )
-
-                    # Step 2 — upsert the centre role assignment.
-                    # This inserts a new row if none exists, or updates the
-                    # existing one — so this fixes missing centre assignments
-                    # as well as changing them.
+                    # Also update centre role assignment if provided
                     if values.get("centre_id"):
                         upsert_centre_role(
                             user_id=user_id,
@@ -242,14 +217,12 @@ def render():
                             role=values["role"],
                             primary_room_id=values.get("primary_room_id"),
                         )
-
                     toast_success("Profile saved.")
                     time.sleep(0.6)
                     st.rerun()
-
                 except Exception as e:
                     err = str(e)
-                    if "duplicate" in err.lower() or "unique" in err.lower():
+                    if "duplicate" in err.lower():
                         toast_error(f"Email {values['email']} is already in use.")
                     else:
                         toast_error(f"Could not save: {err}")
@@ -263,7 +236,7 @@ def _detail_row(label: str, value: str):
         f'min-width:120px;padding-top:1px;">{label}</span>'
         f'<span style="font-size:0.88rem;color:#1e3a55;">{value}</span>'
         f'</div>',
-        unsafe_allow_html=True,
+        unsafe_allow_html=True
     )
 
 
@@ -278,9 +251,10 @@ def _render_qualifications(profile_id: str):
     except Exception as e:
         toast_error(f"Could not load qualifications: {e}"); return
 
-    expired  = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status", "")) == "expired"]
-    critical = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status", "")) == "critical"]
-    warning  = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status", "")) == "warning"]
+    # Alert banners
+    expired  = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status","")) == "expired"]
+    critical = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status","")) == "critical"]
+    warning  = [q for q in quals if qual_risk_level(q.get("expiry_date"), q.get("status","")) == "warning"]
 
     if expired:
         st.error(f"❌ **{len(expired)} qualification(s) expired** — immediate action required.")
@@ -289,12 +263,14 @@ def _render_qualifications(profile_id: str):
     elif warning:
         st.info(f"ℹ️ {len(warning)} qualification(s) expire within 60 days.")
 
-    hc1, hc2 = st.columns([5, 1])
+    # Add qualification button
+    hc1, hc2 = st.columns([5,1])
     hc1.markdown(f"**{len(quals)} qualification(s) on record**")
     with hc2:
         if st.button("➕  Add Qualification", key="add_qual_btn", use_container_width=True, type="primary"):
             st.session_state["show_add_qual"] = True
 
+    # ── Add qualification form (expandable) ───────────────────────────
     if st.session_state.get("show_add_qual"):
         _render_add_qual_form(profile_id)
 
@@ -304,16 +280,19 @@ def _render_qualifications(profile_id: str):
         st.info("No qualifications recorded yet. Click **➕ Add Qualification** to add the first one.")
         return
 
+    # ── Qualifications table ──────────────────────────────────────────
     for q in quals:
-        qt       = q.get("qualification_types") or {}
-        qt_name  = qt.get("name", "Unknown")
-        status   = q.get("status", "")
-        expiry   = q.get("expiry_date")
-        d_until  = days_until(expiry)
-        risk     = qual_risk_level(expiry, status)
-        cfg      = QUAL_STATUS_CONFIG.get(status, {})
-        icon     = cfg.get("icon", "❓")
+        qt        = q.get("qualification_types") or {}
+        qt_name   = qt.get("name","Unknown")
+        qt_short  = qt.get("short_name","")
+        status    = q.get("status","")
+        expiry    = q.get("expiry_date")
+        d_until   = days_until(expiry)
+        risk      = qual_risk_level(expiry, status)
+        cfg       = QUAL_STATUS_CONFIG.get(status, {})
+        icon      = cfg.get("icon","❓")
 
+        # Expiry display
         if not expiry:
             expiry_display = "Does not expire"
         elif risk == "expired":
@@ -325,14 +304,16 @@ def _render_qualifications(profile_id: str):
         else:
             expiry_display = fmt_date(expiry)
 
-        verifier     = q.get("users")
+        # Verifier
+        verifier = q.get("users")
         verified_str = (
             f"Verified by {verifier['first_name']} {verifier['last_name']} on {fmt_date(q.get('verified_at'))}"
             if verifier and q.get("verified_at") else "Not verified"
         )
 
-        with st.expander(f"{icon} **{qt_name}** — {expiry_display}",
-                         expanded=(risk in ("expired", "critical"))):
+        border_colour = {"expired":"#fca5a5","critical":"#fde68a","warning":"#fde68a"}.get(risk,"#e4edf5")
+
+        with st.expander(f"{icon} **{qt_name}** — {expiry_display}", expanded=(risk in ("expired","critical"))):
             qc1, qc2, qc3 = st.columns(3)
             qc1.markdown(f"**Issuing body**  \n{q.get('issuing_body') or '—'}")
             qc2.markdown(f"**Issue date**  \n{fmt_date(q.get('issue_date'))}")
@@ -348,8 +329,9 @@ def _render_qualifications(profile_id: str):
                 st.markdown(f"_Notes: {q['notes']}_")
 
             st.markdown("")
-            ab1, ab2, ab3, _ = st.columns([1, 1, 1, 4])
+            ab1, ab2, ab3, _ = st.columns([1,1,1,4])
 
+            # Verify button
             if status == "pending_verification":
                 if ab1.button("✅  Verify", key=f"verify_{q['id']}", use_container_width=True, type="primary"):
                     try:
@@ -359,11 +341,13 @@ def _render_qualifications(profile_id: str):
                     except Exception as e:
                         toast_error(str(e))
 
+            # Edit button — toggle inline edit
             edit_key = f"edit_qual_{q['id']}"
             if ab2.button("✏️  Edit", key=f"eqbtn_{q['id']}", use_container_width=True):
                 st.session_state[edit_key] = not st.session_state.get(edit_key, False)
                 st.rerun()
 
+            # Delete button
             del_key = f"del_qual_{q['id']}"
             if st.session_state.get(del_key):
                 st.warning("Delete this qualification record?")
@@ -382,6 +366,7 @@ def _render_qualifications(profile_id: str):
                 if ab3.button("🗑️  Delete", key=f"delbtn_{q['id']}", use_container_width=True):
                     st.session_state[del_key] = True; st.rerun()
 
+            # Inline edit form
             if st.session_state.get(edit_key):
                 st.markdown("---")
                 st.markdown("**Edit qualification details**")
@@ -389,19 +374,13 @@ def _render_qualifications(profile_id: str):
                     ec1, ec2 = st.columns(2)
                     raw_issue  = q.get("issue_date")
                     raw_expiry = q.get("expiry_date")
-                    new_issue  = ec1.date_input(
-                        "Issue date",
-                        value=date.fromisoformat(raw_issue[:10]) if raw_issue else None,
-                        key=f"eqi_{q['id']}", format="DD/MM/YYYY",
-                    )
-                    new_expiry = ec2.date_input(
-                        "Expiry date",
-                        value=date.fromisoformat(raw_expiry[:10]) if raw_expiry else None,
-                        key=f"eqe_{q['id']}", format="DD/MM/YYYY",
-                    )
-                    new_body  = st.text_input("Issuing body", value=q.get("issuing_body", "") or "", key=f"eqb_{q['id']}")
-                    new_cert  = st.text_input("Certificate #", value=q.get("certificate_number", "") or "", key=f"eqc_{q['id']}")
-                    new_notes = st.text_area("Notes", value=q.get("notes", "") or "", key=f"eqn_{q['id']}", height=70)
+                    new_issue  = ec1.date_input("Issue date", value=date.fromisoformat(raw_issue[:10]) if raw_issue else None,
+                                                 key=f"eqi_{q['id']}", format="DD/MM/YYYY")
+                    new_expiry = ec2.date_input("Expiry date", value=date.fromisoformat(raw_expiry[:10]) if raw_expiry else None,
+                                                 key=f"eqe_{q['id']}", format="DD/MM/YYYY")
+                    new_body   = st.text_input("Issuing body", value=q.get("issuing_body","") or "", key=f"eqb_{q['id']}")
+                    new_cert   = st.text_input("Certificate #", value=q.get("certificate_number","") or "", key=f"eqc_{q['id']}")
+                    new_notes  = st.text_area("Notes", value=q.get("notes","") or "", key=f"eqn_{q['id']}", height=70)
                     if st.form_submit_button("Save changes", type="primary"):
                         try:
                             update_qualification(
@@ -418,6 +397,7 @@ def _render_qualifications(profile_id: str):
 
 
 def _render_add_qual_form(profile_id: str):
+    """Inline form for adding a new qualification."""
     try:
         qual_types = fetch_qualification_types()
     except Exception as e:
@@ -429,16 +409,14 @@ def _render_add_qual_form(profile_id: str):
     with st.form(key="add_qual_form"):
         st.markdown("**Add new qualification**")
         aq1, aq2 = st.columns(2)
-        selected_type = aq1.selectbox(
-            "Qualification type *",
-            options=list(qt_opts.keys()),
-            format_func=lambda x: qt_opts[x],
-            key="aq_type",
-        )
+        selected_type = aq1.selectbox("Qualification type *",
+                                       options=list(qt_opts.keys()),
+                                       format_func=lambda x: qt_opts[x],
+                                       key="aq_type")
         issuing_body = aq2.text_input("Issuing body", placeholder="e.g. St John Ambulance", key="aq_body")
 
         aq3, aq4 = st.columns(2)
-        issue_date  = aq3.date_input("Issue date",  value=None, key="aq_issue",  format="DD/MM/YYYY")
+        issue_date  = aq3.date_input("Issue date", value=None, key="aq_issue", format="DD/MM/YYYY")
         expiry_date = aq4.date_input("Expiry date", value=None, key="aq_expiry", format="DD/MM/YYYY",
                                       help="Required for this qualification type" if selected_type and qt_req.get(selected_type) else "")
         cert_num  = st.text_input("Certificate / registration number", key="aq_cert")
@@ -446,6 +424,7 @@ def _render_add_qual_form(profile_id: str):
 
         sc1, sc2 = st.columns(2)
         if sc1.form_submit_button("Upload & Save", type="primary", use_container_width=True):
+            # Validate expiry if required
             if selected_type and qt_req.get(selected_type) and not expiry_date:
                 toast_error("Expiry date is required for this qualification type.")
             else:
@@ -477,10 +456,7 @@ def _render_availability(user_id: str, centre_id: str | None):
     st.markdown("")
 
     if not centre_id:
-        st.info(
-            "No centre assigned. Go to the **Edit** tab to assign this staff member "
-            "to a centre, then return here to set their availability."
-        )
+        st.info("No centre assigned. Assign this staff member to a centre to manage availability.")
         return
 
     try:
@@ -488,17 +464,18 @@ def _render_availability(user_id: str, centre_id: str | None):
     except Exception as e:
         toast_error(f"Could not load availability: {e}"); return
 
+    # Build a day_of_week → record map
     avail_map = {a["day_of_week"]: a for a in existing}
 
     st.markdown("**Weekly availability pattern**")
-    st.caption(
-        "Set which days and hours this staff member is available to work. "
-        "The roster builder uses this to flag scheduling conflicts."
-    )
+    st.caption("Set which days and hours this staff member is available to work. "
+               "The roster builder uses this to flag scheduling conflicts.")
 
     with st.form("availability_form"):
         from datetime import date as _date
         rows = []
+
+        # Show Mon–Sun (1–7, wrap Sunday=0)
         display_order = [1, 2, 3, 4, 5, 6, 0]  # Mon to Sun
 
         for dow in display_order:
@@ -506,17 +483,14 @@ def _render_availability(user_id: str, centre_id: str | None):
             day_name = DAYS[dow]
             av1, av2, av3, av4 = st.columns([1.5, 1, 1, 2])
 
-            is_avail = av1.toggle(
-                day_name,
-                value=rec.get("is_available", dow in [1, 2, 3, 4, 5]),
-                key=f"avail_toggle_{dow}",
-            )
+            is_avail = av1.toggle(day_name, value=rec.get("is_available", dow in [1,2,3,4,5]),
+                                   key=f"avail_toggle_{dow}")
 
-            from_time  = None
+            from_time = None
             until_time = None
             if is_avail:
-                raw_from  = rec.get("available_from", "06:30")
-                raw_until = rec.get("available_until", "18:00")
+                raw_from  = rec.get("available_from","06:30")
+                raw_until = rec.get("available_until","18:00")
                 try:
                     from datetime import time as _time
                     def parse_t(s):
@@ -531,22 +505,19 @@ def _render_availability(user_id: str, centre_id: str | None):
 
                 from_time  = av2.time_input("From",  value=from_default,  key=f"af_{dow}")
                 until_time = av3.time_input("Until", value=until_default, key=f"au_{dow}")
-                av4.text_input(
-                    "Notes", value=rec.get("notes", "") or "",
-                    key=f"an_{dow}", placeholder="e.g. School pickup at 3pm",
-                    label_visibility="collapsed",
-                )
+                av4.text_input("Notes", value=rec.get("notes","") or "",
+                               key=f"an_{dow}", placeholder="e.g. School pickup at 3pm", label_visibility="collapsed")
 
             rows.append({
-                "user_id":        user_id,
-                "centre_id":      centre_id,
-                "day_of_week":    dow,
-                "is_available":   is_avail,
-                "available_from": from_time.strftime("%H:%M:%S") if from_time else None,
-                "available_until":until_time.strftime("%H:%M:%S") if until_time else None,
-                "effective_from": _date.today().isoformat(),
-                "effective_until":None,
-                "notes":          st.session_state.get(f"an_{dow}", "") or None,
+                "user_id":       user_id,
+                "centre_id":     centre_id,
+                "day_of_week":   dow,
+                "is_available":  is_avail,
+                "available_from":  from_time.strftime("%H:%M:%S") if from_time else None,
+                "available_until": until_time.strftime("%H:%M:%S") if until_time else None,
+                "effective_from":  _date.today().isoformat(),
+                "effective_until": None,
+                "notes":         st.session_state.get(f"an_{dow}","") or None,
             })
 
         if st.form_submit_button("💾  Save Availability", type="primary", use_container_width=True):
@@ -565,36 +536,31 @@ def _render_leave(user_id: str, centre_id: str | None):
     st.markdown("")
 
     if not centre_id:
-        st.info(
-            "No centre assigned. Go to the **Edit** tab to assign this staff member "
-            "to a centre, then return here to manage leave."
-        )
+        st.info("No centre assigned — cannot manage leave without a centre.")
         return
 
+    # Toggle add-leave form
     lh1, lh2 = st.columns([5, 1])
     lh1.markdown("**Leave history for this staff member**")
     with lh2:
         if st.button("➕  Add Leave", key="add_leave_profile", use_container_width=True, type="primary"):
             st.session_state["show_add_leave_profile"] = not st.session_state.get("show_add_leave_profile", False)
 
+    # Add leave form
     if st.session_state.get("show_add_leave_profile"):
         with st.form("add_leave_profile_form"):
             st.markdown("**Submit leave request**")
             al1, al2 = st.columns(2)
-            leave_type = al1.selectbox(
-                "Leave type *", LEAVE_TYPE_KEYS,
-                format_func=lambda x: LEAVE_TYPES[x], key="alp_type",
-            )
+            leave_type = al1.selectbox("Leave type *", LEAVE_TYPE_KEYS,
+                                        format_func=lambda x: LEAVE_TYPES[x], key="alp_type")
             al2.markdown("")
 
             al3, al4 = st.columns(2)
             start_d = al3.date_input("Start date *", value=date.today(), key="alp_start", format="DD/MM/YYYY")
             end_d   = al4.date_input("End date *",   value=date.today(), key="alp_end",   format="DD/MM/YYYY")
 
-            reason = st.text_area(
-                "Reason", key="alp_reason", height=70,
-                placeholder="Optional — helps the manager make a decision",
-            )
+            reason = st.text_area("Reason", key="alp_reason", height=70,
+                                   placeholder="Optional — helps the manager make a decision")
 
             sc1, sc2 = st.columns(2)
             if sc1.form_submit_button("Submit Request", type="primary", use_container_width=True):
@@ -613,6 +579,7 @@ def _render_leave(user_id: str, centre_id: str | None):
             if sc2.form_submit_button("Cancel", use_container_width=True):
                 st.session_state.pop("show_add_leave_profile", None); st.rerun()
 
+    # Leave history
     try:
         leaves = fetch_leave_requests(user_id=user_id)
     except Exception as e:
@@ -622,11 +589,11 @@ def _render_leave(user_id: str, centre_id: str | None):
         st.info("No leave requests on record for this staff member.")
         return
 
-    status_icons = {"pending": "🟡", "approved": "✅", "declined": "❌", "cancelled": "⚫"}
+    status_icons = {"pending":"🟡","approved":"✅","declined":"❌","cancelled":"⚫"}
     for lv in leaves:
-        status = lv.get("status", "")
-        icon   = status_icons.get(status, "❓")
-        lt     = fmt_leave_type(lv.get("leave_type", ""))
+        status = lv.get("status","")
+        icon   = status_icons.get(status,"❓")
+        lt     = fmt_leave_type(lv.get("leave_type",""))
         sd     = fmt_date(lv.get("start_date"))
         ed     = fmt_date(lv.get("end_date"))
         reason = lv.get("reason") or "—"
@@ -634,7 +601,7 @@ def _render_leave(user_id: str, centre_id: str | None):
         try:
             ndays = workdays_between(
                 date.fromisoformat(lv["start_date"]),
-                date.fromisoformat(lv["end_date"]),
+                date.fromisoformat(lv["end_date"])
             )
         except Exception:
             ndays = "?"
@@ -647,130 +614,3 @@ def _render_leave(user_id: str, centre_id: str | None):
             st.markdown(f"**Reason:** {reason}")
             if lv.get("review_notes"):
                 st.markdown(f"**Manager's note:** {lv['review_notes']}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BREAK PREFERENCES TAB
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_break_preferences(user_id: str, centre_id: str, staff: dict):
-    """
-    Tab 5 — Weekly unpaid break opt-out preferences.
-    Managers set which weekdays this educator opts out of the unpaid meal break.
-    Paid rest breaks are always unaffected.
-    Only visible/editable when the profile has allows_unpaid_break_opt_out=True.
-    """
-    allows = bool(staff.get("allows_unpaid_break_opt_out", False))
-
-    st.markdown("### ☕ Break Preferences")
-    st.caption(
-        "Set recurring weekday preferences for the unpaid meal break opt-out. "
-        "These defaults are applied automatically when a shift is created. "
-        "The roster form can override them per shift."
-    )
-
-    if not allows:
-        st.info(
-            "This educator's profile does not currently allow unpaid break opt-out. "
-            "Enable **Allow unpaid break opt-out** in the **✏️ Edit** tab first."
-        )
-        return
-
-    st.warning(
-        "⚠️ **Confirm each opted-out day complies with the applicable award, "
-        "enterprise agreement, and employee agreement.** "
-        "Paid rest break entitlement is always retained."
-    )
-
-    # Load existing preferences
-    try:
-        existing_rows = fetch_all_break_prefs_for_user(user_id, centre_id)
-    except Exception as e:
-        st.error(f"Could not load break preferences: {e}")
-        return
-
-    # Build current {dow: bool} from most recent row per day
-    today      = date.today().isoformat()
-    current: dict[int, bool] = {}
-    for row in existing_rows:
-        dow   = row.get("day_of_week")
-        until = row.get("effective_until")
-        if dow is None or dow in current:
-            continue
-        if until and until < today:
-            continue
-        current[dow] = bool(row.get("unpaid_break_opt_out", False))
-
-    st.markdown("**Select which weekdays to opt out of the unpaid meal break:**")
-    st.caption("Paid rest break is always required regardless of these settings.")
-
-    with st.form(key="break_prefs_form"):
-        new_prefs: dict[int, bool] = {}
-        cols = st.columns(7)
-        # Mon=1 … Sat=6, Sun=0  (Python isoweekday() % 7)
-        for i, (col, (dow, day_name)) in enumerate(
-            zip(cols, [(1,"Mon"),(2,"Tue"),(3,"Wed"),(4,"Thu"),(5,"Fri"),(6,"Sat"),(0,"Sun")])
-        ):
-            full_name = DAY_NAMES.get(dow, day_name)
-            val       = current.get(dow, False)
-            new_prefs[dow] = col.checkbox(
-                full_name,
-                value=val,
-                key=f"bp_{dow}",
-            )
-
-        eff_from = st.date_input(
-            "Effective from",
-            value=date.today(),
-            key="bp_eff_from",
-            format="DD/MM/YYYY",
-            help="Preferences will apply from this date. Use today to take effect immediately.",
-        )
-        bp_notes = st.text_input(
-            "Notes (optional)",
-            placeholder="e.g. per EA clause 12.3",
-            key="bp_notes",
-        )
-
-        saved = st.form_submit_button("💾 Save Break Preferences", type="primary",
-                                       use_container_width=False)
-
-    if saved:
-        with st.spinner("Saving…"):
-            try:
-                n = upsert_break_prefs_bulk(
-                    user_id=user_id,
-                    centre_id=centre_id,
-                    prefs=new_prefs,
-                    effective_from=eff_from.isoformat(),
-                    notes=bp_notes,
-                )
-                opted_days = [DAY_NAMES.get(d,"") for d, v in new_prefs.items() if v]
-                toast_success(
-                    f"Break preferences saved for {n} day(s). "
-                    + (f"Opted out: {', '.join(opted_days)}." if opted_days else "No days opted out.")
-                )
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not save: {e}")
-
-    # ── History ────────────────────────────────────────────────────────
-    if existing_rows:
-        with st.expander("📜 Preference history", expanded=False):
-            for row in existing_rows:
-                dow      = row.get("day_of_week", "?")
-                day_name = DAY_NAMES.get(dow, str(dow))
-                opt_out  = row.get("unpaid_break_opt_out", False)
-                eff_f    = row.get("effective_from","")
-                eff_u    = row.get("effective_until","—")
-                notes    = row.get("notes","") or ""
-                st.markdown(
-                    f'<div style="font-size:0.82rem;padding:0.25rem 0;'
-                    f'border-bottom:1px solid #f0f4f8;">'
-                    f'<strong>{day_name}</strong> · '
-                    f'{"✅ Opted out" if opt_out else "❌ Not opted out"} · '
-                    f'From {eff_f} until {eff_u}'
-                    + (f' · {notes}' if notes else '')
-                    + f'</div>',
-                    unsafe_allow_html=True,
-                )
