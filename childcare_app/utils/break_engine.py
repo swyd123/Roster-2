@@ -307,51 +307,152 @@ def suggest_break_times_separate(
     return _suggest_separate(start_dt, shift_mins, paid_count, paid_dur, has_meal)
 
 
-def _suggest_combined(
-    start_dt: "datetime",
-    shift_mins: int,
+# ─────────────────────────────────────────────────────────────────────────────
+# BREAK SCHEDULING CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Hard buffer: no break may start within the first BREAK_BUFFER_HOURS of a
+# shift, and no break may end within the last BREAK_BUFFER_HOURS.
+BREAK_BUFFER_HOURS: float = 1.5
+BREAK_BUFFER_MINS:  int   = int(BREAK_BUFFER_HOURS * 60)  # 90
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BREAK SCHEDULING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def suggest_break_times(
     shift_start: str,
     shift_end: str,
+    entitlement: dict,
+) -> list[dict]:
+    """
+    Suggest ideal break times respecting:
+      - 1.5h buffer at start and end of shift
+      - eligible window = [shift_start + 1.5h, shift_end - 1.5h)
+      - combined block (preferred) or separate blocks
+
+    Combined-block rules (only when has_meal=True and unpaid NOT opted out):
+        5–7 hr tier  (paid_dur=10, paid_count=1, has_meal=True):
+            → one 40-min combined block  (10 paid + 30 unpaid)
+        7+  hr tier  (paid_dur=20, paid_count=1, has_meal=True):
+            → one 50-min combined block  (20 paid + 30 unpaid)
+
+    When unpaid is opted out (has_meal=False), only the paid rest break
+    is scheduled — no combined block.
+    """
+    shift_mins = shift_duration_minutes(shift_start, shift_end)
+    if shift_mins <= 0:
+        return []
+
+    try:
+        start_dt = datetime.strptime(shift_start[:5], "%H:%M")
+        end_dt   = datetime.strptime(shift_end[:5],   "%H:%M")
+    except Exception:
+        return []
+
+    paid_count = entitlement.get("paid_count",    0)
+    paid_dur   = entitlement.get("paid_duration",  10)
+    has_meal   = entitlement.get("has_meal",       False)
+
+    # ── Combined block tiers (only when meal break is not opted out) ───
+    if paid_count == 1 and has_meal:
+        if paid_dur == 10:
+            # 5–7 hr tier: 10 paid + 30 unpaid = 40 min combined
+            return _suggest_combined(start_dt, end_dt, shift_mins,
+                                     paid_component=10, label="40 min combined break")
+        if paid_dur == 20:
+            # 7+ hr tier: 20 paid + 30 unpaid = 50 min combined
+            return _suggest_combined(start_dt, end_dt, shift_mins,
+                                     paid_component=20, label="50 min combined break")
+
+    # ── Opt-out or legacy tiers: separate blocks ───────────────────────
+    return _suggest_separate(start_dt, end_dt, shift_mins, paid_count, paid_dur, has_meal)
+
+
+def suggest_break_times_separate(
+    shift_start: str,
+    shift_end: str,
+    entitlement: dict,
+) -> list[dict]:
+    """
+    Return separate paid-rest and meal-break suggestions unconditionally.
+    Call this as the fallback when a combined block causes a ratio issue.
+    Respects the 1.5h buffer at start and end of shift.
+    """
+    shift_mins = shift_duration_minutes(shift_start, shift_end)
+    if shift_mins <= 0:
+        return []
+    try:
+        start_dt = datetime.strptime(shift_start[:5], "%H:%M")
+        end_dt   = datetime.strptime(shift_end[:5],   "%H:%M")
+    except Exception:
+        return []
+
+    paid_count = entitlement.get("paid_count",   0)
+    paid_dur   = entitlement.get("paid_duration", 10)
+    has_meal   = entitlement.get("has_meal",      False)
+    return _suggest_separate(start_dt, end_dt, shift_mins, paid_count, paid_dur, has_meal)
+
+
+def _eligible_break_window(
+    start_dt: "datetime",
+    end_dt: "datetime",
+    break_dur: int,
+) -> tuple["datetime", "datetime"] | None:
+    """
+    Return (earliest_start, latest_end) of the eligible break window, or None
+    if the shift is too short to accommodate a break with the 1.5h buffers.
+
+    Rules:
+        earliest_start = shift_start + BREAK_BUFFER_MINS
+        latest_end     = shift_end   - BREAK_BUFFER_MINS
+        The break must fit entirely inside [earliest_start, latest_end].
+    """
+    earliest = start_dt + timedelta(minutes=BREAK_BUFFER_MINS)
+    latest   = end_dt   - timedelta(minutes=BREAK_BUFFER_MINS)
+    if earliest + timedelta(minutes=break_dur) > latest:
+        return None
+    return earliest, latest
+
+
+def _suggest_combined(
+    start_dt: "datetime",
+    end_dt: "datetime",
+    shift_mins: int,
     paid_component: int = 20,
     label: str = "50 min combined break",
 ) -> list[dict]:
     """
     Produce one combined suggestion (paid_component + 30 min unpaid).
-    Preferred window: 11:00 – (preferred_until) where preferred_until is
-    set so the full block fits before 15:00.
-    Falls back to 45% of the shift if the preferred window doesn't fit.
+
+    Placement strategy (in order of preference):
+      1. Centre of the eligible window [shift_start+1.5h, shift_end-1.5h].
+      2. If the eligible window doesn't accommodate the break, fall back to
+         the largest fitting position and emit the break anyway (the caller's
+         ratio-check will reject if it truly doesn't fit).
     """
-    combined_dur  = paid_component + 30
-    pref_from     = datetime(1900, 1, 1, 11, 0)
-    pref_until    = datetime(1900, 1, 1, 15, 0)
+    combined_dur = paid_component + 30
+    window = _eligible_break_window(start_dt, end_dt, combined_dur)
 
-    try:
-        ss_dt = datetime.strptime(shift_start[:5], "%H:%M")
-        se_dt = datetime.strptime(shift_end[:5],   "%H:%M")
-    except Exception:
-        ss_dt = start_dt
-        se_dt = start_dt + timedelta(minutes=shift_mins)
-
-    # Try to place inside 11:00–15:00
-    window_start = max(ss_dt, pref_from)
-    window_end   = min(se_dt, pref_until)
-
-    if window_start + timedelta(minutes=combined_dur) <= window_end:
-        available  = (window_end - window_start).total_seconds() / 60
-        pad        = max(0, (available - combined_dur) / 2)
-        b_start_dt = window_start + timedelta(minutes=pad)
+    if window:
+        earliest, latest = window
+        # Centre the break inside the eligible window
+        available = (latest - earliest).total_seconds() / 60
+        pad       = max(0, (available - combined_dur) / 2)
+        b_start_dt = earliest + timedelta(minutes=pad)
     else:
-        # Fallback: 45% through the shift
-        b_start_dt = start_dt + timedelta(minutes=int(shift_mins * 0.45))
+        # Shift too short to fit with full buffers — place at 45% as best effort
+        b_start_dt = start_dt + timedelta(minutes=max(BREAK_BUFFER_MINS,
+                                                       int(shift_mins * 0.45)))
 
     b_end_dt = b_start_dt + timedelta(minutes=combined_dur)
 
-    # Clamp to shift bounds
-    if b_end_dt > se_dt:
-        b_end_dt   = se_dt
+    # Hard clamp to shift bounds
+    if b_end_dt > end_dt:
+        b_end_dt   = end_dt
         b_start_dt = b_end_dt - timedelta(minutes=combined_dur)
-        if b_start_dt < ss_dt:
-            b_start_dt = ss_dt
+        if b_start_dt < start_dt:
+            b_start_dt = start_dt
 
     return [{
         "break_type":       "combined",
@@ -367,15 +468,19 @@ def _suggest_combined(
 
 def _suggest_separate(
     start_dt: "datetime",
+    end_dt: "datetime",
     shift_mins: int,
     paid_count: int,
     paid_dur: int,
     has_meal: bool,
 ) -> list[dict]:
-    """Place paid rest break(s) and meal break separately."""
+    """
+    Place paid rest break(s) and meal break separately.
+    All breaks respect the 1.5h buffer at start and end of shift.
+    """
     suggestions = []
 
-    def _mk(t, dur, btype):
+    def _mk(t: "datetime", dur: int, btype: str) -> dict:
         return {
             "break_type":       btype,
             "planned_start":    t.strftime("%H:%M:%S"),
@@ -387,17 +492,44 @@ def _suggest_separate(
             "label":            BREAK_TYPE_LABELS.get(btype, btype.title()),
         }
 
+    # ── Eligible window for any break slot ──────────────────────────
     if paid_count == 1:
-        offset = int(shift_mins * 0.40)
-        suggestions.append(_mk(start_dt + timedelta(minutes=offset), paid_dur, "rest"))
+        window = _eligible_break_window(start_dt, end_dt, paid_dur)
+        if window:
+            earliest, _ = window
+            # Place rest break at 40% through the eligible window
+            avail = (end_dt - timedelta(minutes=BREAK_BUFFER_MINS) - earliest).total_seconds() / 60
+            offset = int(avail * 0.40)
+            t = earliest + timedelta(minutes=offset)
+            suggestions.append(_mk(t, paid_dur, "rest"))
+        else:
+            # Best effort — as close to centre as possible
+            t = start_dt + timedelta(minutes=max(BREAK_BUFFER_MINS, shift_mins // 2 - paid_dur // 2))
+            suggestions.append(_mk(t, paid_dur, "rest"))
+
     elif paid_count == 2:
         for frac in [0.25, 0.65]:
-            offset = int(shift_mins * frac)
-            suggestions.append(_mk(start_dt + timedelta(minutes=offset), paid_dur, "rest"))
+            # Place each rest break, clamped into the eligible window
+            preferred_t = start_dt + timedelta(minutes=int(shift_mins * frac))
+            window = _eligible_break_window(start_dt, end_dt, paid_dur)
+            if window:
+                earliest, latest = window
+                t = max(earliest, min(preferred_t, latest - timedelta(minutes=paid_dur)))
+            else:
+                t = preferred_t
+            suggestions.append(_mk(t, paid_dur, "rest"))
 
     if has_meal:
-        offset = int(shift_mins * 0.52)
-        suggestions.append(_mk(start_dt + timedelta(minutes=offset), 30, "meal"))
+        window = _eligible_break_window(start_dt, end_dt, 30)
+        if window:
+            earliest, latest = window
+            # Place meal at 52% through the eligible window
+            avail  = (latest - earliest).total_seconds() / 60
+            offset = int(avail * 0.52)
+            t = earliest + timedelta(minutes=offset)
+        else:
+            t = start_dt + timedelta(minutes=max(BREAK_BUFFER_MINS, shift_mins // 2 - 15))
+        suggestions.append(_mk(t, 30, "meal"))
 
     return suggestions
 
