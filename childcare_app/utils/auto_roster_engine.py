@@ -578,10 +578,91 @@ def generate_roster(
 
             room_windows[rid] = _merge_slots_to_windows(req_by_slot, ivs)
 
-        # ── Step 2: Part-time/casual gap fill ─────────────────────────
-        # For each room/window, count how many full-time staff already cover
-        # each slot. Only add part-time/casual for uncovered gaps.
-        pt_ca_staff = [s for s in centre_staff if s.get("employment_type") != "full_time"]
+        # ── Step 2A: Part-time contracted hours allocation ────────────
+        # Proactively roster every available part-time educator for their
+        # remaining contracted hours BEFORE considering casual staff.
+        # This ensures PT staff are not under-rostered while casuals are used.
+        pt_staff = [s for s in centre_staff if s.get("employment_type") == "part_time"]
+
+        for s in sorted(pt_staff, key=lambda x: x.get("name", "")):
+            uid  = s["uid"]
+            name = s["name"]
+
+            if date_str in leave_map.get(uid, []):
+                continue
+            av = availability_map.get(uid, {}).get(dow)
+            if av is not None and not av.get("is_available", True):
+                continue
+
+            uid_contracted = contracted.get(uid, 0.0)
+            if uid_contracted <= 0:
+                continue  # no contracted hours — treat as casual in Step 2B
+
+            uid_weekly_hrs = weekly_hours.get(uid, 0.0)
+            remaining_hrs  = uid_contracted - uid_weekly_hrs
+            if remaining_hrs <= FT_OVERTIME_THRESHOLD_HOURS:
+                continue  # already at/over target
+
+            if av:
+                av_from  = (av.get("available_from")  or "00:00")[:5] + ":00"
+                av_until = (av.get("available_until") or "23:59")[:5] + ":00"
+            else:
+                av_from, av_until = "00:00:00", "23:59:00"
+
+            # Don't double-book if already assigned today
+            if any(sh.user_id == uid for sh in day_shifts):
+                continue
+
+            # Build a shift covering as much of their contracted hours
+            # as possible within their availability window today.
+            # Spread across FT_MIN_DAYS to approximate daily hours.
+            target_today = min(
+                remaining_hrs,
+                uid_contracted / max(FT_MIN_DAYS, 1),
+                _mins_between(av_from, av_until) / 60,
+            )
+            if target_today < (CASUAL_MIN_SHIFT_MINUTES / 60):
+                continue  # too little remaining to be worth a shift today
+
+            # Anchor to centre open window
+            shift_s = max(av_from, CENTRE_OPEN)
+            shift_e_dt = (datetime.strptime(shift_s, "%H:%M:%S")
+                          + timedelta(hours=target_today)).strftime("%H:%M:%S")
+            shift_e = min(shift_e_dt, av_until, CENTRE_CLOSE)
+
+            if _mins_between(shift_s, shift_e) < CASUAL_MIN_SHIFT_MINUTES:
+                continue
+
+            rid   = s.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
+            rname = room_map.get(rid, {}).get("name", "")
+            pref_day = break_prefs.get(uid, {}).get(dow, False)
+            override = "opted_out" if pref_day else "use_staff_default"
+
+            shift = SuggestedShift(
+                user_id=uid,
+                user_name=name,
+                room_id=rid,
+                room_name=rname,
+                shift_date=date_str,
+                start_time=shift_s,
+                end_time=shift_e,
+                shift_type=_shift_type(shift_s, shift_e),
+                break_opt_out_override=override,
+                source="part_time_contracted",
+            )
+            day_shifts.append(shift)
+            weekly_hours[uid] = uid_weekly_hrs + _mins_between(shift_s, shift_e) / 60
+
+        # ── Step 2B: Casual gap fill (ratio / attendance demand only) ────
+        # Only add casuals where ratio or attendance demand is still unmet
+        # after FT + PT contracted shifts. PT staff with no contracted hours
+        # are also placed here as needed.
+        casual_staff = [
+            s for s in centre_staff
+            if s.get("employment_type") == "casual"
+            or (s.get("employment_type") == "part_time"
+                and contracted.get(s["uid"], 0.0) <= 0)
+        ]
         assigned_gap_minutes: dict[str, int] = {}
 
         for rid, windows in room_windows.items():
@@ -593,11 +674,11 @@ def generate_roster(
                 ft_coverage_min = _count_coverage_in_window(day_shifts, rid, window)
                 gap = window.required_staff - ft_coverage_min
                 if gap <= 0:
-                    continue   # full-time base already satisfies ratio
+                    continue   # base staffing already satisfies ratio
 
-                # Find eligible part-time/casual for this room
+                # Eligible: casuals + PT-no-contract, ranked by employment type
                 eligible = _eligible_staff(
-                    pt_ca_staff, rid, date_str, dow,
+                    casual_staff, rid, date_str, dow,
                     availability_map, leave_map,
                 )
 
@@ -609,24 +690,22 @@ def generate_roster(
                     if best is None:
                         ratio_warns.append(
                             f"{rname} {window.start[:5]}–{window.end[:5]} on {date_str}: "
-                            f"gap of {gap} staff not filled — no part-time/casual available."
+                            f"gap of {gap} staff not filled — no casual/PT available."
                         )
                         if rname not in unmet_rooms:
                             unmet_rooms.append(rname)
                         break
 
-                    uid      = best["uid"]
-                    dur_mins = shift_duration_minutes(window.start, window.end)
+                    uid           = best["uid"]
+                    dur_mins      = shift_duration_minutes(window.start, window.end)
                     shift_dur_hrs = dur_mins / 60
 
-                    # Contracted-hours cap for PT/casual too
+                    # Contracted-hours cap applies even to casuals if set
                     uid_contracted = contracted.get(uid, 0.0)
                     uid_weekly_hrs = weekly_hours.get(uid, 0.0)
                     if uid_contracted > 0:
                         cap = uid_contracted + FT_OVERTIME_THRESHOLD_HOURS
                         if uid_weekly_hrs + shift_dur_hrs > cap:
-                            # Would exceed contract — try next staff member
-                            # Remove from eligible for this iteration only
                             eligible = [e for e in eligible if e["uid"] != uid]
                             best = _pick_staff(
                                 eligible, rid, date_str, window,
@@ -643,8 +722,6 @@ def generate_roster(
                             uid           = best["uid"]
                             dur_mins      = shift_duration_minutes(window.start, window.end)
                             shift_dur_hrs = dur_mins / 60
-                            uid_contracted = contracted.get(uid, 0.0)
-                            uid_weekly_hrs = weekly_hours.get(uid, 0.0)
 
                     pref_day = break_prefs.get(uid, {}).get(dow, False)
                     override = "opted_out" if pref_day else "use_staff_default"
@@ -991,14 +1068,18 @@ def generate_roster(
     ft_below_hours = ft_below_contracted
 
     # Weekly hours report — all staff (FT + PT + casual)
+    # Also produces pt_hours_report (PT-only) for the validation panel.
+    pt_hours_report:       list[dict] = []
+    pt_below_contracted:   list[str]  = []
+
     all_staff_by_uid = {s["uid"]: s for s in centre_staff}
     for uid, s in sorted(all_staff_by_uid.items(), key=lambda x: x[1].get("name", "")):
         if not any(sh.user_id == uid for sh in all_shifts):
             continue   # not rostered this period
 
-        etype   = s.get("employment_type", "full_time")
-        name    = s.get("name", uid)
-        contr   = contracted.get(uid, 0.0)
+        etype    = s.get("employment_type", "full_time")
+        name     = s.get("name", uid)
+        contr    = contracted.get(uid, 0.0)
         rostered = all_shift_hours.get(uid, 0.0)
         variance = rostered - contr if contr > 0 else 0.0
 
@@ -1011,14 +1092,32 @@ def generate_roster(
         else:
             status = "— No contract"
 
-        weekly_hours_report.append({
+        row = {
             "name":             name,
             "employment_type":  etype.replace("_", " ").title(),
             "contracted_hrs":   f"{contr:.1f}h" if contr > 0 else "—",
             "rostered_hrs":     f"{rostered:.1f}h",
             "variance":         f"{variance:+.1f}h" if contr > 0 else "—",
             "status":           status,
-        })
+        }
+        weekly_hours_report.append(row)
+
+        # Dedicated PT compliance tracking
+        if etype == "part_time":
+            compliant_pt = contr <= 0 or abs(variance) <= FT_OVERTIME_THRESHOLD_HOURS
+            pt_hours_report.append({
+                "name":            name,
+                "contracted_hrs":  f"{contr:.1f}h" if contr > 0 else "—",
+                "rostered_hrs":    f"{rostered:.1f}h",
+                "variance":        f"{variance:+.1f}h" if contr > 0 else "—",
+                "compliant":       compliant_pt,
+                "status":          status,
+            })
+            if contr > 0 and variance < -FT_OVERTIME_THRESHOLD_HOURS:
+                pt_below_contracted.append(
+                    f"{name}: rostered {rostered:.1f}h vs contracted {contr:.1f}h "
+                    f"({variance:+.1f}h). Part-time contracted hours not achieved."
+                )
 
     # Coverage gaps already in ratio_warns — extract them
     coverage_gaps    = [w for w in ratio_warns if "Coverage gap" in w]
@@ -1088,6 +1187,8 @@ def generate_roster(
         "ft_over_contracted":       ft_over_contracted,
         "over_contract_warnings":   over_contract_warns,
         "ft_allocation_report":     ft_allocation_report,
+        "pt_hours_report":          pt_hours_report,
+        "pt_below_contracted":      pt_below_contracted,
         "weekly_hours_report":      weekly_hours_report,
         "attendance_demand":        demand_rows,
         "ft_onsite_coverage":       ft_onsite_report,
