@@ -92,13 +92,78 @@ def render():
         unsafe_allow_html=True
     )
 
-    # ── Tabs ─────────────────────────────────────────────────────────
-    # Determine starting tab from session state
+    # ── Mode: edit vs overview ────────────────────────────────────────
+    # st.tabs() always opens on tab 0 regardless of any index we pass,
+    # so we cannot use it to "jump" to the Edit tab on navigation.
+    # Instead we track mode explicitly in session_state and render
+    # either the edit form or the tabbed overview depending on the flag.
     default_tab = st.session_state.pop("profile_tab", "overview")
-    tab_labels  = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave", "✏️ Edit"]
-    tab_map     = {"overview": 0, "quals": 1, "avail": 2, "leave": 3, "edit": 4}
-    start_idx   = tab_map.get(default_tab, 0)
+    edit_mode   = (default_tab == "edit") or st.session_state.get(
+        f"edit_mode_{profile_id}", False
+    )
 
+    # ── EDIT MODE ────────────────────────────────────────────────────
+    if edit_mode:
+        # Clear the flag so navigating away and back returns to overview
+        st.session_state.pop(f"edit_mode_{profile_id}", None)
+
+        st.markdown("")
+        col_cancel, _ = st.columns([1, 6])
+        if col_cancel.button("← Back to Profile", key="cancel_edit"):
+            st.session_state.page = "staff_profile"
+            st.session_state.viewing_staff_id = profile_id
+            st.rerun()
+
+        st.markdown("### ✏️ Edit Profile")
+        values = staff_form(key_prefix="edit", defaults=staff, show_role_fields=True)
+        if values:
+            with st.spinner("Saving…"):
+                try:
+                    update_staff_member(
+                        profile_id=profile_id,
+                        user_id=user_id,
+                        first_name=values["first_name"],
+                        last_name=values["last_name"],
+                        email=values["email"],
+                        phone=values["phone"],
+                        date_of_birth=values["date_of_birth"],
+                        employment_type=values["employment_type"],
+                        employment_start_date=values["employment_start_date"],
+                        employee_number=values["employee_number"],
+                        emergency_contact_name=values["emergency_contact_name"],
+                        emergency_contact_phone=values["emergency_contact_phone"],
+                        emergency_contact_relationship=values["emergency_contact_relationship"],
+                        notes=values["notes"],
+                        is_active=values["is_active"],
+                        contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
+                        allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
+                        is_responsible_person=values.get("is_responsible_person", False),
+                        is_nominated_supervisor=values.get("is_nominated_supervisor", False),
+                    )
+                    if values.get("centre_id"):
+                        upsert_centre_role(
+                            user_id=user_id,
+                            centre_id=values["centre_id"],
+                            role=values["role"],
+                            primary_room_id=values.get("primary_room_id"),
+                        )
+                    toast_success("Profile saved.")
+                    time.sleep(0.6)
+                    # Return to overview after save
+                    st.session_state.viewing_staff_id = profile_id
+                    st.session_state.pop("editing_staff_id", None)
+                    st.session_state.page = "staff_profile"
+                    st.rerun()
+                except Exception as e:
+                    err = str(e)
+                    if "duplicate" in err.lower():
+                        toast_error(f"Email {values['email']} is already in use.")
+                    else:
+                        toast_error(f"Could not save: {err}")
+        return  # don't render tabs below
+
+    # ── OVERVIEW / TABBED MODE ────────────────────────────────────────
+    tab_labels = ["📋 Overview", "🎓 Qualifications", "📅 Availability", "🏖️ Leave"]
     tabs = st.tabs(tab_labels)
 
     # ════════════════════════════════════════════════════════════════
@@ -106,6 +171,14 @@ def render():
     # ════════════════════════════════════════════════════════════════
     with tabs[0]:
         st.markdown("")
+
+        # Edit Profile button — top of Overview
+        if st.button("✏️  Edit Profile", key="edit_from_overview"):
+            st.session_state[f"edit_mode_{profile_id}"] = True
+            st.session_state.editing_staff_id = profile_id
+            st.session_state.page = "staff_profile"
+            st.rerun()
+
         col_a, col_b = st.columns(2)
 
         with col_a:
@@ -178,54 +251,6 @@ def render():
     # ════════════════════════════════════════════════════════════════
     with tabs[3]:
         _render_leave(user_id, centre_id)
-
-    # ════════════════════════════════════════════════════════════════
-    # TAB 5 — Edit
-    # ════════════════════════════════════════════════════════════════
-    with tabs[4]:
-        st.markdown("")
-        values = staff_form(key_prefix="edit", defaults=staff, show_role_fields=True)
-        if values:
-            with st.spinner("Saving…"):
-                try:
-                    update_staff_member(
-                        profile_id=profile_id,
-                        user_id=user_id,
-                        first_name=values["first_name"],
-                        last_name=values["last_name"],
-                        email=values["email"],
-                        phone=values["phone"],
-                        date_of_birth=values["date_of_birth"],
-                        employment_type=values["employment_type"],
-                        employment_start_date=values["employment_start_date"],
-                        employee_number=values["employee_number"],
-                        emergency_contact_name=values["emergency_contact_name"],
-                        emergency_contact_phone=values["emergency_contact_phone"],
-                        emergency_contact_relationship=values["emergency_contact_relationship"],
-                        notes=values["notes"],
-                        is_active=values["is_active"],
-                        contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
-                        allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
-                        is_responsible_person=values.get("is_responsible_person", False),
-                        is_nominated_supervisor=values.get("is_nominated_supervisor", False),
-                    )
-                    # Also update centre role assignment if provided
-                    if values.get("centre_id"):
-                        upsert_centre_role(
-                            user_id=user_id,
-                            centre_id=values["centre_id"],
-                            role=values["role"],
-                            primary_room_id=values.get("primary_room_id"),
-                        )
-                    toast_success("Profile saved.")
-                    time.sleep(0.6)
-                    st.rerun()
-                except Exception as e:
-                    err = str(e)
-                    if "duplicate" in err.lower():
-                        toast_error(f"Email {values['email']} is already in use.")
-                    else:
-                        toast_error(f"Could not save: {err}")
 
 
 # ── Helper: detail row ────────────────────────────────────────────────────────
