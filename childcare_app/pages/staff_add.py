@@ -7,7 +7,6 @@ from components.staff_form import staff_form
 
 
 def render():
-    # ── Header ───────────────────────────────────────────────────────
     bc, tc = st.columns([1, 8])
     with bc:
         st.markdown('<div class="back-btn">', unsafe_allow_html=True)
@@ -46,6 +45,7 @@ def render():
                     emergency_contact_relationship=values["emergency_contact_relationship"],
                     notes=values["notes"],
                     contracted_hours_per_week=values.get("contracted_hours_per_week", 0.0),
+                    allows_unpaid_break_opt_out=values.get("allows_unpaid_break_opt_out", False),
                     is_responsible_person=values.get("is_responsible_person", False),
                     is_nominated_supervisor=values.get("is_nominated_supervisor", False),
                 )
