@@ -791,22 +791,44 @@ def generate_roster(
 
             shift_key = f"{uid}_{date_str}"
 
+            # Pre-compute the 1.5h buffer eligibility window for this shift
+            from utils.break_engine import BREAK_BUFFER_MINS as _BBM
+            try:
+                _ss_dt = datetime.strptime(ss[:5], "%H:%M")
+                _se_dt = datetime.strptime(se[:5], "%H:%M")
+            except Exception:
+                _ss_dt = _se_dt = None
+
             for sug in suggestions:
                 btype    = sug["break_type"]
                 b_dur    = sug["duration_minutes"]
                 b_start  = sug["planned_start"][:8]
                 b_end    = sug["planned_end"][:8]
 
-                # Prefer combined/meal breaks 11:00–15:00
-                if btype in ("meal", "combined"):
-                    b_start, b_end = _shift_break_to_window(
-                        b_start, b_end, b_dur, ss, se, "11:00:00", "15:00:00"
-                    )
+                # Compute and enforce the 1.5h buffer window
+                if _ss_dt and _se_dt:
+                    _earliest = (_ss_dt + timedelta(minutes=_BBM)).strftime("%H:%M:%S")
+                    _latest   = (_se_dt - timedelta(minutes=_BBM)).strftime("%H:%M:%S")
+                else:
+                    _earliest = ss
+                    _latest   = se
+
+                # Clamp b_start into [_earliest, _latest - b_dur]
+                if b_start < _earliest:
+                    b_start = _earliest
+                    b_end = (datetime.strptime(b_start, "%H:%M:%S")
+                             + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
+                _latest_start = (datetime.strptime(_latest, "%H:%M:%S")
+                                 - timedelta(minutes=b_dur)).strftime("%H:%M:%S")
+                if b_start > _latest_start:
+                    b_start = _latest_start
+                    b_end = (datetime.strptime(b_start, "%H:%M:%S")
+                             + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
 
                 # Hard clamp against existing educator breaks
                 for ex_s, ex_e, _ in breaks_by_user.get(uid, []):
                     if _overlaps(b_start, b_end, ex_s, ex_e):
-                        if ex_e < se:
+                        if ex_e < _latest:
                             b_start = ex_e
                             b_end   = (datetime.strptime(b_start[:8], "%H:%M:%S")
                                        + timedelta(minutes=b_dur)).strftime("%H:%M:%S")
@@ -822,9 +844,9 @@ def generate_roster(
                 cover_used: SuggestedMovement | None = None
 
                 if conflict == "breach":
-                    # Try alternate window (also centre-aware)
+                    # Try alternate window within the 1.5h buffer zone
                     alt_s, alt_e, alt_conflict = _find_alt_break_window(
-                        ss, se, b_dur, rid, uid,
+                        _earliest, _latest, b_dur, rid, uid,
                         room_coverage, breaks_by_room, breaks_by_user,
                         r_staff, r_child, cover_delta, room_map,
                     )
@@ -857,13 +879,27 @@ def generate_roster(
                             cover_used = cover_mv
 
                 # Build debug log entry
+                overlap_with = [
+                    f"{s.user_name} ({ex_s[:5]}–{ex_e[:5]})"
+                    for ex_s, ex_e, _ in breaks_by_user.get(uid, [])
+                    if _overlaps(b_start, b_end, ex_s, ex_e) and ex_s != b_start
+                ] + [
+                    f"room overlap {ex_s[:5]}–{ex_e[:5]}"
+                    for ex_s, ex_e in breaks_by_room.get(rid, [])
+                    if _overlaps(b_start, b_end, ex_s, ex_e)
+                ]
                 day_debug_log.append({
-                    "educator":      shift.user_name,
-                    "date":          date_str,
-                    "proposed_start": b_start[:5],
-                    "proposed_end":   b_end[:5],
-                    "room":          shift.room_name,
-                    "break_type":    btype,
+                    "educator":            shift.user_name,
+                    "date":                date_str,
+                    "shift_start":         ss[:5],
+                    "shift_end":           se[:5],
+                    "earliest_allowable":  _earliest[:5],
+                    "latest_allowable":    _latest[:5],
+                    "proposed_start":      b_start[:5],
+                    "proposed_end":        b_end[:5],
+                    "room":                shift.room_name,
+                    "break_type":          btype,
+                    "overlap":             "Yes" if overlap_with else "No",
                     "centre_staff_before": dbg.get("centre_staff_before", "—"),
                     "centre_staff_after":  dbg.get("centre_staff_after",  "—"),
                     "centre_required":     dbg.get("centre_required",     "—"),
