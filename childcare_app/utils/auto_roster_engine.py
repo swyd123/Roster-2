@@ -180,11 +180,6 @@ def generate_roster(
     for _i, _s in enumerate(sorted(ft_staff_period, key=lambda x: x.get("name", ""))):
         ft_pattern_idx[_s["uid"]] = (_i * _half_patterns) % len(FT_SHIFT_PATTERNS)
 
-    # Shifts created by the "FT day-coverage correction pass" — tracked so the
-    # post-week hours-balancing pass can reassign them to a less-allocated
-    # FT educator if doing so improves balance toward contracted hours.
-    day_coverage_shifts: list[SuggestedShift] = []
-
     # Per-slot Responsible Person / Nominated Supervisor onsite coverage
     rpns_onsite_report: list[dict] = []
 
@@ -199,16 +194,12 @@ def generate_roster(
         day_shifts: list[SuggestedShift] = []
 
         # ── Step 1A: Full-time base shifts ────────────────────────────
-        # HARD CONSTRAINT: every available full-time educator MUST receive
-        # a shift on this day unless they are on leave or explicitly unavailable.
-        # Priority order within each day:
-        #   1. Assign opener (start ≤ 07:15)
-        #   2. Assign closer (end ≥ 18:00)
-        #   3. Assign remaining FT staff standard shifts
-        # Contract cap only applies AFTER FT_MIN_DAYS are already satisfied.
+        # Allocate every available full-time educator toward their
+        # contracted weekly hours (default 38h). Contract cap is applied
+        # after FT_MIN_DAYS are satisfied.
+        # FT staff are NOT required to cover every operating interval —
+        # RP/NS coverage (Step 3 below) is the hard onsite constraint.
         ft_staff = [s for s in centre_staff if s.get("employment_type") == "full_time"]
-        ft_openers_today:  list[str] = []   # uids with opening shift this day
-        ft_closers_today:  list[str] = []   # uids with closing shift this day
 
         for s in sorted(ft_staff, key=lambda x: x.get("name", "")):
             uid  = s["uid"]
@@ -340,177 +331,12 @@ def generate_roster(
             ft_pattern_idx[uid]    = (chosen_idx + 1) % len(FT_SHIFT_PATTERNS)
             weekly_hours[uid]      = uid_weekly_hrs + shift_dur_hrs
 
-            # Track opening/closing for coverage validation
-            if ss <= CENTRE_OPEN:
-                ft_openers_today.append(uid)
-            if se >= CENTRE_CLOSE:
-                ft_closers_today.append(uid)
+        # ── Step 1A-correction: RP/NS coverage already handled below ──────
+        # FT onsite coverage is NO LONGER a hard constraint.
+        # RP/NS onsite coverage (7:15–18:00) IS the hard constraint.
+        # See _correct_rpns_coverage call after Step 1B.
 
-        # ── New: FT day-coverage correction pass ──────────────────────
-        # With the 38h/week model, Step 1A may legitimately skip an FT
-        # educator on a day once they've reached FT_MIN_DAYS and their
-        # weekly target. If that means NO FT educator was rostered today
-        # at all, the "≥1 FT onsite at all times" hard constraint would be
-        # violated. Fix: promote whichever available FT educator is
-        # furthest below their weekly target to a full-day shift — this
-        # may push them over contract, which is an accepted trade-off for
-        # centre coverage.
-        ft_today = [s for s in day_shifts if s.source == "full_time_base"]
-
-        if not ft_today and ft_staff:
-            available_today = []
-            for s in ft_staff:
-                uid = s["uid"]
-                if date_str in leave_map.get(uid, []):
-                    continue
-                av = availability_map.get(uid, {}).get(dow)
-                if av is not None and not av.get("is_available", True):
-                    continue
-                available_today.append(s)
-
-            if available_today:
-                chosen = min(available_today, key=lambda s: weekly_hours.get(s["uid"], 0.0))
-                uid  = chosen["uid"]
-                name = chosen["name"]
-                av   = availability_map.get(uid, {}).get(dow)
-                av_from  = (av.get("available_from")  or "00:00")[:5] + ":00" if av else "00:00:00"
-                av_until = (av.get("available_until") or "23:59")[:5] + ":00" if av else "23:59:00"
-
-                full_s, full_e = FT_FULL_DAY_PATTERN
-                ss = max(full_s, av_from)
-                se = min(full_e, av_until)
-
-                if _mins_between(ss, se) > 0:
-                    shift_dur_hrs  = _mins_between(ss, se) / 60
-                    uid_contracted = contracted.get(uid, 0.0) or FT_TARGET_WEEKLY_HOURS
-                    uid_weekly_hrs = weekly_hours.get(uid, 0.0)
-                    new_total      = uid_weekly_hrs + shift_dur_hrs
-                    over_by        = new_total - uid_contracted
-
-                    pref_day = break_prefs.get(uid, {}).get(dow, False)
-                    override = "opted_out" if pref_day else "use_staff_default"
-                    rid      = chosen.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
-                    rname    = room_map.get(rid, {}).get("name", "")
-
-                    shift = SuggestedShift(
-                        user_id=uid, user_name=name, room_id=rid, room_name=rname,
-                        shift_date=date_str, start_time=ss, end_time=se,
-                        shift_type=_shift_type(ss, se),
-                        break_opt_out_override=override,
-                        source="full_time_base",
-                    )
-                    day_shifts.append(shift)
-                    day_coverage_shifts.append(shift)
-                    ft_rostered_days[uid] = ft_rostered_days.get(uid, 0) + 1
-                    weekly_hours[uid]     = new_total
-
-                    over_note = (
-                        f" (exceeds their {uid_contracted:.1f}h weekly target by {over_by:.1f}h)"
-                        if over_by > FT_OVERTIME_THRESHOLD_HOURS else ""
-                    )
-                    corrections_log.append({
-                        "date": date_str,
-                        "violation": "No full-time staff would be rostered this day "
-                                      "(all FT staff at/near weekly target)",
-                        "action": f"Added {date_str} {ss[:5]}–{se[:5]} shift for {name} "
-                                  f"to maintain full-time onsite coverage{over_note}.",
-                    })
-                    ft_today = [s for s in day_shifts if s.source == "full_time_base"]
-
-        # ── Step 1A-correction: FT onsite coverage 07:15–18:00 ─────────
-        # HARD CONSTRAINT: at least one full-time educator must be onsite
-        # for EVERY 15-min slot from CENTRE_OPEN to CENTRE_CLOSE.
-        #
-        # Because every FT_SHIFT_PATTERNS entry starts ≤ 08:00 and ends
-        # ≥ 17:15, and the centre window is 07:15–18:00, any coverage gap
-        # in the FT-only union can only occur at the two edges:
-        #   - opening gap: [CENTRE_OPEN, earliest FT start)
-        #   - closing gap: (latest FT end, CENTRE_CLOSE]
-        # Fix by extending the educator whose shift defines that edge,
-        # if their availability permits — this overrides the contracted
-        # hours cap because centre coverage is a higher-priority constraint.
-        if not ft_today:
-            ratio_warns.append(
-                f"CRITICAL: No full-time staff available onsite for "
-                f"{CENTRE_OPEN[:5]}–{CENTRE_CLOSE[:5]} on {date_str} "
-                "— no full-time educator rostered this day."
-            )
-        else:
-            earliest_start = min(s.start_time for s in ft_today)
-            latest_end     = max(s.end_time   for s in ft_today)
-
-            # ── Opening gap ────────────────────────────────────────────
-            if earliest_start > CENTRE_OPEN:
-                tied = [s for s in ft_today if s.start_time == earliest_start]
-                # Balance hours: if multiple FT shifts share this edge,
-                # extend whichever educator currently has the LOWEST
-                # weekly hours (furthest below their target).
-                target = min(tied, key=lambda s: weekly_hours.get(s.user_id, 0.0))
-                uid    = target.user_id
-                av     = availability_map.get(uid, {}).get(dow)
-                av_from = (av.get("available_from") or "00:00")[:5] + ":00" if av else "00:00:00"
-
-                if av_from <= CENTRE_OPEN:
-                    extra_hrs = _mins_between(CENTRE_OPEN, earliest_start) / 60
-                    old_start = target.start_time
-                    target.start_time = CENTRE_OPEN
-                    target.shift_type = _shift_type(target.start_time, target.end_time)
-                    weekly_hours[uid] = weekly_hours.get(uid, 0.0) + extra_hrs
-                    corrections_log.append({
-                        "date":      date_str,
-                        "violation": f"FT onsite coverage gap {CENTRE_OPEN[:5]}–{old_start[:5]}",
-                        "action":    f"Extended {target.user_name}'s shift start from "
-                                      f"{old_start[:5]} to {CENTRE_OPEN[:5]}.",
-                    })
-                else:
-                    ratio_warns.append(
-                        f"CRITICAL: No full-time staff available onsite for "
-                        f"{CENTRE_OPEN[:5]}–{earliest_start[:5]} on {date_str}."
-                    )
-
-            # ── Closing gap ────────────────────────────────────────────
-            if latest_end < CENTRE_CLOSE:
-                tied = [s for s in ft_today if s.end_time == latest_end]
-                target = min(tied, key=lambda s: weekly_hours.get(s.user_id, 0.0))
-                uid    = target.user_id
-                av     = availability_map.get(uid, {}).get(dow)
-                av_until = (av.get("available_until") or "23:59")[:5] + ":00" if av else "23:59:00"
-
-                if av_until >= CENTRE_CLOSE:
-                    extra_hrs = _mins_between(latest_end, CENTRE_CLOSE) / 60
-                    old_end = target.end_time
-                    target.end_time   = CENTRE_CLOSE
-                    target.shift_type = _shift_type(target.start_time, target.end_time)
-                    weekly_hours[uid] = weekly_hours.get(uid, 0.0) + extra_hrs
-                    corrections_log.append({
-                        "date":      date_str,
-                        "violation": f"FT onsite coverage gap {old_end[:5]}–{CENTRE_CLOSE[:5]}",
-                        "action":    f"Extended {target.user_name}'s shift end from "
-                                      f"{old_end[:5]} to {CENTRE_CLOSE[:5]}.",
-                    })
-                else:
-                    ratio_warns.append(
-                        f"CRITICAL: No full-time staff available onsite for "
-                        f"{latest_end[:5]}–{CENTRE_CLOSE[:5]} on {date_str}."
-                    )
-
-        # ── Recompute opening/closing coverage AFTER onsite correction ──
-        ft_openers_today = [s.user_id for s in day_shifts
-                             if s.source == "full_time_base" and s.start_time <= CENTRE_OPEN]
-        ft_closers_today = [s.user_id for s in day_shifts
-                             if s.source == "full_time_base" and s.end_time >= CENTRE_CLOSE]
-
-        # Critical warnings for missing opener/closer
-        if not ft_openers_today and ft_staff:
-            ratio_warns.append(
-                f"CRITICAL: No full-time educator available for opening coverage on {date_str}."
-            )
-        if not ft_closers_today and ft_staff:
-            ratio_warns.append(
-                f"CRITICAL: No full-time educator available for closing coverage on {date_str}."
-            )
-
-        # ── Per-slot FT onsite coverage report (for validation) ─────────
+        # ── Per-slot FT onsite report (informational only) ─────────────────
         ft_today = [s for s in day_shifts if s.source == "full_time_base"]
         slot_dt  = datetime.strptime(CENTRE_OPEN,  "%H:%M:%S")
         close_dt = datetime.strptime(CENTRE_CLOSE, "%H:%M:%S")
@@ -1157,10 +983,24 @@ def generate_roster(
 
     # Coverage gaps already in ratio_warns — extract them
     coverage_gaps    = [w for w in ratio_warns if "Coverage gap" in w]
-    ft_onsite_warns  = [w for w in ratio_warns if "onsite for" in w]
+    manual_reviews   = [w for w in ratio_warns if "Manual review required" in w]
+    rpns_warns       = [w for w in ratio_warns
+                        if "Responsible Person/Nominated Supervisor" in w
+                        or "No Responsible Person" in w]
+    # FT onsite warnings kept as informational (no longer a hard constraint).
+    # They contain "full-time" but not "Responsible Person", so filter precisely.
+    ft_onsite_warns  = [w for w in ratio_warns
+                        if "full-time" in w.lower()
+                        and "onsite" in w.lower()
+                        and "Responsible Person" not in w
+                        and "Coverage gap" not in w
+                        and "Manual review" not in w]
     ratio_breaches   = [
         w for w in ratio_warns
-        if "Coverage gap" not in w and "onsite for" not in w
+        if w not in coverage_gaps
+        and w not in manual_reviews
+        and w not in rpns_warns
+        and w not in ft_onsite_warns
     ]
 
     pt_hours = sum(
@@ -1211,8 +1051,6 @@ def generate_roster(
                     "status":   "✅ OK" if delta >= 0 else f"❌ Shortfall {delta}",
                 })
 
-    rpns_warns = [w for w in ratio_warns if "Responsible Person/Nominated Supervisor" in w]
-
     validation = {
         "centre_coverage_achieved": len(coverage_gaps) == 0,
         "uncovered_intervals":      coverage_gaps,
@@ -1222,14 +1060,16 @@ def generate_roster(
         "ft_below_contracted":      ft_below_contracted,
         "ft_over_contracted":       ft_over_contracted,
         "over_contract_warnings":   over_contract_warns,
+        "manual_review_items":      manual_reviews,
         "ft_allocation_report":     ft_allocation_report,
         "pt_hours_report":          pt_hours_report,
         "pt_below_contracted":      pt_below_contracted,
         "weekly_hours_report":      weekly_hours_report,
         "attendance_demand":        demand_rows,
+        # FT onsite — informational only, no longer a hard constraint
         "ft_onsite_coverage":       ft_onsite_report,
-        "ft_onsite_violations":     ft_onsite_warns,
-        "ft_onsite_achieved":       len(ft_onsite_warns) == 0,
+        "ft_onsite_info":           ft_onsite_warns,
+        # RP/NS — primary hard constraint
         "rpns_onsite_coverage":     rpns_onsite_report,
         "rpns_onsite_violations":   rpns_warns,
         "rpns_onsite_achieved":     len(rpns_warns) == 0,
@@ -1780,6 +1620,24 @@ def _correct_rpns_coverage(
                 if overlap:
                     continue
 
+                # Check contracted hours — do NOT automatically exceed contract.
+                uid_contracted = contracted.get(uid, 0.0)
+                uid_weekly_hrs = weekly_hours.get(uid, 0.0)
+                seg_dur_hrs    = _mins_between(seg_s, seg_e) / 60
+                if uid_contracted > 0:
+                    new_total = uid_weekly_hrs + seg_dur_hrs
+                    over_by   = new_total - uid_contracted
+                    if over_by > FT_OVERTIME_THRESHOLD_HOURS:
+                        # Flag for manual review rather than silently exceeding contract
+                        ratio_warns.append(
+                            f"Manual review required: {cand['name']} contracted "
+                            f"{uid_contracted:.1f}h/week — adding RP/NS coverage shift "
+                            f"{seg_s[:5]}–{seg_e[:5]} on {date_str} would bring total to "
+                            f"{new_total:.1f}h (+{over_by:.1f}h). "
+                            f"Assign a casual RP/NS or approve overtime manually."
+                        )
+                        continue  # try next candidate
+
                 pref_day = break_prefs.get(uid, {}).get(dow, False)
                 override = "opted_out" if pref_day else "use_staff_default"
                 rid      = cand.get("primary_room_id") or (rooms[0]["id"] if rooms else "")
@@ -1793,7 +1651,7 @@ def _correct_rpns_coverage(
                     source="rpns_coverage",
                 )
                 day_shifts.append(new_shift)
-                weekly_hours[uid] = weekly_hours.get(uid, 0.0) + _mins_between(seg_s, seg_e) / 60
+                weekly_hours[uid] = weekly_hours.get(uid, 0.0) + seg_dur_hrs
 
                 role_label = "Nominated Supervisor" if cand.get("is_nominated_supervisor") else "Responsible Person"
                 corrections_log.append({
