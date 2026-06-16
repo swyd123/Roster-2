@@ -23,42 +23,122 @@ def _one(resp) -> Optional[dict]:
 # STAFF — core list & profile
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
+    """
+    Fetch user_centre_roles for a list of user_ids.
+    Returns {user_id: [role_row, ...]} mapping.
+
+    Fetches centres and rooms as separate lookups then merges in Python,
+    because user_centre_roles has no direct FK to staff_profiles.
+    """
+    if not user_ids:
+        return {}
+
+    roles = (
+        sb.from_("user_centre_roles")
+        .select(
+            "user_id, role, primary_room_id, centre_id, is_active"
+        )
+        .in_("user_id", user_ids)
+        .is_("deleted_at", "null")
+        .execute()
+    ).data or []
+
+    if not roles:
+        return {}
+
+    # Fetch centres
+    centre_ids = list({r["centre_id"] for r in roles if r.get("centre_id")})
+    centres_map: dict[str, dict] = {}
+    if centre_ids:
+        centres_rows = (
+            sb.from_("centres")
+            .select("id, name")
+            .in_("id", centre_ids)
+            .execute()
+        ).data or []
+        centres_map = {c["id"]: c for c in centres_rows}
+
+    # Fetch rooms
+    room_ids = list({r["primary_room_id"] for r in roles if r.get("primary_room_id")})
+    rooms_map: dict[str, dict] = {}
+    if room_ids:
+        rooms_rows = (
+            sb.from_("rooms")
+            .select("id, name")
+            .in_("id", room_ids)
+            .execute()
+        ).data or []
+        rooms_map = {r["id"]: r for r in rooms_rows}
+
+    # Attach nested dicts and group by user_id
+    result: dict[str, list[dict]] = {}
+    for role in roles:
+        role["centres"] = centres_map.get(role.get("centre_id", ""), {})
+        role["rooms"]   = rooms_map.get(role.get("primary_room_id", ""), {})
+        uid = role["user_id"]
+        result.setdefault(uid, []).append(role)
+
+    return result
+
+
 def fetch_all_staff() -> list[dict]:
-    """All active staff for this organisation with user + role data."""
+    """
+    All active staff for this organisation with user + role data.
+
+    Uses two queries and merges in Python to avoid the invalid
+    staff_profiles → user_centre_roles join (no direct FK exists;
+    both tables hang off users).
+    """
     sb     = get_supabase_client()
     org_id = get_organisation_id()
 
-    resp = (
+    # Query 1 — staff profiles + user accounts (valid FK: staff_profiles.user_id → users.id)
+    profiles = (
         sb.from_("staff_profiles")
         .select(
-            "id, employee_number, employment_type, employment_start_date,"
+            "id, user_id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, notes, organisation_id, allows_unpaid_break_opt_out,"
             "contracted_hours_per_week, is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active, created_at"
-            "),"
-            "user_centre_roles!user_centre_roles_user_id_fkey("
-            "  role, primary_room_id, centre_id, is_active,"
-            "  centres!user_centre_roles_centre_id_fkey(id, name),"
-            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("organisation_id", org_id)
         .is_("deleted_at", "null")
         .order("id")
         .execute()
-    )
-    return resp.data or []
+    ).data or []
+
+    if not profiles:
+        return []
+
+    # Query 2 — roles for those users (keyed by user_id, no FK to staff_profiles)
+    user_ids  = [p["user_id"] for p in profiles if p.get("user_id")]
+    roles_map = _fetch_roles_for_users(sb, user_ids)
+
+    # Merge: attach user_centre_roles list onto each profile
+    for profile in profiles:
+        uid = profile.get("user_id") or (profile.get("users") or {}).get("id", "")
+        profile["user_centre_roles"] = roles_map.get(uid, [])
+
+    return profiles
 
 
 def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
-    """Full record for one staff member including qualifications summary."""
+    """
+    Full record for one staff member.
+
+    Same two-query pattern as fetch_all_staff to avoid the invalid
+    staff_profiles → user_centre_roles join.
+    """
     sb = get_supabase_client()
 
-    resp = (
+    # Query 1 — profile + user
+    profile = _one(
         sb.from_("staff_profiles")
         .select(
-            "id, employee_number, employment_type, employment_start_date,"
+            "id, user_id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, date_of_birth, super_fund_name, super_member_number,"
             "emergency_contact_name, emergency_contact_phone,"
             "emergency_contact_relationship, notes, organisation_id,"
@@ -66,11 +146,6 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
             "is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active"
-            "),"
-            "user_centre_roles!user_centre_roles_user_id_fkey("
-            "  role, primary_room_id, centre_id, is_active,"
-            "  centres!user_centre_roles_centre_id_fkey(id, name),"
-            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("id", profile_id)
@@ -78,7 +153,16 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
         .limit(1)
         .execute()
     )
-    return _one(resp)
+
+    if not profile:
+        return None
+
+    # Query 2 — roles for this user
+    uid       = profile.get("user_id") or (profile.get("users") or {}).get("id", "")
+    roles_map = _fetch_roles_for_users(sb, [uid]) if uid else {}
+    profile["user_centre_roles"] = roles_map.get(uid, [])
+
+    return profile
 
 
 # ─────────────────────────────────────────────────────────────────────────────
