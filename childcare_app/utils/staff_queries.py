@@ -8,53 +8,15 @@ from utils.supabase_client import get_supabase_client, get_organisation_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTERNAL HELPERS
+# helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _one(resp) -> Optional[dict]:
-    """
-    Return the first row from a query response, or None.
-    Replaces .single() which is not available on SyncQueryRequestBuilder.
-    """
-    data = resp.data
-    if not data:
-        return None
-    return data[0] if isinstance(data, list) else data
-
-
-def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
-    """
-    Fetch user_centre_roles rows for a list of user_ids, joined to centres
-    and rooms. Returns a dict keyed by user_id.
-
-    WHY A SEPARATE QUERY?
-    PostgREST can only traverse real foreign-key relationships in a single
-    select. There is no direct FK between staff_profiles and user_centre_roles
-    — they are both children of users. Querying
-        staff_profiles → user_centre_roles
-    fails with PGRST200. The solution is to query user_centre_roles directly,
-    filtering by the set of user_ids we already have from staff_profiles.
-    """
-    if not user_ids:
-        return {}
-
-    rows = (
-        sb.from_("user_centre_roles")
-        .select(
-            "id, user_id, role, primary_room_id, centre_id, is_active,"
-            "centres!user_centre_roles_centre_id_fkey(id, name),"
-            "rooms!user_centre_roles_primary_room_id_fkey(id, name)"
-        )
-        .in_("user_id", user_ids)
-        .is_("deleted_at", "null")
-        .execute()
-    ).data or []
-
-    result: dict[str, list[dict]] = {}
-    for row in rows:
-        uid = row["user_id"]
-        result.setdefault(uid, []).append(row)
-    return result
+    """Return the first row from a Supabase response, or None."""
+    data = resp.data if hasattr(resp, "data") else resp
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data or None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,18 +24,11 @@ def _fetch_roles_for_users(sb, user_ids: list[str]) -> dict[str, list[dict]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_all_staff() -> list[dict]:
-    """
-    All active staff for this organisation with user + role data.
-
-    Uses two queries and merges in Python to avoid the invalid
-    staff_profiles → user_centre_roles join (no direct FK exists;
-    both tables hang off users).
-    """
+    """All active staff for this organisation with user + role data."""
     sb     = get_supabase_client()
     org_id = get_organisation_id()
 
-    # Query 1 — staff profiles + user accounts (valid FK: staff_profiles.user_id → users.id)
-    profiles = (
+    resp = (
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
@@ -81,49 +36,41 @@ def fetch_all_staff() -> list[dict]:
             "contracted_hours_per_week, is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active, created_at"
+            "),"
+            "user_centre_roles!user_centre_roles_user_id_fkey("
+            "  role, primary_room_id, centre_id, is_active,"
+            "  centres!user_centre_roles_centre_id_fkey(id, name),"
+            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("organisation_id", org_id)
         .is_("deleted_at", "null")
         .order("id")
         .execute()
-    ).data or []
-
-    if not profiles:
-        return []
-
-    # Query 2 — roles for those users (valid FK: user_centre_roles.user_id → users.id)
-    user_ids  = [p["users"]["id"] for p in profiles if p.get("users")]
-    roles_map = _fetch_roles_for_users(sb, user_ids)
-
-    # Merge: attach user_centre_roles list onto each profile using the shared user_id
-    for profile in profiles:
-        uid = (profile.get("users") or {}).get("id")
-        profile["user_centre_roles"] = roles_map.get(uid, [])
-
-    return profiles
+    )
+    return resp.data or []
 
 
 def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
-    """
-    Full record for one staff member.
-
-    Same two-query pattern as fetch_all_staff to avoid the invalid
-    staff_profiles → user_centre_roles join.
-    """
+    """Full record for one staff member including qualifications summary."""
     sb = get_supabase_client()
 
-    # Query 1 — profile + user
-    profile = _one(
+    resp = (
         sb.from_("staff_profiles")
         .select(
             "id, employee_number, employment_type, employment_start_date,"
             "employment_end_date, date_of_birth, super_fund_name, super_member_number,"
             "emergency_contact_name, emergency_contact_phone,"
-            "emergency_contact_relationship, notes, organisation_id, allows_unpaid_break_opt_out,"
-            "contracted_hours_per_week, is_responsible_person, is_nominated_supervisor,"
+            "emergency_contact_relationship, notes, organisation_id,"
+            "allows_unpaid_break_opt_out, contracted_hours_per_week,"
+            "is_responsible_person, is_nominated_supervisor,"
             "users!staff_profiles_user_id_fkey("
             "  id, first_name, last_name, email, phone, is_active"
+            "),"
+            "user_centre_roles!user_centre_roles_user_id_fkey("
+            "  role, primary_room_id, centre_id, is_active,"
+            "  centres!user_centre_roles_centre_id_fkey(id, name),"
+            "  rooms!user_centre_roles_primary_room_id_fkey(id, name)"
             ")"
         )
         .eq("id", profile_id)
@@ -131,16 +78,7 @@ def fetch_staff_by_id(profile_id: str) -> Optional[dict]:
         .limit(1)
         .execute()
     )
-
-    if not profile:
-        return None
-
-    # Query 2 — roles
-    uid = (profile.get("users") or {}).get("id")
-    roles_map = _fetch_roles_for_users(sb, [uid]) if uid else {}
-    profile["user_centre_roles"] = roles_map.get(uid, [])
-
-    return profile
+    return _one(resp)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,28 +94,14 @@ def create_staff_member(
     emergency_contact_name: str, emergency_contact_phone: str,
     emergency_contact_relationship: str, notes: str,
     contracted_hours_per_week: float = 0.0,
+    allows_unpaid_break_opt_out: bool = False,
     is_responsible_person: bool = False,
     is_nominated_supervisor: bool = False,
 ) -> dict:
-    """
-    Create a staff member in three steps:
-      1. Insert a row into users
-      2. Insert a row into staff_profiles
-      3. Insert a row into user_centre_roles (required — centre_id must be provided)
-
-    Raises ValueError if any step fails, with a message describing which step.
-    """
-    if not centre_id:
-        raise ValueError(
-            "Centre assignment is required. Please select a centre before saving."
-        )
-    if not role:
-        raise ValueError("Role is required. Please select a role for this staff member.")
-
     sb     = get_supabase_client()
     org_id = get_organisation_id()
 
-    # Step 1 — create user account
+    # 1 — create user account
     u = _one(
         sb.from_("users")
         .insert({
@@ -191,12 +115,9 @@ def create_staff_member(
         .execute()
     )
     if not u:
-        raise ValueError(
-            "Could not create the user account. "
-            "Check that the email address is not already in use."
-        )
+        raise ValueError("User account could not be created.")
 
-    # Step 2 — create staff profile
+    # 2 — create staff profile
     profile = _one(
         sb.from_("staff_profiles")
         .insert({
@@ -207,6 +128,7 @@ def create_staff_member(
             "employment_start_date":          employment_start_date or None,
             "date_of_birth":                  date_of_birth or None,
             "contracted_hours_per_week":      contracted_hours_per_week,
+            "allows_unpaid_break_opt_out":    allows_unpaid_break_opt_out,
             "is_responsible_person":          is_responsible_person,
             "is_nominated_supervisor":        is_nominated_supervisor,
             "emergency_contact_name":         emergency_contact_name.strip() or None,
@@ -217,102 +139,18 @@ def create_staff_member(
         .select()
         .execute()
     )
-    if not profile:
-        raise ValueError(
-            "User account was created but the staff profile could not be saved. "
-            "Please contact support."
-        )
 
-    # Step 3 — assign centre role (required)
-    role_row = _one(
-        sb.from_("user_centre_roles")
-        .insert({
+    # 3 — assign centre role
+    if centre_id:
+        sb.from_("user_centre_roles").insert({
             "user_id":         u["id"],
             "centre_id":       centre_id,
             "role":            role,
             "primary_room_id": primary_room_id or None,
             "is_active":       True,
-        })
-        .select()
-        .execute()
-    )
-    if not role_row:
-        raise ValueError(
-            f"Staff profile was created but the centre role could not be assigned. "
-            f"Please open the staff member's profile and use the Edit tab to add their centre assignment."
-        )
+        }).execute()
 
     return profile
-
-
-def upsert_centre_role(
-    user_id: str,
-    centre_id: str,
-    role: str,
-    primary_room_id: str | None,
-) -> dict:
-    """
-    Insert or update the user_centre_roles row for a staff member at a centre.
-
-    If a row already exists for this user+centre, update it.
-    If no row exists, insert one.
-
-    Used by the Edit tab on the staff profile to add or change
-    a centre assignment after the staff member has been created.
-    """
-    if not centre_id:
-        raise ValueError("Centre is required.")
-    if not role:
-        raise ValueError("Role is required.")
-
-    sb = get_supabase_client()
-
-    # Check for an existing row (active or inactive) for this user+centre
-    existing = (
-        sb.from_("user_centre_roles")
-        .select("id")
-        .eq("user_id", user_id)
-        .eq("centre_id", centre_id)
-        .is_("deleted_at", "null")
-        .limit(1)
-        .execute()
-    ).data or []
-
-    if existing:
-        # Update the existing role row
-        row_id = existing[0]["id"]
-        result = _one(
-            sb.from_("user_centre_roles")
-            .update({
-                "role":            role,
-                "primary_room_id": primary_room_id or None,
-                "is_active":       True,
-            })
-            .eq("id", row_id)
-            .select()
-            .execute()
-        )
-    else:
-        # Insert a new row
-        result = _one(
-            sb.from_("user_centre_roles")
-            .insert({
-                "user_id":         user_id,
-                "centre_id":       centre_id,
-                "role":            role,
-                "primary_room_id": primary_room_id or None,
-                "is_active":       True,
-            })
-            .select()
-            .execute()
-        )
-
-    if not result:
-        raise ValueError(
-            "Centre role could not be saved. "
-            "Check that the centre ID and role are valid."
-        )
-    return result
 
 
 def update_staff_member(
@@ -324,8 +162,8 @@ def update_staff_member(
     emergency_contact_name: str, emergency_contact_phone: str,
     emergency_contact_relationship: str, notes: str,
     is_active: bool,
-    allows_unpaid_break_opt_out: bool = False,
     contracted_hours_per_week: float = 0.0,
+    allows_unpaid_break_opt_out: bool = False,
     is_responsible_person: bool = False,
     is_nominated_supervisor: bool = False,
 ) -> dict:
@@ -346,20 +184,51 @@ def update_staff_member(
             "employment_type":                employment_type,
             "employment_start_date":          employment_start_date or None,
             "date_of_birth":                  date_of_birth or None,
+            "contracted_hours_per_week":      contracted_hours_per_week,
+            "allows_unpaid_break_opt_out":    allows_unpaid_break_opt_out,
+            "is_responsible_person":          is_responsible_person,
+            "is_nominated_supervisor":        is_nominated_supervisor,
             "emergency_contact_name":         emergency_contact_name.strip() or None,
             "emergency_contact_phone":        emergency_contact_phone.strip() or None,
             "emergency_contact_relationship": emergency_contact_relationship.strip() or None,
             "notes":                          notes.strip() or None,
-            "allows_unpaid_break_opt_out":    allows_unpaid_break_opt_out,
-            "contracted_hours_per_week":      contracted_hours_per_week,
-            "is_responsible_person":          is_responsible_person,
-            "is_nominated_supervisor":        is_nominated_supervisor,
         })
         .eq("id", profile_id)
         .select()
         .execute()
     )
     return profile
+
+
+def upsert_centre_role(
+    user_id: str, centre_id: str, role: str, primary_room_id: str | None,
+) -> None:
+    """Insert or update the user_centre_roles row for a staff member at a centre."""
+    sb = get_supabase_client()
+    existing = (
+        sb.from_("user_centre_roles")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("centre_id", centre_id)
+        .is_("deleted_at", "null")
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if existing:
+        sb.from_("user_centre_roles").update({
+            "role":            role,
+            "primary_room_id": primary_room_id or None,
+            "is_active":       True,
+        }).eq("id", existing[0]["id"]).execute()
+    else:
+        sb.from_("user_centre_roles").insert({
+            "user_id":         user_id,
+            "centre_id":       centre_id,
+            "role":            role,
+            "primary_room_id": primary_room_id or None,
+            "is_active":       True,
+        }).execute()
 
 
 def soft_delete_staff(profile_id: str, user_id: str) -> None:
@@ -517,7 +386,7 @@ def fetch_availability(user_id: str, centre_id: str) -> list[dict]:
 
 
 def upsert_availability(rows: list[dict]) -> None:
-    """Save a list of availability rows (insert or replace)."""
+    """Save a list of availability rows (delete then re-insert)."""
     sb = get_supabase_client()
     if not rows:
         return
@@ -531,9 +400,12 @@ def upsert_availability(rows: list[dict]) -> None:
 # LEAVE REQUESTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_leave_requests(centre_id: str | None = None, user_id: str | None = None,
-                          status_filter: str | None = None) -> list[dict]:
-    sb = get_supabase_client()
+def fetch_leave_requests(
+    centre_id: str | None = None,
+    user_id: str | None = None,
+    status_filter: str | None = None,
+) -> list[dict]:
+    sb     = get_supabase_client()
 
     q = (
         sb.from_("leave_requests")
@@ -545,7 +417,6 @@ def fetch_leave_requests(centre_id: str | None = None, user_id: str | None = Non
             "reviewer:users!leave_requests_reviewed_by_user_id_fkey(first_name, last_name)"
         )
     )
-
     if centre_id:
         q = q.eq("centre_id", centre_id)
     if user_id:
