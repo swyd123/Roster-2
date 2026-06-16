@@ -319,6 +319,7 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         ft_below_contr    = validation.get("ft_below_contracted", [])
         ft_over_contr     = validation.get("ft_over_contracted", [])
         pt_hrs            = validation.get("pt_ca_hours_used", 0)
+        pt_below          = validation.get("pt_below_contracted", [])
         ft_onsite_ok      = validation.get("ft_onsite_achieved", True)
         ft_onsite_violns  = validation.get("ft_onsite_violations", [])
         rpns_ok           = validation.get("rpns_onsite_achieved", True)
@@ -326,11 +327,11 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
         corrections_log   = validation.get("corrections_log", [])
 
         # Critical banner — excludes ft_over_contracted (accepted trade-off).
-        critical_items = ft_below_contr + uncovered + ft_onsite_violns + rpns_violns
+        critical_items = ft_below_contr + pt_below + uncovered + ft_onsite_violns + rpns_violns
         if critical_items:
             st.error(
                 f"⛔ **CRITICAL: {len(critical_items)} hard constraint violation(s).** "
-                "Centre coverage, FT onsite, RP/NS coverage, or contracted hours "
+                "Centre coverage, FT/PT contracted hours, FT onsite, or RP/NS coverage "
                 "not fully achieved. Review the reports below before saving."
             )
 
@@ -429,6 +430,31 @@ def _render_result(result, centre_id, start_d, end_d, rooms, db_rules):
                     "Status":         row["status"],
                 })
             st.dataframe(pd.DataFrame(hrs_rows), use_container_width=True, hide_index=True)
+
+        # Part-time contracted hours report
+        pt_report = validation.get("pt_hours_report", [])
+        pt_below  = validation.get("pt_below_contracted", [])
+        if pt_report:
+            st.markdown("#### 🟡 Part-Time Hours Report")
+            st.caption(
+                "Part-time staff are allocated to contracted hours before casuals are used. "
+                "Shortfalls indicate insufficient availability or no suitable shifts within "
+                "the roster period."
+            )
+            if pt_below:
+                for w in pt_below:
+                    st.warning(f"⚠️ {w}")
+            pt_rows = []
+            for row in pt_report:
+                pt_rows.append({
+                    "Educator":       row["name"],
+                    "Contracted hrs": row["contracted_hrs"],
+                    "Rostered hrs":   row["rostered_hrs"],
+                    "Variance":       row["variance"],
+                    "✓ Compliant":   "✅ Yes" if row["compliant"] else "❌ No",
+                    "Status":         row["status"],
+                })
+            st.dataframe(pd.DataFrame(pt_rows), use_container_width=True, hide_index=True)
 
         # Attendance demand validation
         demand = validation.get("attendance_demand", [])
