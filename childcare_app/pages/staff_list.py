@@ -30,33 +30,32 @@ def render():
             return
 
     # ── Metrics ───────────────────────────────────────────────────────
-    total   = len(staff)
-    active  = sum(1 for s in staff if (s.get("users") or {}).get("is_active"))
-    ft      = sum(1 for s in staff if s.get("employment_type") == "full_time")
-    casual  = sum(1 for s in staff if s.get("employment_type") == "casual")
-    ns_rp   = sum(1 for s in staff if s.get("is_nominated_supervisor") or s.get("is_responsible_person"))
+    total    = len(staff)
+    active   = sum(1 for s in staff if (s.get("users") or {}).get("is_active"))
+    ft       = sum(1 for s in staff if s.get("employment_type") == "full_time")
+    casual   = sum(1 for s in staff if s.get("employment_type") == "casual")
 
+    ns_rp = sum(1 for s in staff if s.get("is_nominated_supervisor") or s.get("is_responsible_person"))
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total Staff", total)
-    m2.metric("Active",      active)
-    m3.metric("Full Time",   ft)
-    m4.metric("Casual",      casual)
-    m5.metric("NS / RP",     ns_rp, help="Staff designated as Nominated Supervisor or Responsible Person")
+    m1.metric("Total Staff",  total)
+    m2.metric("Active",       active)
+    m3.metric("Full Time",    ft)
+    m4.metric("Casual",       casual)
+    m5.metric("NS / RP",      ns_rp, help="Nominated Supervisors and Responsible Persons")
 
     st.markdown("---")
 
     # ── Filters ───────────────────────────────────────────────────────
     fc1, fc2, fc3, fc4 = st.columns([3, 1.5, 1.5, 1.5])
-    search        = fc1.text_input("🔍  Search", placeholder="Name or email…",
-                                    label_visibility="collapsed")
-    et_filter     = fc2.selectbox("Type", ["All"] + EMPLOYMENT_TYPE_KEYS,
-                                   format_func=lambda x: "All Types" if x == "All" else EMPLOYMENT_TYPES[x],
-                                   label_visibility="collapsed")
+    search    = fc1.text_input("🔍  Search", placeholder="Name or email…",
+                                label_visibility="collapsed")
+    et_filter = fc2.selectbox("Type", ["All"] + EMPLOYMENT_TYPE_KEYS,
+                               format_func=lambda x: "All Types" if x == "All" else EMPLOYMENT_TYPES[x],
+                               label_visibility="collapsed")
     status_filter = fc3.selectbox("Status", ["All", "Active", "Inactive"],
                                    label_visibility="collapsed")
-    sort_by       = fc4.selectbox("Sort",
-                                   ["Name A–Z", "Name Z–A", "Start Date", "Employment Type"],
-                                   label_visibility="collapsed")
+    sort_by   = fc4.selectbox("Sort", ["Name A–Z", "Name Z–A", "Start Date", "Employment Type"],
+                               label_visibility="collapsed")
 
     # ── Apply filters ─────────────────────────────────────────────────
     filtered = staff
@@ -64,7 +63,7 @@ def render():
         t = search.lower()
         filtered = [s for s in filtered if
                     t in fmt_name(s).lower() or
-                    t in (s.get("users") or {}).get("email", "").lower() or
+                    t in (s.get("users") or {}).get("email","").lower() or
                     t in (s.get("employee_number") or "").lower()]
     if et_filter != "All":
         filtered = [s for s in filtered if s.get("employment_type") == et_filter]
@@ -73,6 +72,7 @@ def render():
     elif status_filter == "Inactive":
         filtered = [s for s in filtered if not (s.get("users") or {}).get("is_active")]
 
+    # Sorting
     if sort_by == "Name A–Z":
         filtered.sort(key=lambda s: fmt_name(s))
     elif sort_by == "Name Z–A":
@@ -91,15 +91,13 @@ def render():
         for s in filtered:
             u = s.get("users") or {}
             export_rows.append({
-                "Name":                 fmt_name(s),
-                "Email":                u.get("email", ""),
-                "Phone":                u.get("phone", ""),
-                "Employment Type":      fmt_employment(s.get("employment_type", "")),
-                "Employee #":           s.get("employee_number", ""),
-                "Start Date":           fmt_date(s.get("employment_start_date")),
-                "Status":               "Active" if u.get("is_active") else "Inactive",
-                "Nominated Supervisor": "Yes" if s.get("is_nominated_supervisor") else "No",
-                "Responsible Person":   "Yes" if s.get("is_responsible_person")  else "No",
+                "Name":            fmt_name(s),
+                "Email":           u.get("email",""),
+                "Phone":           u.get("phone",""),
+                "Employment Type": fmt_employment(s.get("employment_type","")),
+                "Employee #":      s.get("employee_number",""),
+                "Start Date":      fmt_date(s.get("employment_start_date")),
+                "Status":          "Active" if u.get("is_active") else "Inactive",
             })
         csv = pd.DataFrame(export_rows).to_csv(index=False)
         st.download_button("⬇️  Export CSV", data=csv,
@@ -117,50 +115,29 @@ def render():
     for s in filtered:
         u         = s.get("users") or {}
         name      = fmt_name(s)
-        et        = fmt_employment(s.get("employment_type", ""))
+        et        = fmt_employment(s.get("employment_type",""))
         is_active = u.get("is_active", False)
-        email     = u.get("email", "—")
+        email     = u.get("email","—")
         phone     = u.get("phone") or "—"
         start     = fmt_date(s.get("employment_start_date"))
         emp_num   = s.get("employee_number") or "—"
 
-        is_ns = bool(s.get("is_nominated_supervisor", False))
-        is_rp = bool(s.get("is_responsible_person",  False))
-
+        # Role + centre from user_centre_roles (first active one)
         roles_list = [r for r in (s.get("user_centre_roles") or []) if r.get("is_active")]
         role_str   = fmt_role(roles_list[0]["role"]) if roles_list else "—"
-        centre_str = (roles_list[0].get("centres") or {}).get("name", "—") if roles_list else "—"
-        room_str   = (roles_list[0].get("rooms") or {}).get("name", "") if roles_list else ""
+        centre_str = (roles_list[0].get("centres") or {}).get("name","—") if roles_list else "—"
+        room_str   = (roles_list[0].get("rooms") or {}).get("name","") if roles_list else ""
 
+        # Status colour
         status_colour = "#d4f0e4" if is_active else "#fde8e8"
-        status_text   = "Active"  if is_active else "Inactive"
+        status_text   = "Active" if is_active else "Inactive"
         status_tc     = "#0f6b3a" if is_active else "#991b1b"
-
-        # Build title suffix with NS/RP tags
-        role_tags = ""
-        if is_ns:
-            role_tags += (
-                '  <span style="background:#e0e7ff;color:#3730a3;'
-                'padding:1px 7px;border-radius:99px;font-size:0.72rem;'
-                'font-weight:600;margin-left:4px;">NS</span>'
-            )
-        if is_rp:
-            role_tags += (
-                '  <span style="background:#dbeafe;color:#1e40af;'
-                'padding:1px 7px;border-radius:99px;font-size:0.72rem;'
-                'font-weight:600;margin-left:4px;">RP</span>'
-            )
 
         with st.expander(
             f"**{name}**  ·  {et}  ·  {centre_str}",
             expanded=False,
         ):
-            if role_tags:
-                st.markdown(
-                    f'<div style="margin-bottom:8px;">{role_tags}</div>',
-                    unsafe_allow_html=True,
-                )
-
+            # Top row — details grid
             d1, d2, d3, d4 = st.columns(4)
             d1.markdown(f"**Email**  \n{email}")
             d2.markdown(f"**Phone**  \n{phone}")
@@ -175,31 +152,32 @@ def render():
                 f'<span style="background:{status_colour};color:{status_tc};'
                 f'padding:2px 8px;border-radius:99px;font-size:0.78rem;font-weight:600;">'
                 f'{status_text}</span>',
-                unsafe_allow_html=True,
+                unsafe_allow_html=True
             )
             d8.markdown(f"**Centre**  \n{centre_str}")
 
-            # Compliance roles detail
-            if is_ns or is_rp:
-                badge_parts = []
-                if is_ns:
-                    badge_parts.append(
+            # Compliance role badges
+            _is_ns = bool(s.get("is_nominated_supervisor", False))
+            _is_rp = bool(s.get("is_responsible_person",  False))
+            if _is_ns or _is_rp:
+                _parts = []
+                if _is_ns:
+                    _parts.append(
                         '<span style="background:#e0e7ff;color:#3730a3;padding:2px 10px;'
                         'border-radius:99px;font-size:0.78rem;font-weight:600;'
                         'margin-right:6px;">Nominated Supervisor</span>'
                     )
-                if is_rp:
-                    badge_parts.append(
+                if _is_rp:
+                    _parts.append(
                         '<span style="background:#dbeafe;color:#1e40af;padding:2px 10px;'
                         'border-radius:99px;font-size:0.78rem;font-weight:600;">'
                         'Responsible Person</span>'
                     )
                 st.markdown(
                     '<div style="margin:6px 0;"><strong>Compliance roles:</strong>  '
-                    + "".join(badge_parts) + "</div>",
+                    + "".join(_parts) + "</div>",
                     unsafe_allow_html=True,
                 )
-
             if s.get("notes"):
                 st.markdown(f"**Notes:** _{s['notes']}_")
 
@@ -227,7 +205,7 @@ def render():
                     st.warning(f"Remove **{name}**?")
                     y, n = st.columns(2)
                     if y.button("Yes, remove", key=f"yes_{s['id']}", type="primary",
-                                use_container_width=True):
+                                 use_container_width=True):
                         try:
                             soft_delete_staff(s["id"], u["id"])
                             toast_success(f"{name} has been removed.")
@@ -242,7 +220,3 @@ def render():
                     if st.button("🗑️  Remove", key=f"del_{s['id']}", use_container_width=True):
                         st.session_state[confirm_key] = True
                         st.rerun()
-
-    st.caption(
-        "**NS** = Nominated Supervisor  ·  **RP** = Responsible Person"
-    )
