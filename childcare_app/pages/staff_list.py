@@ -195,8 +195,8 @@ def render():
             with ba2:
                 if st.button("✏️  Edit", key=f"edit_{s['id']}", use_container_width=True):
                     st.session_state.editing_staff_id = s["id"]
+                    st.session_state[f"edit_mode_{s['id']}"] = True
                     st.session_state.page = "staff_profile"
-                    st.session_state.profile_tab = "edit"
                     st.rerun()
 
             with ba3:
